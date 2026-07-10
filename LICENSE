@@ -1,0 +1,175 @@
+景渊 JingYuan — 最终用户许可协议
+JingYuan — End User License Agreement
+
+Copyright (c) 2026 lryoooow. All rights reserved. 保留一切权利。
+
+本协议中英文版本具有同等效力；若二者存在歧义，以中文版本为准。
+The Chinese and English texts are equally authentic. In case of any discrepancy,
+the Chinese text prevails.
+
+================================================================================
+简体中文
+================================================================================
+
+一、授权范围
+
+    著作权人授予你一项免费、非独占、不可转让、可撤销的许可，允许你在**个人、
+    非商业**用途下，于你本人拥有或控制的设备上安装并运行本软件的二进制发行版。
+
+    「个人、非商业用途」指：你为自己的学习、研究或个人投资决策参考而使用本软件，
+    且不因此直接或间接获取商业利益。
+
+二、你可以
+
+    1. 在个人设备上安装、运行、卸载本软件，数量不限。
+    2. 将本软件生成的报告与分析内容用于你个人的研究与决策参考。
+    3. 为个人备份目的复制本软件的安装包。
+
+三、你不可以
+
+    1. 将本软件用于任何商业目的，包括但不限于：企业或机构的内部经营使用、
+       对外提供付费或免费的服务、以本软件的输出对外提供投资咨询、
+       将本软件或其输出转售、出租、出借、捆绑销售。
+    2. 再分发、再上传、二次打包本软件，或将其嵌入其他产品分发。
+    3. 对本软件进行逆向工程、反编译、反汇编，或以其他方式试图获取其源代码
+       （所在地强制性法律明确允许且不可排除的范围内除外）。
+    4. 移除、遮蔽或篡改本软件中的品牌标识、版权声明或免责声明。
+    5. 将本软件用于任何违反所在地法律法规的用途。
+
+四、源代码
+
+    本许可仅覆盖以二进制形式发行的本软件。本软件的源代码未公开，
+    亦未随本许可授予任何源代码相关的权利。
+
+五、违约后果
+
+    一经发现违反第三条任一款项：
+
+    1. 本许可**自动终止**，无需另行通知。你必须立即停止使用并删除本软件的
+       全部副本。
+    2. 著作权人保留要求你停止侵害、消除影响、赔偿损失的权利，
+       并保留依据《中华人民共和国著作权法》《中华人民共和国反不正当竞争法》
+       等法律法规追究民事责任的权利；情节严重的，保留移交司法机关追究
+       刑事责任的权利。
+    3. 因商业使用所获得的全部收益，著作权人有权主张返还。
+
+六、商业授权
+
+    如需将本软件用于任何商业场景，请事先联系著作权人取得单独的书面商业授权。
+
+七、免责声明与责任限制
+
+    1. 本软件按「现状」提供，不附带任何明示或默示的担保，包括但不限于
+       适销性、特定用途适用性与非侵权性的担保。
+    2. **本软件不构成投资建议。** 它是研究辅助工具，不接入任何券商，无法下单。
+       其输出可能包含错误、遗漏或过时信息。
+    3. 本软件所依赖的行情与财务数据来自第三方免费公开接口，
+       可能延迟、被修正、中断或不可用。著作权人不对数据的准确性、
+       完整性或及时性作任何保证。
+    4. 在法律允许的最大范围内，著作权人不对因使用或无法使用本软件而导致的
+       任何直接、间接、偶然、特殊或后果性损失承担责任，
+       **包括但不限于投资损失**。
+    5. 你使用本软件所作出的每一个投资决策及其全部后果，均由你自行承担。
+       市场有风险，投资需谨慎。
+
+八、适用法律
+
+    本协议适用中华人民共和国大陆地区法律。因本协议产生的争议，
+    双方应友好协商；协商不成的，提交著作权人所在地有管辖权的人民法院解决。
+
+九、协议的接受
+
+    安装、复制或使用本软件，即表示你已阅读、理解并同意受本协议约束。
+    若你不同意本协议的任何条款，请不要安装或使用本软件，并删除其全部副本。
+
+================================================================================
+English
+================================================================================
+
+1. Grant of License
+
+   The copyright holder grants you a free, non-exclusive, non-transferable and
+   revocable license to install and run the binary distribution of this software
+   on devices you own or control, strictly for PERSONAL, NON-COMMERCIAL purposes.
+
+   "Personal, non-commercial use" means using the software for your own study,
+   research, or as a reference for your own investment decisions, without
+   deriving commercial benefit, directly or indirectly.
+
+2. You May
+
+   a. Install, run and uninstall the software on your personal devices.
+   b. Use the reports and analyses it generates as a reference for your own
+      research and decisions.
+   c. Make copies of the installer for personal backup purposes.
+
+3. You May Not
+
+   a. Use the software for any commercial purpose, including but not limited to:
+      internal business use by any company or institution; providing services
+      (paid or free) to third parties; offering investment advisory services
+      based on its output; reselling, renting, lending or bundling the software
+      or its output.
+   b. Redistribute, re-upload, repackage the software, or embed it in another
+      product for distribution.
+   c. Reverse engineer, decompile or disassemble the software, or otherwise
+      attempt to derive its source code, except to the extent such restriction
+      is expressly prohibited by applicable mandatory law.
+   d. Remove, obscure or alter any branding, copyright notice or disclaimer.
+   e. Use the software for any purpose that violates applicable law.
+
+4. Source Code
+
+   This license covers the binary distribution only. The source code is not
+   published, and no rights to it are granted under this license.
+
+5. Consequences of Breach
+
+   Upon any breach of Section 3:
+
+   a. This license TERMINATES AUTOMATICALLY without notice. You must immediately
+      cease all use and delete all copies of the software.
+   b. The copyright holder reserves the right to seek injunctive relief and
+      damages, and to pursue civil liability under applicable copyright and
+      unfair-competition law. In serious cases, the copyright holder reserves
+      the right to refer the matter to judicial authorities for criminal
+      liability.
+   c. The copyright holder is entitled to claim all proceeds derived from any
+      commercial use.
+
+6. Commercial Licensing
+
+   To use this software in any commercial context, you must obtain a separate
+   written commercial license from the copyright holder in advance.
+
+7. Disclaimer and Limitation of Liability
+
+   a. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+      IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+      FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   b. THIS SOFTWARE DOES NOT CONSTITUTE INVESTMENT ADVICE. It is a research aid.
+      It does not connect to any broker and cannot place orders. Its output may
+      contain errors, omissions or outdated information.
+   c. Market and financial data are obtained from free third-party public
+      endpoints and may be delayed, revised, interrupted or unavailable. No
+      warranty is made as to their accuracy, completeness or timeliness.
+   d. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE
+      LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL OR CONSEQUENTIAL
+      DAMAGES ARISING FROM THE USE OF OR INABILITY TO USE THE SOFTWARE,
+      INCLUDING BUT NOT LIMITED TO INVESTMENT LOSSES.
+   e. Every investment decision you make using this software, and all of its
+      consequences, are yours alone. Markets carry risk.
+
+8. Governing Law
+
+   This agreement is governed by the laws of the mainland of the People's
+   Republic of China. Disputes shall first be resolved through good-faith
+   negotiation; failing that, they shall be submitted to the competent People's
+   Court at the copyright holder's domicile.
+
+9. Acceptance
+
+   By installing, copying or using the software, you acknowledge that you have
+   read, understood and agreed to be bound by this agreement. If you do not
+   agree to any of its terms, do not install or use the software, and delete all
+   copies.
