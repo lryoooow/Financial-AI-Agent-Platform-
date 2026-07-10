@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none" role="img" aria-label="JingYuan">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0" stop-color="#0B1220"/>
+<stop offset="1" stop-color="#182238"/>
+</linearGradient></defs>
+<rect width="1024" height="1024" rx="230" fill="url(#bg)"/>
+<path d="M 290.3 660.0 Q 512 752.0 733.7 660.0" fill="none" stroke="#D8B24A" stroke-width="20" stroke-linecap="round" opacity="1.00"/>
+<path d="M 220.1 678.0 Q 512 806.0 803.9 678.0" fill="none" stroke="#D8B24A" stroke-width="14" stroke-linecap="round" opacity="0.55"/>
+<path d="M 149.1 695.5 Q 512 858.5 874.9 695.5" fill="none" stroke="#D8B24A" stroke-width="10" stroke-linecap="round" opacity="0.27"/>
+<rect x="326.0" y="483" width="16" height="29" rx="8.0" fill="#D8B24A" opacity="0.51"/>
+<rect x="288.0" y="512" width="92" height="117" rx="20.2" fill="#D8B24A"/>
+<rect x="504.0" y="380" width="16" height="29" rx="8.0" fill="#D8B24A" opacity="0.51"/>
+<rect x="466.0" y="409" width="92" height="220" rx="20.2" fill="#D8B24A"/>
+<rect x="681.0" y="273" width="16" height="29" rx="8.0" fill="#F0D27A" opacity="0.51"/>
+<rect x="643.0" y="302" width="92" height="327" rx="20.2" fill="#F0D27A"/>
+<polyline points="334,483 512,380 689,273" fill="none" stroke="#F0D27A" stroke-width="12" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="689" cy="273" r="19.5" fill="#F0D27A"/>
+</svg>

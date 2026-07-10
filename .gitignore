@@ -1,0 +1,34 @@
+# 本仓库只发布文档与品牌资产。源码与构建产物一律不进版本库。
+# 安装包通过 GitHub Releases 分发，不提交到 git（单个文件 193MB，远超建议上限）。
+
+# 构建产物 / 安装包
+*.exe
+*.blockmap
+*.zip
+*.7z
+*.msi
+
+# 源码目录（就算被误拷进来也不会提交）
+backend/
+fronted/
+frontend/
+src/
+node_modules/
+dist/
+build/
+release/
+__pycache__/
+*.py[cod]
+
+# 环境与密钥
+.env
+.env.*
+*.key
+*.pem
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
