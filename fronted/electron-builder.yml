@@ -30,3 +30,7 @@ nsis:
   shortcutName: 景渊 JingYuan
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
+  # 产物名与 README 下载表一致（默认是 "JingYuan Setup x.y.z.exe" 带空格）
+  artifactName: JingYuan-Setup-${version}.${ext}
+portable:
+  artifactName: JingYuan-Portable-${version}.${ext}
