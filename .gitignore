@@ -1,34 +1,52 @@
-# 本仓库只发布文档与品牌资产。源码与构建产物一律不进版本库。
-# 安装包通过 GitHub Releases 分发，不提交到 git（单个文件 193MB，远超建议上限）。
+# --- 参考源码 / 外部 clone（不参与构建，不进本仓库）---
+langchain/
+langchain_v1/
+langgraph-main/
+deepagents/
 
-# 构建产物 / 安装包
+# --- 构建产物 ---
+backend/dist/
+backend/build/
+backend/*.spec
+backend/src/finresearch/static/
+FinResearch-portable.zip
+*.log
 *.exe
-*.blockmap
-*.zip
-*.7z
-*.msi
 
-# 源码目录（就算被误拷进来也不会提交）
-backend/
-fronted/
-frontend/
-src/
-node_modules/
-dist/
-build/
-release/
+# --- Python ---
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+.venv/
+venv/
 
-# 环境与密钥
+# --- 前端 ---
+fronted/dist/
+fronted/build/
+fronted/release/
+fronted/node_modules/
+node_modules/
+
+# --- 环境与密钥（含真实 API key，绝不入库）---
 .env
-.env.*
-*.key
-*.pem
+*.env
+!.env.example
 
-# 编辑器 / 系统
-.vscode/
+# --- IDE / 工具缓存 ---
 .idea/
+.vscode/
+*.swp
+*.swo
+.pytest_cache/
+.codeforge/
+
+# --- 内部开发文档（不进公开产品仓库；本地保留）---
+CLAUDE.md
+金融Agent平台规划.md
+金融Agent平台规划-工具层.md
+
+# --- OS ---
 .DS_Store
 Thumbs.db
-desktop.ini

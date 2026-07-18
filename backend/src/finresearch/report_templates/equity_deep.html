@@ -1,0 +1,126 @@
+{# 个股深度报告 · 分析师级排版。
+   设计要点：
+   1. 顶部行情速览卡片（价格/涨跌/PE/PB/市值），数据时点强制标注；
+   2. 摘要 + 催化剂分块，摘要强制可溯源标注；
+   3. 财务概览表 + 行业可比口径说明；
+   4. 分析章节按段落分行渲染（body 中以 \n 分段，逐段成 <p>）；
+   5. 风险/来源/免责强制收尾，强制免责声明。 #}
+{% extends "base.html" %}
+
+{% block header %}
+{{ doc.name }}（{{ doc.ticker }}）<span style="color:var(--muted);font-size:13px;font-weight:400;">· 个股深度</span>
+{% endblock %}
+
+{% block styles %}
+<style>
+  /* 行情速览卡片 */
+  .snapshot {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin: 12px 0 6px;
+  }
+  .snapshot .cell {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .snapshot .label { font-size: 11px; color: var(--muted); }
+  .snapshot .num {
+    font-family: var(--font-mono);
+    font-size: 18px;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+
+  /* 摘要与催化剂 */
+  .summary-body p { margin: 4px 0; font-size: 14px; }
+  .provenance { font-size: 11px; color: var(--muted); margin-top: 8px; }
+
+  /* 分析章节：body 按 \n 分段 */
+  .section { margin: 16px 0; padding: 12px 14px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+  .section h3 {
+    font-size: 14px;
+    margin: 0 0 8px;
+    border-left: 3px solid var(--accent);
+    padding-left: 8px;
+  }
+  .section p { margin: 6px 0; font-size: 13.5px; line-height: 1.75; }
+  .section p:first-of-type { margin-top: 0; }
+
+  /* 财务表 */
+  table.fin th, table.fin td { font-size: 12.5px; }
+  table.fin tbody tr:nth-child(odd) td { background: #fff; }
+
+  .limit-note { font-size: 11px; color: var(--muted); font-style: italic; margin-top: 6px; }
+
+  ul.risks li, ul.sources li { font-size: 13px; }
+  .disclaimer { background: #f3f4f6; border-radius: 6px; }
+</style>
+{% endblock %}
+
+{% block summary %}
+<div class="summary-body">
+  {% for para in doc.summary.split("\n") if doc.summary %}
+    <p>{{ para.strip() }}</p>
+  {% endfor %}
+</div>
+<div class="provenance">
+  本报告所有数值由本地工具库（akshare / pandas-ta-classic）计算并可溯源；数据时点：{{ doc.as_of }}。
+</div>
+{% if doc.catalyst %}
+<div class="catalyst"><b>潜在催化剂：</b>{{ doc.catalyst }}</div>
+{% endif %}
+{% endblock %}
+
+{% block valuation %}
+{# 行情速览：仅在 quote 字段存在时渲染；前端若注入 quote 则展示，否则整块跳过 #}
+{% if doc.quote %}
+<div class="snapshot">
+  <div class="cell"><div class="label">最新价</div><div class="num">{{ doc.quote.price }}</div></div>
+  <div class="cell"><div class="label">涨跌幅</div><div class="num {{ 'up' if doc.quote.changePct >= 0 else 'down' }}">{{ doc.quote.changePct }}%</div></div>
+  <div class="cell"><div class="label">PE（动态）</div><div class="num">{{ doc.quote.pe }}</div></div>
+  <div class="cell"><div class="label">PB</div><div class="num">{{ doc.quote.pb }}</div></div>
+</div>
+{% endif %}
+
+<section>
+  <h2>财务概览（近五年）</h2>
+  <table class="fin">
+    <thead><tr><th>项目</th>{% for y in doc.financials.years %}<th>{{ y }}</th>{% endfor %}</tr></thead>
+    <tbody>
+    {% for row in doc.financials.rows %}
+      <tr><td>{{ row.name }}</td>{% for v in row['values'] %}<td class="mono">{{ v }}</td>{% endfor %}</tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="limit-note">
+    注：以上财务数据来自 akshare 财务分析指标接口，未经人工调整；ROE/毛利率/资产负债率为百分比口径，
+    营收/净利润为亿元口径。行业可比公司均值、历史分位数与 DCF 估值受限于当前数据维度，未在本表呈现。
+  </div>
+</section>
+{% endblock %}
+
+{% block body %}
+{# 逐章节渲染：body 以换行分段，每段独立成 <p> #}
+{% for s in doc.sections %}
+  <div class="section">
+    <h3>{{ s.title }}</h3>
+    {% for para in s.body.split("\n") if para.strip() %}
+      <p>{{ para.strip() }}</p>
+    {% endfor %}
+  </div>
+{% endfor %}
+{% endblock %}
+
+{% block disclaimer %}
+<div class="disclaimer">
+  <b>免责声明：</b>{{ doc.disclaimer }}
+  本报告由 AI 辅助生成，所有结论与判断均基于公开行情与财务数据的程序化计算，
+  可能存在指标滞后、数据缺失或模型偏差；报告中任何关于"偏多/偏空/中性""建议关注"的表述仅为分析观点，
+  不构成任何买卖建议或具体操作指令。市场有风险，投资需谨慎。
+</div>
+{% endblock %}

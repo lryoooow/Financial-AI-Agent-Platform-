@@ -6,7 +6,7 @@
 
 **A local-first A-share research copilot for serious individual investors.**
 
-[![Release](https://img.shields.io/badge/release-v1.2.2-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+[![Release](https://img.shields.io/badge/release-v1.5.0-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0B1220)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![License](https://img.shields.io/badge/license-Personal%20use%20only-8B5CF6)](LICENSE)
 
@@ -41,22 +41,22 @@ rather than quietly printing `PE 0.0`.
 
 ## Features
 
-**Professional chat** — Ask about a company by nickname ("茅台", "宁德时代") and JingYuan resolves
-the ticker, fetches a live quote and recent news, and injects them as a fact block with an explicit
-timestamp. Ambiguous names ("平安" → 中国平安? 平安银行?) trigger a clarifying question instead of
-a guess. When no data is available, the assistant says so rather than recalling a stale price.
+**Professional chat** — Ask about a company by nickname ("茅台", "宁德时代") and JingYuan's agent
+resolves the ticker and calls tools on demand — live quotes, financials, news, technical indicators,
+industry valuation — citing each with an explicit timestamp. It can compare several names in one
+question ("茅台和五粮液比一下") and follow up across turns. Ambiguous names ("平安" → 中国平安?
+平安银行?) trigger a clarifying question instead of a guess. When no data is available, the assistant
+says so rather than recalling a stale price.
 
-**Research tasks** — A deterministic LangGraph pipeline produces a structured report:
+**Research tasks** — An agent orchestrates a structured report, driving real tool calls you can watch
+live. Sections are written **one at a time and stream in token by token** as the model produces them.
+Templates cover *equity deep-dive*, *industry*, *earnings review* and *risk assessment*; open-ended
+industry queries ("光伏", "半导体") are supported too. Sections without supporting data are not
+written — they are declared insufficient.
 
-```
-entity → research → market → summary → report
-```
-
-Four templates, each assembling a different set of sections: *equity deep-dive*, *industry*,
-*earnings review*, *risk assessment*. Sections without supporting data are not written — they are
-declared insufficient.
-
-**Report library** — Reports persist in local SQLite and export to Word, PDF, TXT and Markdown.
+**Report library** — Reports persist in local SQLite and export to Word, PDF, TXT and Markdown. Any
+report can be permanently deleted — its content, the research task that produced it and the agent
+checkpoints are removed together.
 
 **Model configuration** — 15 OpenAI-compatible providers preset (8 domestic, 7 international).
 Bring your own API key. The model list can be pulled live from each vendor's `/v1/models`.
@@ -70,7 +70,7 @@ Bring your own API key. The model list can be pulled live from each vendor's `/v
 │        │  loads http://127.0.0.1:<port>/                           │
 │        ▼                                                           │
 │  FastAPI backend (PyInstaller sidecar, serves the frontend)        │
-│    • LangGraph fixed pipeline, SQLite checkpoints                  │
+│    • deepagents agent (LangChain/LangGraph), SQLite checkpoints    │
 │    • Market tools: eastmoney-direct → sina → tencent → akshare     │
 │    • SQLite: conversations, reports, settings                      │
 │        │                                                           │
@@ -89,8 +89,8 @@ Download from the [**latest release**](https://github.com/lryoooow/Financial-AI-
 
 | File | Use |
 | --- | --- |
-| `JingYuan-Setup-1.2.2.exe` | Installer. Creates Start-menu and desktop shortcuts. |
-| `JingYuan-Portable-1.2.2.exe` | Portable. Runs without installing. |
+| `JingYuan-Setup-1.5.0.exe` | Installer. Creates Start-menu and desktop shortcuts. |
+| `JingYuan-Portable-1.5.0.exe` | Portable. Runs without installing. |
 
 Windows 10/11, x64. No Python or Node runtime required — everything is bundled.
 

@@ -1,0 +1,32 @@
+appId: com.jingyuan.app
+productName: JingYuan
+# 不打 asar：后端是大量文件的 onedir，解包目录更稳
+asar: false
+directories:
+  output: release
+  buildResources: build
+files:
+  # Electron 外壳：主进程 + 预加载 + package.json（渲染进程由后端伺服，不进 Electron 包）
+  - electron/**
+  - package.json
+  - "!**/node_modules/**"
+# Python 后端（PyInstaller onedir）随包发布到 resources/backend
+extraResources:
+  - from: ../backend/dist/FinResearch
+    to: backend
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 景渊 JingYuan
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico

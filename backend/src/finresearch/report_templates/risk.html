@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block body %}
+{% for s in doc.sections %}
+  <div class="section">
+    <h3 style="font-size:14px;margin:14px 0 4px;">{{ s.title }}</h3>
+    <p>{{ s.body }}</p>
+  </div>
+{% endfor %}
+{% endblock %}
