@@ -6,7 +6,7 @@
 
 **给资深个人投资者的本地 A 股研究助手。**
 
-[![版本](https://img.shields.io/badge/release-v1.2.2-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+[![版本](https://img.shields.io/badge/release-v1.5.0-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![平台](https://img.shields.io/badge/platform-Windows%20x64-0B1220)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![许可](https://img.shields.io/badge/license-仅限个人使用-8B5CF6)](LICENSE)
 
@@ -39,20 +39,18 @@
 
 ## 功能
 
-**专业对话** — 用简称提问（"茅台现在多少钱"、"宁德时代最近怎么样"），景渊会识别标的、拉取实时行情
-与近期资讯，作为带数据时点的事实块注入上下文。简称有歧义时（"平安" 指中国平安还是平安银行？）它会
+**专业对话** — 用简称提问（"茅台现在多少钱"、"宁德时代最近怎么样"），景渊的智能体会识别标的，
+按需调用工具——实时行情、财务、新闻、技术指标、行业估值——每项都带数据时点引用。可以一次比较多个
+标的（"茅台和五粮液比一下"），也能跨轮追问。简称有歧义时（"平安" 指中国平安还是平安银行？）它会
 反问，而不是猜。取不到数据时它直说取不到，不会凭记忆报一个过期价格。
 
-**研究任务** — 确定性的 LangGraph 管线产出结构化报告：
-
-```
-标的归一化 → 基本面研究 → 行情与技术 → 投资摘要 → 报告生成
-```
-
-四种模板各自组装不同的栏目：**个股深度**、**行业研究**、**财报点评**、**风险评估**。
+**研究任务** — 由智能体编排产出结构化报告，工具调用轨迹实时可见。各分析板块**逐段串行撰写、
+段内逐 token 真流式**呈现——一个板块接一个板块地出现，正文一个字一个字地写出来。模板覆盖
+**个股深度**、**行业研究**、**财报点评**、**风险评估**，也支持开放式行业查询（"光伏"、"半导体"）。
 没有数据支撑的栏目不会被写出来，而是如实标注「数据不足，本报告不展开」。
 
-**报告库** — 报告落本地 SQLite，支持导出 Word / PDF / TXT / Markdown。
+**报告库** — 报告落本地 SQLite，支持导出 Word / PDF / TXT / Markdown。任意报告都可**真删除**——
+报告正文、生成它的研究任务、以及 Agent 检查点一并抹除，不可恢复。
 
 **模型配置** — 预置 15 家 OpenAI 兼容厂商（8 家国内、7 家国外），自带 Base URL。
 填入你自己的 API Key，模型清单可从各厂商 `/v1/models` 实时拉取。
@@ -66,7 +64,7 @@
 │        │  加载 http://127.0.0.1:<端口>/                            │
 │        ▼                                                           │
 │  FastAPI 后端（PyInstaller sidecar，同源托管前端）                  │
-│    • LangGraph 固定管线，SQLite 检查点                             │
+│    • deepagents 智能体（LangChain/LangGraph），SQLite 检查点        │
 │    • 行情源：东财直连 → 新浪 → 腾讯 → AkShare 兜底                  │
 │    • SQLite：对话、报告、设置                                       │
 │        │                                                           │
@@ -85,8 +83,8 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `JingYuan-Setup-1.2.2.exe` | 安装包，会创建开始菜单与桌面快捷方式 |
-| `JingYuan-Portable-1.2.2.exe` | 便携版，免安装直接运行 |
+| `JingYuan-Setup-1.5.0.exe` | 安装包，会创建开始菜单与桌面快捷方式 |
+| `JingYuan-Portable-1.5.0.exe` | 便携版，免安装直接运行 |
 
 Windows 10/11 x64。无需另装 Python 或 Node，运行时已全部打包在内。
 
