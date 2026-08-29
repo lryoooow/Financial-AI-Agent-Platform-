@@ -17,9 +17,9 @@ def test_roundtrip_current_scheme():
     assert cipher.startswith(("dpapi:", "enc:"))
 
 
+@pytest.mark.skipif(not secrets._dpapi_available(), reason="非 Windows 或无 win32crypt")
 def test_dpapi_is_preferred_on_windows():
-    if secrets._dpapi_available():
-        assert secrets.encrypt_value("k").startswith("dpapi:")
+    assert secrets.encrypt_value("k").startswith("dpapi:")
 
 
 def test_legacy_enc_prefix_still_decrypts():

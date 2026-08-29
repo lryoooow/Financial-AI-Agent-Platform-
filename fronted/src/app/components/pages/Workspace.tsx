@@ -71,6 +71,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   const [evidenceError, setEvidenceError] = useState("");
   const [llm, setLlm] = useState<LlmConfig | null>(null);
   const runId = useRef(0);
+  // v1.6.0（核验修复）：runBackend 是否已占用流（含 createResearch 进行中尚未 connect 的窗口）。
+  // 挂载重连 effect 据此避让，防止晚到的 researchTasks 把用户刚发起的研究连接关掉。
+  const activeRunRef = useRef<number | null>(null);
   const reportRef = useRef<HTMLDivElement>(null);
   // v1.6.0（审计 C2）：研究 SSE 连接由 hook 托管（卸载必关 / 单连接），并支持断线重连
   const stream = useResearchStream();
@@ -80,7 +83,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     if (initialCode) {
       const code = initialCode.split(":")[0];
       setQuery(code);
-      run(code);
+      void run(code);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialCode]);
@@ -123,9 +126,12 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     api.researchTasks()
       .then((r) => {
         if (cancelled) return;
+        // 核验修复：用户本轮已发起研究（含提交中）时不抢连接 —— hook.connect 会先关旧连接
+        if (activeRunRef.current !== null || stream.isConnected()) return;
         const live = (r.tasks || []).find((t) => t.status === "running" || t.status === "pending");
         if (!live) return;
         const id = ++runId.current;
+        activeRunRef.current = id;
         setPhase("running");
         setReconnectedCode(live.code);
         stream.connect(live.id, live.code, live.template || "equity_deep", (ev) => {
@@ -137,7 +143,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
             id,
             resolved: { code: live.code, name: live.code },
             runTemplate: (live.template as TemplateId) || "equity_deep",
-            finish: () => {},
+            // 核验修复：终态必须主动关连接（与 runBackend 一致）—— 服务端终帧后断流会触发
+            // EventSource onerror→__disconnected__，把刚设置的完成态覆盖成「连接中断」错误
+            finish: () => { stream.close(); },
           });
         });
       })
@@ -305,6 +313,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
 
   async function runBackend(resolved: CurrentStock): Promise<boolean> {
     const id = ++runId.current;
+    activeRunRef.current = id;
     const runTemplate = template;
     setDisplayTemplate(runTemplate);
     setStock(resolved);
@@ -324,9 +333,13 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     } catch {
       setError("无法提交研究任务：后端服务不可用或真实数据接口异常。");
       setPhase("idle");
+      if (activeRunRef.current === id) activeRunRef.current = null;
       return false;
     }
-    if (runId.current !== id) return true;
+    if (runId.current !== id) {
+      if (activeRunRef.current === id) activeRunRef.current = null;
+      return true;
+    }
 
     emit(`提交研究任务 ${taskId.slice(0, 8)}…`);
     await new Promise<void>((resolve) => {
@@ -336,6 +349,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
       const finish = () => {
         if (finished) return;
         finished = true;
+        if (activeRunRef.current === id) activeRunRef.current = null;
         stream.close();
         resolve();
       };

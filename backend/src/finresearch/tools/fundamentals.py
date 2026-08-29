@@ -52,7 +52,9 @@ def _company_profile_direct(raw: str) -> dict:
     configure_market_network()
     if time.time() - _DIRECT_FAIL_AT < _DIRECT_BREAKER_S:
         raise ConnectionError("公司资料直连接口近 5 分钟内失败，熔断中（直接走行情名称兜底）")
-    market = 1 if raw.startswith(("6", "9")) else 0
+    # 核验修复（B7 补齐第五处）：北交所 920xxx 的东财 secid 市场号是 0，旧判定会把
+    # "9" 开头一律归沪市（1），920 走该兜底拿到空档案。
+    market = 0 if raw.startswith(("43", "83", "87", "88", "92")) else (1 if raw.startswith(("6", "9")) else 0)
     fields = "f57,f58,f84,f85,f127,f116,f117,f189"
     try:
         resp = _direct_session().get(
@@ -213,9 +215,11 @@ def get_financial_indicators(code: str) -> dict:
                 return f"{v/1e8:.2f}{unit}" if abs(v) > 1e6 else f"{v:.2f}"
             return "—"
 
-        # v1.6.0（审计 P0 修复）：pick 候选键按接口真实列名补齐 —— 实测 86 列中存在
-        # 「主营业务收入增长率(%)」「扣除非经常性损益后的净利润(元)」等，但不存在旧候选
-        # 「营业总收入/营业收入」，导致营收行恒为「—」。
+        # v1.6.0（审计 P0 修复 + 核验勘误）：净利润/增速侧按实测真实列名命中；
+        # 营收绝对值经实测（akshare 1.18.64 实拉 600519，86 列全枚举）在该财务指标
+        # 接口上**不存在**（仅「主营业务收入增长率(%)」，无任何营收绝对值列）——
+        # 下列营收候选是防御性保留（未来上游加列即自动命中），现状如实渲染「—」
+        # 并在 provenance.note 留痕，绝不编造。换利润表类接口可补真值（后续增强）。
         revenue_keys = ("营业总收入", "营业收入", "主营业务收入(元)", "营业总收入(元)", "营业收入(元)")
         net_keys = ("净利润", "归母净利润", "扣除非经常性损益后的净利润(元)")
         revenue_vals = [fmt_num(pick(r, *revenue_keys)) for r in rows]

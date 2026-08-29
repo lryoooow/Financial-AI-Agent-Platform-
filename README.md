@@ -117,7 +117,7 @@ Everything sits in `%APPDATA%\FinResearch\`:
 
 To reset the app completely, close it and delete that folder. To back it up, copy it.
 
-API keys are stored in this local database in plain text. They are transmitted only to the LLM
+API keys are encrypted at rest in the local database (Windows DPAPI, machine-bound; a legacy host-bound scheme is kept for compatibility). They are transmitted only to the LLM
 vendor you selected.
 
 ## Disclaimer

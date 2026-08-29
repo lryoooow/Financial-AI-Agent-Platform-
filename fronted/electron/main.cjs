@@ -93,6 +93,10 @@ function portFile() {
   return path.join(appDataDir(), 'port.txt');
 }
 
+function shutdownTokenFile() {
+  return path.join(appDataDir(), 'shutdown-token.txt');
+}
+
 function clearStalePort() {
   try {
     fs.unlinkSync(portFile());
@@ -201,10 +205,17 @@ function createWindow(port) {
   });
   win.on('closed', () => { win = null; });
 
-  // [D7] 加固：渲染内容来自本地后端，不允许开新窗口与外部跳转
+  // [D7] 加固：渲染内容来自本地后端，不允许开新窗口与外部跳转。
+  // 核验修复：用 URL 解析精确比对 host —— 前缀匹配可被 `http://127.0.0.1:9527@evil/`
+  // 这类 userinfo 形态绕过。
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith(`http://127.0.0.1:${port}`)) event.preventDefault();
+    try {
+      const u = new URL(url);
+      if (u.host !== `127.0.0.1:${port}` && u.host !== `localhost:${port}`) event.preventDefault();
+    } catch (_) {
+      event.preventDefault();
+    }
   });
 
   // 把最大化/还原状态变化推给渲染进程，TitleBar 据此切换图标
@@ -230,10 +241,17 @@ function registerWindowIpc() {
 // [B3] 优雅退出：先握手让后端自己走 lifespan 收尾（检查点 flush、日志「关闭。」），
 // 等它退出最多 5s，超时才硬杀。
 function requestBackendShutdown() {
+  // 核验修复：附启动时随机生成的 X-Shutdown-Token（自定义头强制 CORS 预检，
+  // 跨站 no-cors 表单无法伪造本握手关掉本地后端）。
   return new Promise((resolve) => {
     if (!backend || backendPort == null) return resolve(false);
+    let token = '';
+    try { token = fs.readFileSync(shutdownTokenFile(), 'utf8').trim(); } catch (_) {}
     const req = http.request(
-      { host: '127.0.0.1', port: backendPort, path: '/api/shutdown', method: 'POST', timeout: 2000 },
+      {
+        host: '127.0.0.1', port: backendPort, path: '/api/shutdown', method: 'POST', timeout: 2000,
+        headers: token ? { 'X-Shutdown-Token': token } : {},
+      },
       (res) => { res.resume(); resolve(true); },
     );
     req.on('error', () => resolve(false));

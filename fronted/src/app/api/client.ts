@@ -420,7 +420,9 @@ export const api = {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n"); // v1.6.0：兼容 CRLF 分隔
+      // 核验修复：对拼接后的 buf 整体规范化 —— 逐 chunk replace 会漏掉 \r 与 \n 分属
+      // 两个 TCP chunk 的情形（残留 \r\n 切不开帧界，第二帧事件被静默丢弃）
+      buf = (buf + decoder.decode(value, { stream: true })).replace(/\r\n|\r/g, "\n");
       const frames = buf.split("\n\n");
       buf = frames.pop() || "";
       for (const frame of frames) {

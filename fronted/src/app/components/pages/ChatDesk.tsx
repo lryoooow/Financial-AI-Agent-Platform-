@@ -218,13 +218,18 @@ export function ChatDesk({
       { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
     ]);
     setStreamingId(assistantId);
-    // v1.6.0（审计 C1）：流可中断 + 90s 无输出看门狗
+    // v1.6.0（核验修复）：真「无输出」看门狗 —— 旧实现是 90s 总时长定时器，
+    // 正常流式中的长回复（推理模型常态）到点也被误杀。现改为活动刷新：
+    // 每次收到 token/stage 重置基准，连续 90s 无任何输出才中止。
     const ac = new AbortController();
     stopRef.current = ac;
-    const watchdog = window.setTimeout(
-      () => ac.abort(new Error("模型长时间无输出")),
-      90_000,
-    );
+    let lastAct = Date.now();
+    const watchdog = window.setInterval(() => {
+      if (Date.now() - lastAct > 90_000) {
+        window.clearInterval(watchdog);
+        ac.abort(new Error("模型长时间无输出"));
+      }
+    }, 5_000);
     try {
       let conv = current;
       if (!conv) {
@@ -237,9 +242,14 @@ export function ChatDesk({
       const isStale = () => activeConvIdRef.current !== convId;
       await api.sendChatMessageStream(convId, text, llm, imgs.length ? imgs : undefined, {
         signal: ac.signal,
-        onStage: (_s, label) => { if (!isStale()) setStage(label); },
+        onStage: (_s, label) => {
+          if (isStale()) return;
+          lastAct = Date.now();
+          setStage(label);
+        },
         onToken: (piece) => {
           if (isStale()) return;
+          lastAct = Date.now();
           setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
         },
         onDone: (payload) => {
@@ -257,17 +267,20 @@ export function ChatDesk({
         },
       });
     } catch (e) {
+      // 核验修复：会话已删/已切走时不落无关的错误横幅
+      const convIdAtSend = (current?.id) ?? null;
+      const stale = convIdAtSend !== null && activeConvIdRef.current !== convIdAtSend;
       if ((e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出") {
         // 用户停止/看门狗：已生成部分保留（后端会把部分回复落库并标注「生成中断」）
-        setError("已停止生成");
-      } else {
+        if (!stale) setError("已停止生成");
+      } else if (!stale) {
         setError(e instanceof Error ? e.message : String(e));
       }
       // 后端在流开始前已持久化用户消息：只移除空的助手占位，不再回删提问
       setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
       setStreamingId(null);
     } finally {
-      window.clearTimeout(watchdog);
+      window.clearInterval(watchdog);
       if (stopRef.current === ac) stopRef.current = null;
       setLoading(false);
       setStage("");

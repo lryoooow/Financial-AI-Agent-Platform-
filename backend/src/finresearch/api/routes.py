@@ -91,11 +91,13 @@ _CHAT_LOCKS_CAP = 200
 
 
 def _chat_lock(conversation_id: str) -> asyncio.Lock:
-    lock = _CHAT_LOCKS.setdefault(conversation_id, asyncio.Lock())
+    # 核验修复：先驱逐再插入 —— 后插入先驱逐可能把"刚 setdefault 尚未 acquire 的当前
+    # 会话锁"弹出，同会话第二个请求拿到另一把锁，互斥失效（需 200+ 并发持锁才触发，
+    # 一行重排彻底消除）。
     if len(_CHAT_LOCKS) > _CHAT_LOCKS_CAP:
         for k in [k for k, v in _CHAT_LOCKS.items() if not v.locked()][: len(_CHAT_LOCKS) - _CHAT_LOCKS_CAP]:
             _CHAT_LOCKS.pop(k, None)
-    return lock
+    return _CHAT_LOCKS.setdefault(conversation_id, asyncio.Lock())
 
 
 async def sweep_stale_research_tasks() -> int:
@@ -206,7 +208,9 @@ async def _active_llm_cfg() -> Optional[dict]:
         return {"base_url": str(cfg.get("baseUrl") or "").strip(),
                 "api_key": key, "model": model}
     except Exception as e:  # noqa: BLE001
-        logger.debug("解析当前激活模型配置失败：%s", e)
+        # warning 级（曾为 debug）：此函数失败=聊天/研究直接退化成「没有可用模型」，
+        # 必须能在 sidecar 日志里看到根因（打包环境曾出现静默失败，靠本日志定位）。
+        logger.warning("解析当前激活模型配置失败：%s", e, exc_info=True)
         return None
 
 
@@ -668,7 +672,8 @@ async def delete_chat_conversation(conversation_id: str) -> dict:
     # v1.6.0（审计 B4）：会话已删、写锁已释放，再做副作用清理（失败不让删除回滚）——
     # 1) LangGraph 检查点线程（thread_id == conv_id）：删报告早有对称清理，删会话此前没有，
     #    检查点按 super-step 全量序列化消息，会话越长库越肥且删后永久残留；
-    # 2) 媒体目录；3) 上下文诊断行。
+    # 2) 媒体目录；3) 上下文诊断行；4) 会话锁条目（核验补）。
+    _CHAT_LOCKS.pop(conversation_id, None)
     cp, _kind = get_checkpointer()
     if cp is not None and hasattr(cp, "adelete_thread"):
         try:
@@ -981,12 +986,34 @@ async def delete_research_task(task_id: str) -> dict:
     return {"ok": True, "deleted": task_id}
 
 
+def _shutdown_token() -> str:
+    """读取 run_server 启动时生成的停机令牌（不存在返回空串 = 开发直跑模式，免鉴权）。"""
+    try:
+        from pathlib import Path
+
+        from ..config import app_data_dir
+
+        p = Path(app_data_dir()) / "shutdown-token.txt"
+        return p.read_text(encoding="utf-8").strip() if p.is_file() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 @router.post("/shutdown")
 async def shutdown_backend(request: Request) -> dict:
     """优雅停机（审计 B3）：Electron 退出前先握手，让 lifespan 收尾/检查点 flush 执行。
 
     run_server 把 uvicorn.Server 实例挂到 app.state；直连源码跑（无挂载）时本端点无效。
+    核验修复：要求 X-Shutdown-Token 与启动令牌一致 —— 自定义头强制 CORS 预检，
+    跨站 no-cors 表单无法再触发本机后端停机（轻微本地 DoS 面）。
     """
+    expected = _shutdown_token()
+    if expected:
+        import secrets as _secrets
+
+        got = request.headers.get("x-shutdown-token", "")
+        if not _secrets.compare_digest(got, expected):
+            raise HTTPException(403, "forbidden")
     server = getattr(request.app.state, "uvicorn_server", None)
     if server is not None:
         server.should_exit = True

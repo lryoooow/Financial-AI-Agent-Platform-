@@ -29,6 +29,8 @@ export default function App() {
   // 否则 localStorage 为空但后端已存当前模型时，null 会把后端值永久覆盖
   // （Settings 的 configsLoadedRef 同款模式，这里此前漏防）。
   const activeLoadedRef = useRef(false);
+  // 核验修复：GET 返回前用户已改选模型时，不让迟到的 GET 覆盖用户操作
+  const userTouchedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,7 +39,7 @@ export default function App() {
       .catch(() => {});
     api.localSetting("active-model")
       .then((r) => {
-        if (cancelled || !r.payload) return;
+        if (cancelled || !r.payload || userTouchedRef.current) return;
         const p = r.payload as ActiveModel | null;
         if (isValidActiveModel(p)) setActive(p);
       })
@@ -76,7 +78,7 @@ export default function App() {
           <div className={vis("settings")}>
             <Settings
               active={active ? { providerId: active.providerId, modelId: active.modelId } : null}
-              onActivate={(p) => setActive(p)}
+              onActivate={(p) => { userTouchedRef.current = true; setActive(p); }}
             />
           </div>
         </main>

@@ -18,10 +18,23 @@ from .market_provider import record
 
 logger = logging.getLogger(__name__)
 
+# 核验补（B6 遗漏侧）：直连会话复用（连接池 + 统一 UA），不再每次裸 requests.get
+# 新建 TCP+TLS。与 fundamentals._direct_session 同款模式。
+_DIRECT_SESSION = None
+
+
+def _direct_session():
+    global _DIRECT_SESSION
+    if _DIRECT_SESSION is None:
+        import requests
+
+        _DIRECT_SESSION = requests.Session()
+        _DIRECT_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    return _DIRECT_SESSION
+
 
 def _news_direct(raw: str, limit: int) -> List[dict]:
     """东方财富新闻直连；请求参数全 ASCII，避免 Windows cp950 对中文路径/参数编码失败。"""
-    import requests
     from .market_provider import configure_market_network
 
     configure_market_network()
@@ -38,12 +51,12 @@ def _news_direct(raw: str, limit: int) -> List[dict]:
         }},
     }
     callback = "jQuery_finresearch"
-    resp = requests.get(
+    resp = _direct_session().get(
         "https://search-api-web.eastmoney.com/search/jsonp",
         params={"cb": callback, "param": json.dumps(inner, ensure_ascii=True), "_": "1"},
         # HTTP 头只允许 latin-1：中文关键词必须 percent-encode，否则 UnicodeEncodeError
         #（行业研究固定用中文行业名调本接口，不编码则直连路径 100% 失败）。
-        headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://so.eastmoney.com/news/s?keyword={quote(raw)}"},
+        headers={"Referer": f"https://so.eastmoney.com/news/s?keyword={quote(raw)}"},
         timeout=6,
     )
     resp.raise_for_status()
@@ -96,7 +109,8 @@ def search_news(code: str, limit: int = 12) -> dict:
                 raw_value=raw,
             ),
         }
-        record("news", "akshare", True)
+        # 核验补：健康统计渠道与 provenance 同源（直连成功别记成 akshare）
+        record("news", "eastmoney_search" if direct_used else "akshare", True)
         slow_cache.set(cache_key, result, ttl=600)
         return result
     except Exception as e:  # noqa: BLE001

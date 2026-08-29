@@ -73,3 +73,23 @@ def test_bid_ask_asks_pure_code_not_prefixed_symbol(monkeypatch):
     monkeypatch.setattr(akshare, "stock_bid_ask_em", fake)
     market.get_bid_ask("600519.SH")
     assert seen["symbol"] == "600519"
+
+
+def test_bid_ask_dash_sentinel_levels_skipped(monkeypatch):
+    """核验修复：'-' 哨兵档位跳过 —— 旧实现 _f('-')=0.0 会渲染「卖X 0.00 元」假档。"""
+    import akshare
+    import pandas as pd
+
+    import finresearch.tools.market as market
+
+    rows = [("sell_5", "-"), ("sell_5_vol", 100), ("sell_4", "-"), ("sell_4_vol", 100),
+            ("sell_3", 1298.0), ("sell_3_vol", 300), ("sell_2", 1297.0), ("sell_2_vol", 200),
+            ("sell_1", 1296.0), ("sell_1_vol", 100),
+            ("buy_1", 1295.0), ("buy_1_vol", 110), ("buy_2", 1294.0), ("buy_2_vol", 220),
+            ("buy_3", "-"), ("buy_3_vol", 0), ("buy_4", "-"), ("buy_4_vol", 0),
+            ("buy_5", 1290.0), ("buy_5_vol", 550)]
+    monkeypatch.setattr(akshare, "stock_bid_ask_em", lambda symbol: pd.DataFrame(rows, columns=["item", "value"]))
+    result = market.get_bid_ask("600519.SH")
+    assert [a["label"] for a in result["asks"]] == ["卖三", "卖二", "卖一"], "哨兵档跳过"
+    assert [b["label"] for b in result["bids"]] == ["买一", "买二", "买五"]
+    assert all(a["price"] > 0 for a in result["asks"] + result["bids"]), "不得出现 0.00 假档"

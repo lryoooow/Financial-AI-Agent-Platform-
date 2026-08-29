@@ -128,6 +128,27 @@ def _write_port_file(port_file: str, port: int) -> None:
             pass
 
 
+def _write_shutdown_token() -> str:
+    """生成一次性随机停机令牌（核验修复）。
+
+    /api/shutdown 曾可被任意本机网页用 no-cors 表单触发（简单请求免预检）关掉后端。
+    现要求自定义头 X-Shutdown-Token 与本文件内容一致 —— 自定义头强制 CORS 预检，
+    被（已收紧的）CORS 策略拦下。Electron 侧读同目录文件附头。
+    """
+    import secrets as _secrets
+
+    token = _secrets.token_hex(16)
+    path = os.path.join(app_data_dir(), "shutdown-token.txt")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(token)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+    return token
+
+
 def _ensure_ascii_cacert() -> None:
     """curl_cffi 在 Windows 上按本机 ANSI 代码页编码 CAINFO 文件路径。
 
@@ -186,7 +207,7 @@ def _start_parent_watchdog(server: "uvicorn.Server") -> None:
                     server.should_exit = True
                     return
             except Exception:  # noqa: BLE001
-                return
+                continue  # 瞬时异常（权限/临时错误）不退出看门狗，继续轮询
 
     threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
 
@@ -202,6 +223,7 @@ def main() -> None:
 
     port = _free_port()
     _write_port_file(os.path.join(app_data_dir(), "port.txt"), port)
+    _write_shutdown_token()
     try:
         print(f"FIN_PORT={port}", flush=True)  # port.txt is the primary channel.
     except Exception:

@@ -77,3 +77,23 @@ def test_is_reasoning_model_patterns():
     assert not is_reasoning_model("deepseek-v4-pro")
     assert not is_reasoning_model("")
     assert not is_reasoning_model(None)
+
+
+def test_env_configured_reasoning_model_also_gets_enlarged_budget(monkeypatch):
+    """核验修复：模型名口径与 build_llm._resolve 对齐 —— env 配推理模型
+    （请求不带 llm_config）时也必须放宽 max_tokens（旧实现空串判非推理，P0 复发）。"""
+    monkeypatch.setattr(rep.settings, "llm_model", "deepseek-reasoner", raising=False)
+
+    captured = {}
+
+    def fake_build_llm(**kwargs):
+        captured.update(kwargs)
+        return _FakeStreamLLM(["事实", "分析", "。"])
+
+    monkeypatch.setattr(rep, "build_llm", fake_build_llm)
+    asyncio.run(rep._llm_section(
+        {"template": "equity_deep", "normalized_ticker": "600519.SH"},  # 无 llm_config
+        rep._SPEC_VALUATION,
+        {"quote": _QUOTE, "fins": _FINS, "profile": {}},
+    ))
+    assert captured["max_tokens"] >= 4096, "env 推理模型也必须放宽 token 上限"

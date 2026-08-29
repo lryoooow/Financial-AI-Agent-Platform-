@@ -77,7 +77,8 @@ def test_chat_lock_helper_caps_and_returns_lock():
 
 
 def test_version_consistency():
-    """D5：版本单一来源（pyproject == __version__），main.py 引用 __version__。"""
+    """D5：版本单一来源（pyproject == __version__ == 前端 package.json），main.py 引用 __version__。"""
+    import json
     import tomllib
 
     from finresearch import __version__
@@ -86,5 +87,8 @@ def test_version_consistency():
     with open(pyproject, "rb") as f:
         data = tomllib.load(f)
     assert data["project"]["version"] == __version__
+    fronted_pkg = Path(__file__).resolve().parent.parent.parent / "fronted" / "package.json"
+    assert json.loads(fronted_pkg.read_text(encoding="utf-8"))["version"] == __version__, \
+        "前端 package.json 版本必须与后端一致"
     main_src = (Path(__file__).resolve().parent.parent / "src" / "finresearch" / "main.py").read_text(encoding="utf-8")
     assert 'version=__version__' in main_src, "FastAPI(version=) 必须引用 __version__"

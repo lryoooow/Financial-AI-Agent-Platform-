@@ -741,7 +741,14 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
     # langchain-openai 不把 reasoning_content 提进 .content —— 480 token 全被 CoT 吃掉时
     # finish_reason=length、content 为空串，四段全静默回退模板（生产日志成片复现）。
     # 推理模型放宽到 4096（正文长度仍由下方 cap 字符上限约束），普通模型维持 480。
-    model_name = str(((state.get("llm_config") or {}).get("model")) or "")
+    # 核验修复：模型名口径与 build_llm._resolve 一致（override.model 回落 settings.llm_model）——
+    # env 配推理模型（如 LLM_MODEL=deepseek-reasoner）而请求不带 llm_config 时，
+    # 旧取法得空串判非推理 → 480 token 又被 CoT 吃满，P0 复发。
+    model_name = str(
+        ((state.get("llm_config") or {}).get("model") or "").strip()
+        or getattr(settings, "llm_model", "")
+        or ""
+    )
     base_tokens = max(64, int(getattr(settings, "report_section_max_tokens", 480)))
     section_max_tokens = 4096 if is_reasoning_model(model_name) else base_tokens
     llm = build_llm(

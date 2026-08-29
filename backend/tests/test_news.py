@@ -39,9 +39,13 @@ def _jsonp_payload(keyword: str) -> str:
     return f"jQuery_finresearch({json.dumps(body, ensure_ascii=False)});"
 
 
-def test_news_direct_referer_is_latin1_safe_for_cjk_keyword(monkeypatch):
-    import requests
+def _patch_session(monkeypatch, news, fake_get):
+    """把直连会话替换为捕获请求参数的假会话（v1.6.0 起直连走 Session 复用）。"""
+    fake_session = type("S", (), {"get": staticmethod(fake_get), "headers": {}})()
+    monkeypatch.setattr(news, "_DIRECT_SESSION", fake_session)
 
+
+def test_news_direct_referer_is_latin1_safe_for_cjk_keyword(monkeypatch):
     import finresearch.tools.news as news
 
     captured = {}
@@ -51,7 +55,7 @@ def test_news_direct_referer_is_latin1_safe_for_cjk_keyword(monkeypatch):
         captured["url"] = url
         return _FakeResp(_jsonp_payload("光伏"))
 
-    monkeypatch.setattr(requests, "get", fake_get)
+    _patch_session(monkeypatch, news, fake_get)
     items = news._news_direct("光伏", 5)
 
     referer = captured["headers"]["Referer"]
@@ -66,8 +70,6 @@ def test_news_direct_referer_is_latin1_safe_for_cjk_keyword(monkeypatch):
 
 
 def test_news_direct_referer_ascii_keyword_unchanged(monkeypatch):
-    import requests
-
     import finresearch.tools.news as news
 
     captured = {}
@@ -76,6 +78,6 @@ def test_news_direct_referer_ascii_keyword_unchanged(monkeypatch):
         captured.update(kwargs)
         return _FakeResp(_jsonp_payload("600519"))
 
-    monkeypatch.setattr(requests, "get", fake_get)
+    _patch_session(monkeypatch, news, fake_get)
     news._news_direct("600519", 5)
     assert "keyword=600519" in captured["headers"]["Referer"]

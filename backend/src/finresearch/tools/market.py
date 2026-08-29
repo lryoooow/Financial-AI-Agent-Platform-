@@ -515,10 +515,14 @@ def get_bid_ask(code: str) -> dict:
         ]
 
         def pick(side: str, i: int, label: str):
+            # 核验修复：push2 无该档数据时价格可为 '-'（fltt=2 哨兵）——旧实现 _f('-')=0.0
+            # 会渲染出「卖X 0.00 元」的假档位，违背零幻觉原则。哨兵值一律跳过该档。
             p = rec.get(f"{side}_{i}")
-            if p is None:
+            if p is None or str(p).strip() in ("-", ""):
                 return None
-            v = rec.get(f"{side}_{i}_vol", 0)
+            v = rec.get(f"{side}_{i}_vol")
+            if v is None or str(v).strip() in ("-", ""):
+                v = 0
             return {"label": label, "price": _f(p), "vol": int(_f(v))}
 
         entries = [pick(s, i, lab) for s, i, lab in levels]
@@ -536,12 +540,15 @@ def get_bid_ask(code: str) -> dict:
         attempts.append({"source": "akshare", "ok": False, "error": str(e)})
         _record("book", "akshare", False, str(e))
         logger.debug("get_bid_ask 失败（无免费直连源）：%s", e)
+        # 核验补：盘后 push2 各档返回 None，akshare 内部 None*100 直接 TypeError——
+        # 如实提示可能为非交易时段（上游限制，不伪造盘口）
+        hint = "（可能为非交易时段：盘口源在收盘后返回空档位）" if isinstance(e, TypeError) else ""
         return {
             "asks": [], "bids": [], "trading_date": "",
             "elapsed_ms": int((time.perf_counter() - t0) * 1000),
             "provenance": _enrich(
                 make_provenance(source="akshare", endpoint="stock_bid_ask_em",
-                                error=f"盘口暂不可用（akshare 失败，无免费直连源）：{e}"),
+                                error=f"盘口暂不可用（akshare 失败，无免费直连源{hint}）：{e}"),
                 attempts=list(attempts),
             ),
         }
