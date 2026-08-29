@@ -76,6 +76,18 @@ class _RotatingStdio:
         except Exception:  # noqa: BLE001
             pass
 
+    def isatty(self) -> bool:
+        # 必须：uvicorn 彩色 formatter 初始化时调用 sys.stdout.isatty()，
+        # 缺这个方法服务在启动日志配置阶段就崩（实弹冒烟抓到）。
+        return False
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    def writable(self) -> bool:
+        return True
+
 
 def _redirect_stdio() -> None:
     """Windowed PyInstaller sidecars may not have valid console streams."""
