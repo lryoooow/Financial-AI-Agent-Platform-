@@ -206,6 +206,65 @@ async def t_chat_compliance_gate_and_guard():
             check(e.status_code == 409, f"同会话并发守卫 409（实际 {e.status_code}）")
 
 
+async def t_active_llm_fallback_overrides_stale_conv_config():
+    """发布后修复：对话冻存的旧 key 失效后，未显式选模型时应改用当前激活配置。
+
+    用户实测场景：Settings 已换新 DeepSeek key（有效），旧对话 model_config 冻存
+    旧 key（401）——旧逻辑 req.llm 为 None 时直接用冻存 key → 401。
+    """
+    conv_id = "conv-stale-key"
+    from finresearch.tools.secrets import encrypt_config
+
+    async with session_scope() as s:
+        s.add(ChatConversation(id=conv_id, title="旧对话", model_config=encrypt_config({
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-old-invalid-key-5000",
+            "model": "deepseek-old-model",
+        })))
+        await s.commit()
+    await put_local_setting("active-model", LocalSettingRequest(payload={
+        "providerId": "deepseek", "modelId": "deepseek-chat",
+        "provider": "DeepSeek", "model": "deepseek-chat", "accent": "#000",
+    }))
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "deepseek": {"baseUrl": "https://api.deepseek.com",
+                     "apiKey": "sk-new-valid-key-d414", "selectedModel": "deepseek-chat"},
+    }))
+
+    captured = {}
+
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+        captured["llm_cfg"] = llm_cfg
+        yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
+
+    orig = routes._deepagent_chat_stream
+    routes._deepagent_chat_stream = fake_stream
+    try:
+        # 不带 req.llm（用户没点过模型选择器）
+        resp = await send_chat_message(conv_id, ChatSendRequest(message="你好"))
+        async for chunk in resp.body_iterator:
+            pass
+    finally:
+        routes._deepagent_chat_stream = orig
+
+    cfg = captured.get("llm_cfg") or {}
+    check(cfg.get("api_key") == "sk-new-valid-key-d414", "未显式选模型时用当前激活 key（非对话冻存旧 key）")
+    check(cfg.get("model") == "deepseek-chat", "模型取激活配置的 modelId")
+    check(cfg.get("base_url") == "https://api.deepseek.com", "base_url 取激活配置")
+
+
+async def t_active_llm_cfg_none_when_unconfigured():
+    """无任何激活配置时返回 None（回落到冻存/env 的旧路径不回归）。"""
+    cfg = await routes._active_llm_cfg()
+    # 本 impl 的 DB 里 active-model/model-configs 已由上一用例写入——先清掉再验空
+    async with session_scope() as s:
+        await s.execute(__import__("sqlalchemy").delete(LocalSetting).where(
+            LocalSetting.key.in_(["active-model", "model-configs"])))
+        await s.commit()
+    cfg = await routes._active_llm_cfg()
+    check(cfg is None, "无激活配置时 _active_llm_cfg 返回 None")
+
+
 async def main() -> None:
     await init_db()
     # 初始化检查点（与生产 lifespan 同序），让会话删除的线程清理断言真实生效
@@ -219,6 +278,8 @@ async def main() -> None:
         await t_delete_research_task_rules()
         await t_create_research_reuse_window()
         await t_chat_compliance_gate_and_guard()
+        await t_active_llm_fallback_overrides_stale_conv_config()
+        await t_active_llm_cfg_none_when_unconfigured()
     finally:
         # 不关检查点的话，aiosqlite 残留线程会让解释器在退出阶段挂死
         # （生产 lifespan 收尾同样会 close；这里必须对称）

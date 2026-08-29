@@ -182,6 +182,34 @@ def _start_research_runtime(
     return runtime
 
 
+async def _active_llm_cfg() -> Optional[dict]:
+    """读取用户当前生效的模型配置（active-model + model-configs），无可用 key 返回 None。
+
+    v1.6.0（发布后修复）：用户在设置里换了 API Key 后，旧对话 model_config 里冻存的
+    仍是旧 key —— 未显式点选模型就发消息时按旧 key 请求，产生 401（实测：Settings 新
+    key 有效、对话冻存旧 key 无效）。修复后的优先级：本次显式选择 > 当前激活配置 >
+    对话冻存配置（最后兜底）。
+    """
+    try:
+        async with session_scope() as s:
+            if s is None:
+                return None
+            a_row = await s.get(LocalSetting, "active-model")
+            c_row = await s.get(LocalSetting, "model-configs")
+            active = a_row.payload if (a_row and isinstance(a_row.payload, dict)) else {}
+            configs = c_row.payload if (c_row and isinstance(c_row.payload, dict)) else {}
+        cfg = decrypt_nested(configs).get(str(active.get("providerId") or "")) or {}
+        key = str(cfg.get("apiKey") or "").strip()
+        if not key:
+            return None
+        model = str(active.get("modelId") or cfg.get("selectedModel") or "").strip()
+        return {"base_url": str(cfg.get("baseUrl") or "").strip(),
+                "api_key": key, "model": model}
+    except Exception as e:  # noqa: BLE001
+        logger.debug("解析当前激活模型配置失败：%s", e)
+        return None
+
+
 def _remember_task_llm(task_id: str, llm: Optional[dict]) -> None:
     _TASK_LLM[task_id] = llm
     if len(_TASK_LLM) > _TASK_LLM_CAP:
@@ -739,7 +767,7 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
         conv.updated_at = dt.datetime.now(dt.UTC)
         await s.commit()
         conv_id = conv.id
-        llm_cfg = req.llm or decrypt_config(conv.model_config)
+        conv_model_config = conv.model_config  # 会话已提交，读值出域
         history_snapshot = list(history)
         # 数据库存引用，当前这一轮仍把原始 data URL 交给视觉模型。
         if req.images and history_snapshot:
@@ -754,6 +782,16 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
             "summary": summary_row.summary,
             "history_path": summary_row.history_path,
         } if summary_row else None)
+
+    # 模型配置优先级（v1.6.0 发布后修复）：
+    #   ① 本次显式选择（req.llm，前端点过 ModelPicker）
+    #   ② 当前激活配置（active-model + model-configs —— 用户换 key 后立即生效）
+    #   ③ 对话冻存配置（v1.5 行为，仅作最后兜底；旧 key 可能已失效）
+    llm_cfg = req.llm
+    if llm_cfg is None:
+        llm_cfg = await _active_llm_cfg()
+    if llm_cfg is None:
+        llm_cfg = decrypt_config(conv_model_config)
 
     # 只判"有没有配模型"，不在这里构造模型：真正要用的那个由 build_chat_agent 内部建，
     # 这里再建一个只为判空是白白多造一套 httpx 客户端。
@@ -1102,6 +1140,10 @@ async def research_stream(
                 # 读一次用户画像，注入研究链路各段撰写；缺行时由 DEFAULT_PROFILE 逐字段回填
                 prof_row = await s.get(LocalSetting, "user-profile")
                 user_profile = (prof_row.payload if prof_row else None) or {}
+        # v1.6.0 发布后修复：前端未显式选模型时（llm 为 null），此前会落到 env 配置
+        # （打包形态=未配置）直接报"模型未配置"。与对话链路同口径：当前激活配置兜底。
+        if not llm_cfg:
+            llm_cfg = await _active_llm_cfg()
         if not code_:
             yield sse.ev_error("缺少 code（DB 无此任务且未传 code 查询参数）")
             return
