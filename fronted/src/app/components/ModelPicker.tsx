@@ -1,24 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Cpu } from "lucide-react";
+import { Check, ChevronDown, Cpu, Settings2 } from "lucide-react";
 import { PROVIDERS } from "../data/providers";
 import { api, type LlmConfig } from "../api/client";
 
 /**
- * 行内模型选择器（v1.6.0 重构：模型级选择）。
+ * 行内模型选择器（v1.6.1：纯模型列表）。
  *
- * v1.5 形态：每个供应商只出一项（Settings 里的 selectedModel），想在对话页换模型
- * 必须去设置页 —— 用户实测「只能选供应商，选不了模型」。
- * v1.6.0：按供应商分组列出其**全部模型**（Settings 保存的列表，含「拉取最新模型」
- * 的实时结果；未拉取过用内置清单兜底）；选中即持久化到 active-model（localStorage +
- * 后端），刷新/重启后保持，且与后端 _active_llm_cfg 的优先级口径闭环。
+ * 用户反馈明确要求：不再展示模型厂商，直接列具体模型可选。
+ * —— 每项 = 一个具体模型（厂商仅以左侧色点隐式区分）；
+ * —— 选中即持久化 active-model（localStorage + 后端），与后端 _active_llm_cfg 口径闭环；
+ * —— options 刷新（Settings 换 key/拉新模型）后自动用新配置重发当前选择
+ *    （修「换 key 后会话仍带旧 key 请求」的旧链）。
  *
- * 密钥仍从 localStorage `finresearch_keys` 读（activeModel prop 无密钥，避免密钥在
- * 组件树里传递）。
- *
- * 另修一个隐藏链：v1.5 挂载时把 localStorage 里的（可能过期的）key 自动发给宿主组件，
- * 且 options 刷新后不重发 —— 用户在 Settings 换 key 后，聊天页整个会话仍带着旧 key
- * 请求（实测 401 根因之一）。现在 options 引用一变（后端 GET 刷新 localStorage）即用
- * 新配置重发当前选择。
+ * 密钥仍从 localStorage `finresearch_keys` 读（activeModel prop 无密钥）。
  */
 export interface PickerOption {
   providerId: string;
@@ -85,7 +79,7 @@ export function loadActiveLlm(): LlmConfig | null {
   return options[0].llm;
 }
 
-/** 选中即持久化（localStorage + 后端 active-model）——与后端 _active_llm_cfg 闭环。 */
+/** 选中即持久化（localStorage + 后端 active-model）。 */
 function persistActive(o: PickerOption) {
   const payload = {
     providerId: o.providerId, modelId: o.model,
@@ -119,7 +113,7 @@ export function ModelPicker({
     return () => { cancelled = true; };
   }, []);
 
-  // 默认选中：active-model 的精确匹配 > provider 名匹配 > 第一项
+  // 默认选中：active-model 精确匹配 > prop 匹配 > 第一项
   const defaultIdx = useMemo(() => {
     let a: any = null;
     try { a = JSON.parse(localStorage.getItem("finresearch_active") || "null"); } catch { /* ignore */ }
@@ -172,16 +166,6 @@ export function ModelPicker({
 
   const safeIdx = Math.min(idx, options.length - 1);
   const cur = options[safeIdx];
-  // 按供应商分组（保持 PROVIDERS 顺序）
-  const groups: { providerId: string; provider: string; accent: string; items: { o: PickerOption; i: number }[] }[] = [];
-  options.forEach((o, i) => {
-    let g = groups.find((x) => x.providerId === o.providerId);
-    if (!g) {
-      g = { providerId: o.providerId, provider: o.provider, accent: o.accent, items: [] };
-      groups.push(g);
-    }
-    g.items.push({ o, i });
-  });
 
   return (
     <div ref={rootRef} className="relative">
@@ -189,49 +173,43 @@ export function ModelPicker({
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="flex max-w-[260px] items-center gap-1.5 rounded-md bg-secondary/60 px-2 py-1 text-[11px] transition-colors hover:bg-secondary"
+        title={`${cur.provider} · ${cur.model}`}
       >
         <Cpu className="size-3 shrink-0" style={{ color: cur.accent }} />
         <span className="hidden shrink-0 text-muted-foreground sm:inline">模型</span>
-        <span className="truncate text-foreground/85">{cur.provider} · {cur.model}</span>
+        <span className="truncate font-mono text-foreground/85">{cur.model}</span>
         <ChevronDown className={`size-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
 
       {open && (
-        <div className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-80 w-[300px] overflow-y-auto rounded-lg border border-border bg-card p-1.5 shadow-xl shadow-black/30">
-          {groups.map((g) => (
-            <div key={g.providerId} className="mb-1 last:mb-0">
-              <div className="flex items-center gap-1.5 px-2 py-1.5">
-                <span className="size-2 rounded-sm shrink-0" style={{ background: g.accent }} />
-                <span className="text-[10px] font-medium text-muted-foreground tracking-wide">{g.provider}</span>
-                <span className="text-[9px] text-muted-foreground/60">{g.items.length}</span>
-              </div>
-              {g.items.map(({ o, i }) => {
-                const selected = i === safeIdx;
-                return (
-                  <button
-                    key={`${o.providerId}-${o.model}`}
-                    type="button"
-                    onClick={() => {
-                      setIdx(i);
-                      setOpen(false);
-                      persistActive(o);
-                      onChange(o.llm);
-                    }}
-                    className={`flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-1.5 pl-5 text-left transition-colors ${selected ? "bg-accent text-gold" : "text-foreground/85 hover:bg-secondary"}`}
-                  >
-                    <span className="min-w-0 block truncate text-[11px] font-mono">{o.model}</span>
-                    {selected && <Check className="size-3.5 shrink-0 text-gold" />}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
+        <div className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-80 w-[280px] overflow-y-auto rounded-lg border border-border bg-card p-1.5 shadow-xl shadow-black/30">
+          {options.map((o, i) => {
+            const selected = i === safeIdx;
+            return (
+              <button
+                key={`${o.providerId}-${o.model}`}
+                type="button"
+                onClick={() => {
+                  setIdx(i);
+                  setOpen(false);
+                  persistActive(o);
+                  onChange(o.llm);
+                }}
+                className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left transition-colors ${selected ? "bg-accent text-gold" : "text-foreground/85 hover:bg-secondary"}`}
+              >
+                <span className="size-1.5 rounded-full shrink-0" style={{ background: o.accent }} />
+                <span className="min-w-0 flex-1 truncate text-[11px] font-mono">{o.model}</span>
+                {selected && <Check className="size-3.5 shrink-0 text-gold" />}
+              </button>
+            );
+          })}
           <button
             type="button"
             onClick={() => { setOpen(false); onGoSettings(); }}
-            className="mt-1 w-full rounded-md px-2.5 py-1.5 text-left text-[10px] text-muted-foreground hover:bg-secondary transition-colors"
+            className="mt-1 flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[10px] text-muted-foreground hover:bg-secondary transition-colors"
           >
-            管理模型与密钥（设置）…
+            <Settings2 className="size-3" />
+            管理模型与密钥…
           </button>
         </div>
       )}
