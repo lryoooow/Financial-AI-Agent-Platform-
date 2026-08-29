@@ -10,16 +10,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from finresearch.api import routes  # noqa: E402
 
 
-def test_shutdown_endpoint_sets_should_exit():
+def test_shutdown_endpoint_sets_should_exit(monkeypatch):
+    monkeypatch.setattr(routes, "_shutdown_token", lambda: "tok-123")
     fake_server = SimpleNamespace(should_exit=False)
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(uvicorn_server=fake_server)))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(uvicorn_server=fake_server)),
+        headers={"x-shutdown-token": "tok-123"},
+    )
     result = asyncio.run(routes.shutdown_backend(request))
     assert result["ok"] is True
     assert fake_server.should_exit is True
 
 
-def test_shutdown_endpoint_without_server_handle():
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+def test_shutdown_endpoint_rejects_missing_or_wrong_token(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(routes, "_shutdown_token", lambda: "tok-123")
+    fake_server = SimpleNamespace(should_exit=False)
+    for headers in ({}, {"x-shutdown-token": "wrong"}, {"x-shutdown-token": ""}):
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(uvicorn_server=fake_server)),
+            headers=headers,
+        )
+        try:
+            asyncio.run(routes.shutdown_backend(request))
+            raise AssertionError(f"应 403：{headers}")
+        except HTTPException as e:
+            assert e.status_code == 403
+    assert fake_server.should_exit is False, "被拒请求不得触发停机"
+
+
+def test_shutdown_endpoint_without_server_handle(monkeypatch):
+    monkeypatch.setattr(routes, "_shutdown_token", lambda: "tok-123")
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace()),
+        headers={"x-shutdown-token": "tok-123"},
+    )
     result = asyncio.run(routes.shutdown_backend(request))
     assert result["ok"] is False  # 源码直跑模式（无挂载）不误报成功
 

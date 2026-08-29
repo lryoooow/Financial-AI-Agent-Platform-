@@ -265,6 +265,59 @@ async def t_active_llm_cfg_none_when_unconfigured():
     check(cfg is None, "无激活配置时 _active_llm_cfg 返回 None")
 
 
+async def t_overlay_current_key_wins_over_stale_cache():
+    """v1.6.2 用户实测场景：应用开着换 key，前端 req.llm 带的是挂载时缓存的旧 key
+    （…ebf8, 401）而 Settings 已是新 key（…8f9f, 有效）——同供应商必须 DB 优先。"""
+    conv_id = "conv-overlay"
+    async with session_scope() as s:
+        s.add(ChatConversation(id=conv_id, title="t"))
+        await s.commit()
+    await put_local_setting("active-model", LocalSettingRequest(payload={
+        "providerId": "deepseek", "modelId": "deepseek-v4-flash",
+        "provider": "DeepSeek", "model": "deepseek-v4-flash", "accent": "#000",
+    }))
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "deepseek": {"baseUrl": "https://api.deepseek.com",
+                     "apiKey": "sk-fresh-8f9f", "selectedModel": "deepseek-v4-flash"},
+        "moonshot": {"baseUrl": "https://api.moonshot.cn/v1",
+                     "apiKey": "sk-moon-key", "selectedModel": "kimi-k3"},
+    }))
+
+    captured = {}
+
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+        captured["llm_cfg"] = llm_cfg
+        yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
+
+    orig = routes._deepagent_chat_stream
+    routes._deepagent_chat_stream = fake_stream
+    try:
+        # 同供应商：req.llm 带旧缓存 key + 自选模型 → DB 新 key 覆盖，模型保留
+        resp = await send_chat_message(conv_id, ChatSendRequest(
+            message="hi",
+            llm={"base_url": "https://api.deepseek.com", "api_key": "sk-stale-ebf8", "model": "deepseek-v4-pro"},
+        ))
+        async for _ in resp.body_iterator:
+            pass
+        cfg = captured.get("llm_cfg") or {}
+        check(cfg.get("api_key") == "sk-fresh-8f9f", "同供应商：DB 当前 key 覆盖缓存旧 key")
+        check(cfg.get("model") == "deepseek-v4-pro", "显式选择的模型保留")
+
+        # 跨供应商：req.llm 选 moonshot，active 是 deepseek → 不得越权替换
+        captured.clear()
+        resp = await send_chat_message(conv_id, ChatSendRequest(
+            message="hi",
+            llm={"base_url": "https://api.moonshot.cn/v1", "api_key": "sk-moon-key", "model": "kimi-k3"},
+        ))
+        async for _ in resp.body_iterator:
+            pass
+        cfg = captured.get("llm_cfg") or {}
+        check(cfg.get("api_key") == "sk-moon-key" and cfg.get("base_url") == "https://api.moonshot.cn/v1",
+              "跨供应商：显式选择不被 active 覆盖")
+    finally:
+        routes._deepagent_chat_stream = orig
+
+
 async def main() -> None:
     await init_db()
     # 初始化检查点（与生产 lifespan 同序），让会话删除的线程清理断言真实生效
@@ -280,6 +333,7 @@ async def main() -> None:
         await t_chat_compliance_gate_and_guard()
         await t_active_llm_fallback_overrides_stale_conv_config()
         await t_active_llm_cfg_none_when_unconfigured()
+        await t_overlay_current_key_wins_over_stale_cache()
     finally:
         # 不关检查点的话，aiosqlite 残留线程会让解释器在退出阶段挂死
         # （生产 lifespan 收尾同样会 close；这里必须对称）

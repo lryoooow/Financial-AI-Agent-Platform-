@@ -184,6 +184,26 @@ def _start_research_runtime(
     return runtime
 
 
+async def _overlay_current_key(llm_cfg: Optional[dict]) -> Optional[dict]:
+    """缓存防腐（v1.6.2）：同供应商时以 DB 当前配置的 key/base_url 覆盖前端传来的缓存。
+
+    用户实测链：应用开着 → Settings 换 key → 聊天页选择器仍握着挂载时缓存的旧 key →
+    401。DB（model-configs）是唯一事实源，localStorage/组件缓存只是缓存。
+    仅当 base_url 完全一致（同一供应商）才覆盖 —— 用户显式选了别家供应商时不越权替换。
+    """
+    if not llm_cfg:
+        return llm_cfg
+    current = await _active_llm_cfg()
+    if not current:
+        return llm_cfg
+    req_base = (llm_cfg.get("base_url") or "").strip()
+    cur_base = (current.get("base_url") or "").strip()
+    if req_base and cur_base and req_base == cur_base:
+        if (current.get("api_key") or "") != (llm_cfg.get("api_key") or ""):
+            return {**llm_cfg, "base_url": cur_base, "api_key": current["api_key"]}
+    return llm_cfg
+
+
 async def _active_llm_cfg() -> Optional[dict]:
     """读取用户当前生效的模型配置（active-model + model-configs），无可用 key 返回 None。
 
@@ -797,6 +817,8 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
         llm_cfg = await _active_llm_cfg()
     if llm_cfg is None:
         llm_cfg = decrypt_config(conv_model_config)
+    # v1.6.2 缓存防腐：显式选择也做 DB 覆盖（同供应商换 key 后立即生效，杀整个缓存类问题）
+    llm_cfg = await _overlay_current_key(llm_cfg)
 
     # 只判"有没有配模型"，不在这里构造模型：真正要用的那个由 build_chat_agent 内部建，
     # 这里再建一个只为判空是白白多造一套 httpx 客户端。
@@ -1171,6 +1193,8 @@ async def research_stream(
         # （打包形态=未配置）直接报"模型未配置"。与对话链路同口径：当前激活配置兜底。
         if not llm_cfg:
             llm_cfg = await _active_llm_cfg()
+        # v1.6.2 缓存防腐：同供应商 DB 当前 key 覆盖（与对话链路同口径）
+        llm_cfg = await _overlay_current_key(llm_cfg)
         if not code_:
             yield sse.ev_error("缺少 code（DB 无此任务且未传 code 查询参数）")
             return

@@ -112,6 +112,13 @@ export function ModelPicker({
       .catch(() => {});
     return () => { cancelled = true; };
   }, []);
+  // v1.6.2：Settings 保存（含换 key）即时同步 —— 广播一响就重读 localStorage，
+  // 下面的重发 effect 会用新配置刷新宿主组件的 llm（杀"带着旧 key 请求"的缓存链）
+  useEffect(() => {
+    const refresh = () => setOptions(loadPickerOptions());
+    window.addEventListener("finresearch:configs-updated", refresh);
+    return () => window.removeEventListener("finresearch:configs-updated", refresh);
+  }, []);
 
   // 默认选中：active-model 精确匹配 > prop 匹配 > 第一项
   const defaultIdx = useMemo(() => {

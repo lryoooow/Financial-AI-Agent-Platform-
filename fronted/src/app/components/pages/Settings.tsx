@@ -72,6 +72,9 @@ export function Settings({ active, onActivate }: Props) {
       models: c.models,
     }]));
     localStorage.setItem("finresearch_keys", JSON.stringify(toSave));
+    // v1.6.2：广播配置更新 —— 已挂载的 ModelPicker 据此即时刷新（否则换 key 后
+    // 聊天页选择器仍握挂载时的旧缓存，带着旧 key 请求 401）
+    window.dispatchEvent(new CustomEvent("finresearch:configs-updated"));
     const t = window.setTimeout(() => {
       api.saveLocalSetting("model-configs", toSave).catch(() => {});
     }, 300);
