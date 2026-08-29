@@ -131,10 +131,15 @@ def val_or_missing(v: Any, field: str = "") -> str:
     return s
 
 
-def row_vals(fins: dict, name: str) -> list:
-    """取 financials.rows 里指定 name 的 values 列表。"""
+def row_vals(fins: dict, name) -> list:
+    """取 financials.rows 里指定 name 的 values 列表。
+
+    v1.6.0：name 支持别名列表（str 或 [str,...]）—— 生产侧行名与消费方查询名
+    曾错配（「扣非净利润」vs「净利润」），别名机制让新旧数据形状都能命中。
+    """
+    names = [name] if isinstance(name, str) else list(name or [])
     for r in fins.get("rows", []) or []:
-        if r.get("name") == name:
+        if r.get("name") in names:
             return list(r.get("values", []) or [])
     return []
 
@@ -231,17 +236,22 @@ def render_financial_facts(fins: dict) -> str:
     f = fins.get("financials", fins) if isinstance(fins, dict) else {}
     years = f.get("years", []) or []
     rev = row_vals(f, "营业收入")
-    net = row_vals(f, "净利润")
+    # 别名兼容：v1.5 及更早数据行名为「扣非净利润」
+    net = row_vals(f, ["净利润", "扣非净利润"])
     roe = row_vals(f, "ROE")
     gm = row_vals(f, "毛利率")
     debt = row_vals(f, "资产负债率")
+    # v1.6.0：同比改读专用增速行（上游直接给的真值），不再从绝对值序列二次计算 ——
+    # 旧做法在绝对值行缺失时连带同比一起丢，而增速行明明有数。
+    rev_yoy = row_vals(f, ["营收同比", "营业收入同比"])
+    net_yoy = row_vals(f, ["净利润同比", "归母净利润同比"])
     latest_year = years[-1] if years else "—"
     lines = [
         f"【财务指标】最新一期（{latest_year}）",
-        f"营业收入 {val_str(rev)}（同比 {yoy_str(rev)}）；净利润 {val_str(net)}（同比 {yoy_str(net)}）。",
+        f"营业收入 {val_str(rev)}（同比 {val_str(rev_yoy)}）；净利润 {val_str(net)}（同比 {val_str(net_yoy)}）。",
         f"ROE {val_str(roe)}（同比变动 {pp_str(roe)}）；毛利率 {val_str(gm)}（同比变动 {pp_str(gm)}）；"
         f"资产负债率 {val_str(debt)}（同比变动 {pp_str(debt)}）。",
-        "注：营收/净利润括注为同比增速（%）；ROE/毛利率/资产负债率括注为同比变动（pct=百分点）。",
+        "注：营收/净利润括注为上游增速行的同比（%）；ROE/毛利率/资产负债率括注为同比变动（pct=百分点）。",
     ]
     return "\n".join(lines)
 

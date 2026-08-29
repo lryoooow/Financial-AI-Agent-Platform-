@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Optional
 
@@ -40,21 +41,31 @@ _T_INDUSTRY = 20.0
 logger = logging.getLogger(__name__)
 
 # 按 task_id 存放取数结果与成稿，避免它们流经模型上下文。
-# 上限与 routes._TASK_LLM 同量级：家用场景不会有几百个并发任务，超了丢最早的。
-_STORE: dict[str, dict] = {}
+# v1.6.0（审计 E2）：FIFO→LRU —— 旧实现按插入序淘汰，仍在运行的任务槽位可能被后续
+# 任务挤出（compose_report 读到空 → 前功尽弃）。现在命中即续命；且 routes.pipeline
+# 在读取 draft_report 后会调用 clear_task 确定性释放槽位，双保险。
+from collections import OrderedDict as _OrderedDict
+
+_STORE: "dict[str, dict]" = _OrderedDict()
 _STORE_CAP = 64
 
 
 def _put(task_id: str, key: str, value: Any) -> None:
     slot = _STORE.setdefault(task_id, {})
     slot[key] = value
+    _STORE.move_to_end(task_id)
     if len(_STORE) > _STORE_CAP:
-        for k in list(_STORE)[: len(_STORE) - _STORE_CAP]:
-            _STORE.pop(k, None)
+        for k in list(_STORE.keys()):
+            if len(_STORE) <= _STORE_CAP:
+                break
+            if k != task_id:
+                _STORE.pop(k, None)
 
 
 def get_stored(task_id: str, key: str, default=None):
     """供 routes 取回 draft_report / findings——它们从不流经模型。"""
+    if task_id in _STORE:
+        _STORE.move_to_end(task_id)
     return (_STORE.get(task_id) or {}).get(key, default)
 
 
@@ -95,12 +106,17 @@ def _emit_summary(state: dict, summary: str) -> None:
     quote = (state.get("facts") or {}).get("quote") or {}
     # ticker 必须是带市场后缀的前端格式（600519.SH）：Workspace.tsx:183 直接拿 ev.ticker 当 code 用。
     # normalize_ticker 返回的是裸代码（600519），照发会让前端拿到错的标的格式。
-    raw = state.get("normalized_ticker") or state.get("code") or ""
+    # v1.6.0（审计 B8）：行业链路的 normalized_ticker 是申万行业码（如 801735），
+    # 无条件 to_market_ticker 会被错转成 801735.SZ。判据与 report.py 生成侧一致：
+    # state.is_industry 显式标志优先，80 前缀（申万行业码段，A 股个股无 80 开头）兜底。
+    raw = str(state.get("normalized_ticker") or state.get("code") or "")
+    is_industry = bool(state.get("is_industry")) or raw.startswith("80")
+    ticker = to_market_ticker(raw) if (raw and not is_industry and raw.isdigit() and len(raw) == 6) else raw
     _stream_push({
         "type": "research_summary",
         "text": summary,
         "name": quote.get("name") or "",
-        "ticker": to_market_ticker(raw) if raw else "",
+        "ticker": ticker,
         "price": quote.get("price"),
         "change": quote.get("change"),
         "changePct": quote.get("changePct"),
@@ -184,7 +200,10 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
                 reason = f"数据源暂时不可用（{iv_err or prov_err}），请稍后重试"
             else:
                 reason = f"未找到名为「{industry_name}」的行业，请换个说法（如「光伏」「半导体」「白酒」）"
-            return f"未能取到行业估值数据：{reason}。无法生成行业报告。"
+            # v1.6.0（审计 E2）：结构化错误 —— 纯字符串会让前端 tool_call 状态显示成
+            # 绿色 ok（stream._tool_failed 只认 JSON 里的 error 字段）。
+            return json.dumps({"error": f"未能取到行业估值数据：{reason}。无法生成行业报告。"},
+                              ensure_ascii=False)
 
         # 用最匹配的行业（items 已按粒度排序，第一个最具体）作为报告主体
         top = iv["items"][0]

@@ -33,8 +33,9 @@ from ..agents.deep.research_tools import clear_task as research_clear_task, get_
 from ..agents.deep.stream import stream_agent_sse
 from ..agents.graph import get_checkpointer
 from ..agents.prompts import CHART_SYSTEM
+from ..agents.workers.report import check_generated  # 对话合规闸与报告共用同一份禁用词检测
 from ..tools import export, now_iso
-from ..tools.secrets import decrypt_config, encrypt_config
+from ..tools.secrets import decrypt_config, decrypt_nested, encrypt_config, encrypt_nested
 from ..tools.context import build_chart_context, recent_diagnostics as context_diagnostics
 from ..tools.context_store import delete_conversation_data, media_path, offload_message_media
 from ..config import settings
@@ -82,6 +83,53 @@ class _ResearchRuntime:
 
 
 _RESEARCH_RUNS: dict[str, _ResearchRuntime] = {}
+# v1.6.0（审计 B9）：同会话并发发送守卫。研究链路有 _start_research_runtime 去重，
+# 对话此前没有 —— 两个并发 POST 在同一 thread_id 上并发跑两个 agent 实例，检查点
+# 状态交错、轮次重复/丢失，_chat_next_seq 还会分到相同 seq。
+_CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+_CHAT_LOCKS_CAP = 200
+
+
+def _chat_lock(conversation_id: str) -> asyncio.Lock:
+    lock = _CHAT_LOCKS.setdefault(conversation_id, asyncio.Lock())
+    if len(_CHAT_LOCKS) > _CHAT_LOCKS_CAP:
+        for k in [k for k, v in _CHAT_LOCKS.items() if not v.locked()][: len(_CHAT_LOCKS) - _CHAT_LOCKS_CAP]:
+            _CHAT_LOCKS.pop(k, None)
+    return lock
+
+
+async def sweep_stale_research_tasks() -> int:
+    """启动清扫（审计 B4）：把上一进程遗留的 pending/running 研究任务终结为 error。
+
+    此前无此清扫时，任务行会永久卡在「running」——研究任务页恢复出一条永远在转的
+    僵尸（生产库实证 3 条）。仅在 lifespan 启动时调用一次（新进程内不可能有活跃 runtime）。
+    """
+    swept = 0
+    async with session_scope() as s:
+        if s is None:
+            return 0
+        stmt = select(ResearchTask).where(ResearchTask.status.in_(["pending", "running"]))
+        rows = list((await s.execute(stmt)).scalars().all())
+        for t in rows:
+            t.status = "error"
+            t.stage = "error"
+            t.error = "应用重启，任务中断，请重新提交。"
+            swept += 1
+        if rows:
+            await s.commit()
+    if swept:
+        logger.info("启动清扫：%d 条遗留研究任务已标记为中断。", swept)
+    return swept
+
+
+def _task_age_seconds(updated) -> float:
+    """v1.6.0（审计 B5）：任务年龄（秒）。SQLite func.now() 存 naive-UTC（生产库实证），
+    与本地 naive now() 直接相减在东八区恒偏 +8h —— pending 任务 30s 复用窗口永远失效。"""
+    if updated is None:
+        return 9999.0
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=dt.UTC)
+    return (dt.datetime.now(dt.UTC) - updated).total_seconds()
 
 
 async def _mark_research_interrupted(task_id: str, message: str) -> None:
@@ -109,8 +157,10 @@ def _start_research_runtime(
         try:
             async for frame in factory():
                 runtime.history.append(frame)
-                if len(runtime.history) > 600:
-                    del runtime.history[: len(runtime.history) - 600]
+                # v1.6.0（审计 B11）：600→3000。真流式下四段 × ~300 token ≈ 1200-1700 帧
+                # section_token，旧上限会把摘要帧与早期段落挤出重连回放窗口（切页回来只见残卷）。
+                if len(runtime.history) > 3000:
+                    del runtime.history[: len(runtime.history) - 3000]
                 for queue in tuple(runtime.subscribers):
                     queue.put_nowait(frame)
         except asyncio.CancelledError:
@@ -255,19 +305,27 @@ async def get_local_setting(key: str) -> dict:
         if s is None:
             raise HTTPException(503, "local database unavailable")
         row = await s.get(LocalSetting, key)
-        return {"key": key, "payload": row.payload if row else None}
+        payload = row.payload if row else None
+    # v1.6.0（审计 B1）：model-configs 含各厂商明文 API Key，落库前统一加密。
+    # 读取时透明解密；历史明文行原样返回（前端下次保存即自动加密，零迁移）。
+    if key == "model-configs" and isinstance(payload, dict):
+        payload = decrypt_nested(payload)
+    return {"key": key, "payload": payload}
 
 
 @router.put("/local-settings/{key}")
 async def put_local_setting(key: str, req: LocalSettingRequest) -> dict:
+    payload = req.payload
+    if key == "model-configs" and isinstance(payload, dict):
+        payload = encrypt_nested(payload)
     async with session_scope() as s:
         if s is None:
             raise HTTPException(503, "local database unavailable")
         row = await s.get(LocalSetting, key)
         if row:
-            row.payload = req.payload
+            row.payload = payload
         else:
-            s.add(LocalSetting(key=key, payload=req.payload))
+            s.add(LocalSetting(key=key, payload=payload))
         await s.commit()
     return {"ok": True, "key": key}
 
@@ -498,15 +556,25 @@ async def context_media(conversation_id: str, filename: str):
     return FileResponse(path)
 
 
+def _iso_utc(value) -> str:
+    """v1.6.0（审计 B5）：naive-UTC（SQLite func.now 实际存储）→ aware ISO，
+    前端拿到带 +00:00 的规范时间戳，不再与本地时间差 8 小时。"""
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
+    return value.isoformat()
+
+
 def _chat_meta(conv: ChatConversation, messages: Optional[list[dict]] = None) -> dict:
     return {
         "id": conv.id,
         "title": conv.title,
         "snapshot_interval": conv.snapshot_interval,
         "model_config": conv.model_config,
-        "archived_at": conv.archived_at.isoformat() if conv.archived_at else None,
-        "created_at": conv.created_at.isoformat() if conv.created_at else "",
-        "updated_at": conv.updated_at.isoformat() if conv.updated_at else "",
+        "archived_at": _iso_utc(conv.archived_at) or None,
+        "created_at": _iso_utc(conv.created_at),
+        "updated_at": _iso_utc(conv.updated_at),
         "message_count": len(messages) if messages is not None else None,
     }
 
@@ -569,8 +637,25 @@ async def delete_chat_conversation(conversation_id: str) -> dict:
         await s.execute(delete(ChatContextSummary).where(ChatContextSummary.conversation_id == conversation_id))
         await s.delete(conv)
         await s.commit()
+    # v1.6.0（审计 B4）：会话已删、写锁已释放，再做副作用清理（失败不让删除回滚）——
+    # 1) LangGraph 检查点线程（thread_id == conv_id）：删报告早有对称清理，删会话此前没有，
+    #    检查点按 super-step 全量序列化消息，会话越长库越肥且删后永久残留；
+    # 2) 媒体目录；3) 上下文诊断行。
+    cp, _kind = get_checkpointer()
+    if cp is not None and hasattr(cp, "adelete_thread"):
+        try:
+            await cp.adelete_thread(conversation_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("删除检查点线程失败 conv=%s：%s", conversation_id, e)
+    try:
         await asyncio.to_thread(delete_conversation_data, conversation_id)
-        return {"ok": True, "channel": "deltachannel"}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("删除会话媒体目录失败 conv=%s：%s", conversation_id, e)
+    async with session_scope() as s2:
+        if s2 is not None:
+            await s2.execute(delete(LocalSetting).where(LocalSetting.key == f"context-diag:chat:{conversation_id}"))
+            await s2.commit()
+    return {"ok": True, "channel": "deltachannel"}
 
 
 @router.get("/chat/conversations/{conversation_id}")
@@ -674,68 +759,101 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     # 这里再建一个只为判空是白白多造一套 httpx 客户端。
     has_model = llm_available(llm_cfg)
 
+    # v1.6.0（审计 B9）：会话级并发守卫。前端单输入框通常不会并发，但双开窗口/刷新
+    # 竞态会让两个 POST 打进同一 thread_id：两个 agent 实例并发写同一检查点，
+    # 状态交错、轮次重复/丢失。已有流在跑直接 409。
+    chat_lock = _chat_lock(conversation_id)
+    if chat_lock.locked():
+        raise HTTPException(409, "该对话仍在生成上一条回复，请等它完成或先停止")
+
     async def gen():
         nonlocal summary_snapshot
         # 统一闭环：无论是否有模型/是否出错，都最终持久化助手回复并发 done。
         reply_text = ""
+        violated = False
 
-        if not has_model:
-            # 无模型：不是 transient error，给出可操作提示并正常闭环（发 token + 持久化 + done）
-            reply_text = (
-                "⚠️ 当前还没有可用模型。\n\n"
-                "请在「模型配置」中保存 API Key 与模型，再回到对话继续提问。"
-            )
-            yield sse.ev_chat_stage("composing", "正在组织回复")
-            await asyncio.sleep(0.1)
-            yield sse.ev_token(reply_text)
-        else:
-            # deepagents 是唯一实现。原先这里还有一条 legacy 分支（detect_ticker 预取行情 +
-            # build_chat_context 手写上下文 + 裸 llm.astream），已整体移除——它的每一项能力
-            # 都在 agent 链路里有对应实现，且更强：
-            #   detect_ticker 单标的预取  → agent 按需自己调 resolve_entity/get_realtime_quote，
-            #                               且能一轮里查多个标的（"茅台和五粮液比一下"）
-            #   build_chat_context 手写摘记 → SummarizationMiddleware（含历史卸载到文件系统）
-            #   offload/retrieve 原文取回   → FilesystemMiddleware，agent 按需自己 read_file
-            #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
-            try:
-                async for _line, _piece in _deepagent_chat_stream(
-                    conv_id=conv_id,
-                    text=text,
-                    history=history_snapshot,
-                    profile=user_profile,
-                    llm_cfg=llm_cfg,
-                    images=req.images,
-                    user_msg=history_snapshot[-1] if history_snapshot else None,
-                ):
-                    yield _line
-                    reply_text += _piece
-            except Exception as e:  # noqa: BLE001
-                logger.exception("对话链路失败")
-                # 已流式输出的部分保留；补失败说明后照常持久化 + done（闭环）
-                note = f"\n\n⚠️ 模型调用失败：{e}"
-                reply_text = (reply_text + note).strip() or note.strip()
-                yield sse.ev_error(str(e))
-            if not reply_text:
-                reply_text = "⚠️ 模型返回为空。可以换一个模型或把问题拆得更具体。"
+        async def _persist_reply(final_text: str):
+            """持久化助手回复（独立 session），返回 (meta, messages, assistant_msg)。"""
+            assistant_msg = _chat_msg("assistant", final_text)
+            final_meta = None
+            final_messages: list = []
+            async with session_scope() as s:
+                if s is not None:
+                    conv2 = await s.get(ChatConversation, conv_id)
+                    if conv2 is not None:
+                        history2 = await _chat_history(s, conv_id)
+                        history2 = await _chat_append(s, conv2, assistant_msg, history2)
+                        await s.commit()
+                        await s.refresh(conv2)
+                        final_meta = _chat_meta(conv2, history2)
+                        final_messages = history2
+            return final_meta, final_messages, assistant_msg
+
+        async with chat_lock:
+            if not has_model:
+                # 无模型：不是 transient error，给出可操作提示并正常闭环（发 token + 持久化 + done）
+                reply_text = (
+                    "⚠️ 当前还没有可用模型。\n\n"
+                    "请在「模型配置」中保存 API Key 与模型，再回到对话继续提问。"
+                )
+                yield sse.ev_chat_stage("composing", "正在组织回复")
+                await asyncio.sleep(0.1)
                 yield sse.ev_token(reply_text)
+            else:
+                # deepagents 是唯一实现。原先这里还有一条 legacy 分支（detect_ticker 预取行情 +
+                # build_chat_context 手写上下文 + 裸 llm.astream），已整体移除——它的每一项能力
+                # 都在 agent 链路里有对应实现，且更强：
+                #   detect_ticker 单标的预取  → agent 按需自己调 resolve_entity/get_realtime_quote，
+                #                               且能一轮里查多个标的（"茅台和五粮液比一下"）
+                #   build_chat_context 手写摘记 → SummarizationMiddleware（含历史卸载到文件系统）
+                #   offload/retrieve 原文取回   → FilesystemMiddleware，agent 按需自己 read_file
+                #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
+                try:
+                    gate_acc = ""
+                    async for _line, _piece in _deepagent_chat_stream(
+                        conv_id=conv_id,
+                        text=text,
+                        history=history_snapshot,
+                        profile=user_profile,
+                        llm_cfg=llm_cfg,
+                        images=req.images,
+                        user_msg=history_snapshot[-1] if history_snapshot else None,
+                    ):
+                        # v1.6.0（审计 B10，用户已批准）：对话链路禁用词闸 —— 与报告同一份
+                        # FORBIDDEN_VERBS 检测（此前报告有闸、聊天 token 原样直出，同一产品双标）。
+                        # 命中即停流：不再外发该 token 及后续内容，落库文本同样截断。
+                        if _piece:
+                            gate_acc += _piece
+                            if check_generated(gate_acc):
+                                violated = True
+                                break
+                        yield _line
+                        reply_text += _piece
+                except asyncio.CancelledError:
+                    # v1.6.0（审计 B9）：客户端断开/用户点停止 —— 已生成部分照样落库。
+                    # 此前生成器被取消=回复整体丢失，重开会话只剩提问没有回答。
+                    if (reply_text or "").strip():
+                        await _persist_reply(_strip_md(reply_text) + "\n\n（生成中断）")
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("对话链路失败")
+                    # 已流式输出的部分保留；补失败说明后照常持久化 + done（闭环）
+                    note = f"\n\n⚠️ 模型调用失败：{e}"
+                    reply_text = (reply_text + note).strip() or note.strip()
+                    yield sse.ev_error(str(e))
+                if violated:
+                    note = "\n\n（以上内容包含受限的投资建议表述，已按合规要求截断。本助手不提供买卖建议。）"
+                    reply_text = _strip_md(reply_text) + note
+                    yield sse.ev_token(note)
+                if not reply_text:
+                    reply_text = "⚠️ 模型返回为空。可以换一个模型或把问题拆得更具体。"
+                    yield sse.ev_token(reply_text)
 
-        # 落库前对完整文本再清洗一次（状态安全网：兜住逐 token 清洗无法处理的跨 token 拼接，如 ** 重组）
-        reply_text = _strip_md(reply_text)
+            # 落库前对完整文本再清洗一次（状态安全网：兜住逐 token 清洗无法处理的跨 token 拼接，如 ** 重组）
+            reply_text = _strip_md(reply_text)
 
-        # 2) 持久化助手回复（独立 session）——统一闭环
-        assistant_msg = _chat_msg("assistant", reply_text)
-        final_meta = None
-        final_messages: list = []
-        async with session_scope() as s:
-            if s is not None:
-                conv2 = await s.get(ChatConversation, conv_id)
-                if conv2 is not None:
-                    history2 = await _chat_history(s, conv_id)
-                    history2 = await _chat_append(s, conv2, assistant_msg, history2)
-                    await s.commit()
-                    await s.refresh(conv2)
-                    final_meta = _chat_meta(conv2, history2)
-                    final_messages = history2
+            # 2) 持久化助手回复（独立 session）——统一闭环
+            final_meta, final_messages, assistant_msg = await _persist_reply(reply_text)
         yield sse.sse({
             "type": "done",
             "conversation": final_meta,
@@ -768,8 +886,8 @@ def _research_task_meta(t: ResearchTask) -> dict:
         "stage": t.stage,          # pending/entity/research/market/report/done/error
         "report_id": t.report_id,
         "error": t.error,
-        "created_at": t.created_at.isoformat() if t.created_at else "",
-        "updated_at": t.updated_at.isoformat() if t.updated_at else "",
+        "created_at": _iso_utc(t.created_at),
+        "updated_at": _iso_utc(t.updated_at),
     }
 
 
@@ -791,6 +909,51 @@ async def list_research_tasks(limit: int = 50) -> dict:
         )
         rows = list((await s.execute(stmt)).scalars().all())
         return {"tasks": [_research_task_meta(t) for t in rows]}
+
+
+@router.delete("/research/{task_id}")
+async def delete_research_task(task_id: str) -> dict:
+    """删除研究任务（审计 B4）：失败/中断任务此前没有任何删除入口，检查点线程永久残留。
+
+    有关联报告的任务走报告库删除（连带任务与检查点），这里 409 引导。
+    """
+    async with session_scope() as s:
+        if s is None:
+            raise HTTPException(503, "local database unavailable")
+        t = await s.get(ResearchTask, task_id)
+        if not t:
+            raise HTTPException(404, "task not found")
+        if t.report_id:
+            raise HTTPException(409, "该任务已生成报告，请从报告库删除（连带任务与检查点）")
+        await s.delete(t)
+        await s.execute(delete(LocalSetting).where(LocalSetting.key == f"context-diag:research:{task_id}"))
+        await s.commit()
+    runtime = _RESEARCH_RUNS.pop(task_id, None)
+    rt = getattr(runtime, "task", None) if runtime is not None else None
+    if rt is not None and not rt.done():
+        rt.cancel()
+    _TASK_LLM.pop(task_id, None)
+    research_clear_task(task_id)
+    cp, _kind = get_checkpointer()
+    if cp is not None and hasattr(cp, "adelete_thread"):
+        try:
+            await cp.adelete_thread(task_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("删除检查点线程失败 task=%s：%s", task_id, e)
+    return {"ok": True, "deleted": task_id}
+
+
+@router.post("/shutdown")
+async def shutdown_backend(request: Request) -> dict:
+    """优雅停机（审计 B3）：Electron 退出前先握手，让 lifespan 收尾/检查点 flush 执行。
+
+    run_server 把 uvicorn.Server 实例挂到 app.state；直连源码跑（无挂载）时本端点无效。
+    """
+    server = getattr(request.app.state, "uvicorn_server", None)
+    if server is not None:
+        server.should_exit = True
+        return {"ok": True}
+    return {"ok": False, "note": "server handle unavailable（源码直跑模式）"}
 
 
 @router.get("/research/{task_id}")
@@ -830,9 +993,8 @@ async def create_research(req: ResearchRequest) -> dict:
             if existing is not None:
                 runtime = _RESEARCH_RUNS.get(existing.id)
                 is_active = bool(runtime and runtime.task and not runtime.task.done())
-                updated = existing.updated_at or existing.created_at
-                now = dt.datetime.now(updated.tzinfo) if updated and updated.tzinfo else dt.datetime.now()
-                age_s = (now - updated).total_seconds() if updated else 9999
+                # v1.6.0（审计 B5）：统一 aware-UTC 计算（详见 _task_age_seconds docstring）
+                age_s = _task_age_seconds(existing.updated_at or existing.created_at)
                 if is_active or (existing.status == "pending" and age_s <= 30):
                     _remember_task_llm(existing.id, req.llm or decrypt_config(existing.llm_config))
                     return {"task_id": existing.id, "reused": True}
@@ -995,6 +1157,9 @@ async def research_stream(
             # 报告不经模型上下文，直接从工具层存储取回（见 research_tools 的设计说明）
             draft = research_get_stored(task_id, "draft_report")
             merged_timings.update(research_get_stored(task_id, "timings", {}) or {})
+            # v1.6.0（审计 E2）：draft 已取回即确定性释放 _STORE 槽位（配合 LRU，
+            # 不再依赖上限挤出；运行中任务不会被后续任务挤出）
+            research_clear_task(task_id)
 
             if not draft:
                 async with session_scope() as s:
@@ -1111,7 +1276,7 @@ async def list_reports(limit: int = 100) -> dict:
             "template": r.template,
             "summary": (r.summary or "")[:300],
             "as_of": r.as_of or "",
-            "created_at": r.created_at.isoformat() if r.created_at else "",
+            "created_at": _iso_utc(r.created_at),
         } for r in rows]}
 
 
@@ -1238,6 +1403,8 @@ async def delete_report(report_id: str) -> dict:
             task = await s.get(ResearchTask, task_id)
             if task is not None:
                 await s.delete(task)  # 连带删来源任务（task↔report 1:1）
+            # v1.6.0（审计 B4）：连带清理上下文诊断行（此前删报告后永久残留，生产库实证 20+ 条）
+            await s.execute(delete(LocalSetting).where(LocalSetting.key == f"context-diag:research:{task_id}"))
         await s.commit()
     # 会话已提交、写锁已释放，再做副作用清理（这些即便失败也不该让删除回滚）
     if task_id:
@@ -1246,6 +1413,8 @@ async def delete_report(report_id: str) -> dict:
         rt = getattr(runtime, "task", None) if runtime is not None else None
         if rt is not None and not rt.done():
             rt.cancel()
+        _TASK_LLM.pop(task_id, None)
+        research_clear_task(task_id)
         # 删检查点线程（清中间状态，真正不留痕）；用检查点自己的连接，不占主库写锁
         cp, _kind = get_checkpointer()
         if cp is not None and hasattr(cp, "adelete_thread"):

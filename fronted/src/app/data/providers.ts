@@ -266,5 +266,3 @@ export const PROVIDERS: Provider[] = [
   },
 ];
 
-export const emptyKeyState = (): Record<string, string> =>
-  Object.fromEntries(PROVIDERS.map((p) => [p.id, ""]));

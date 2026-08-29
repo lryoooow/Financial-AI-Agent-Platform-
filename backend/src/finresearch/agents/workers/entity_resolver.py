@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 
@@ -14,7 +15,9 @@ logger = logging.getLogger(__name__)
 async def entity_node(state: ResearchState) -> dict:
     code = state.get("code", "")
     norm = normalize_ticker(code)
-    name = get_company_name(norm) or ""
+    # v1.6.0（审计 E2）：种子清单首次加载/过期重载是同步读盘（种子缺失时还会同步拉
+    # 全市场），直接调用会卡住事件循环 —— 挪进线程池。
+    name = await asyncio.to_thread(get_company_name, norm) or ""
     logger.info("[entity] %s -> %s (%s)", code, norm, name)
     return {
         "normalized_ticker": norm,

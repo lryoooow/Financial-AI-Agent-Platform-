@@ -8,9 +8,10 @@
      而 system prompt 又命令模型"严格引用事实块"——等于指挥模型写编造值。
 2. 数据缺失时诚实降级：不展开就是不展开，不一边标"未展开"一边输出整段正文；
    零数据套话（"行业景气度受宏观经济、政策导向共同影响"）一律删除。
-3. 合规禁用词：check_generated 只检测 → 命中则重写一次 → 仍命中回退规则模板并标注。
-   盲替换已废弃（会污染引文、产生"不建议建议关注（偏多）"）。引文永不 sanitize。
-4. 可溯源：证据分层栏按各段**实际**生成来源（llm/template/insufficient）如实声明。
+3. 合规禁用词：check_generated 只检测 → 命中即停流并回退规则模板（v1.6.0 注释对齐：
+   实际流程没有「重写一次」环节，旧注释与实现不符）。盲替换已废弃（会污染引文、
+   产生"不建议建议关注（偏多）"）。引文永不 sanitize。
+4. 可溯源：证据分层栏按各段**实际**生成来源（llm/template/insufficient/error）如实声明。
 
 模板驱动：SECTION_SPECS 按 equity_deep/industry/earnings/risk 给出不同栏目集合与顺序；
 每段只构造本段所需字段的事实块（估值段看不到新闻，行业段看不到 KDJ），
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...config import settings
-from ...llm import build_llm
+from ...llm import build_llm, is_reasoning_model
 from ...tools import facts, report as report_tool
 from ...tools.context import build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
@@ -48,9 +49,11 @@ _SRC_LABELS = {
     "akshare": "AkShare（东方财富）",
 }
 
-# 摘要 + 各段并发撰写；家用 key 的 RPS 有限，不加闸会成片 429 → 静默回退模板。
-_LLM_GATE = asyncio.Semaphore(max(1, int(getattr(settings, "report_llm_concurrency", 3))))
-_SECTION_TIMEOUT = float(getattr(settings, "report_section_timeout_s", 60.0))
+# v1.6.0（审计 D4 注释对齐）：1.5.0 起报告四段改「逐段串行真流式」，本闸不再承担
+# 段间并发限流（串行天然 ≤1），仅作为全链路 LLM 并发护栏存在（对话/摘要同时跑时共用）。
+# getattr 兜底值与 config 实际默认对齐（4 并发 / 30s 超时）。
+_LLM_GATE = asyncio.Semaphore(max(1, int(getattr(settings, "report_llm_concurrency", 4))))
+_SECTION_TIMEOUT = float(getattr(settings, "report_section_timeout_s", 30.0))
 
 
 async def _invoke(llm, messages) -> str:
@@ -311,15 +314,21 @@ def _section_technical(fv: dict) -> str:
 def _section_fundamentals(fv: dict) -> str:
     fins = fv.get("fins", {})
     rev = facts.row_vals(fins, "营业收入")
-    net = facts.row_vals(fins, "净利润")
+    # v1.6.0：别名兼容（v1.5 及更早行名为「扣非净利润」）
+    net = facts.row_vals(fins, ["净利润", "扣非净利润"])
     roe = facts.row_vals(fins, "ROE")
     gm = facts.row_vals(fins, "毛利率")
     debt = facts.row_vals(fins, "资产负债率")
     years = fins.get("years", []) or []
 
     blocks: list[str] = []
-    rev_yoy = facts.yoy_pct(rev)
-    net_yoy = facts.yoy_pct(net)
+    # v1.6.0：同比优先读上游增速行真值（"营收同比"/"净利润同比"），缺失再从绝对值序列推
+    def _yoy_or_series(series: list, row_names: list) -> Optional[float]:
+        direct = facts.to_float(facts.val_str(facts.row_vals(fins, row_names)))
+        return direct if direct is not None else facts.yoy_pct(series)
+
+    rev_yoy = _yoy_or_series(rev, ["营收同比", "营业收入同比"])
+    net_yoy = _yoy_or_series(net, ["净利润同比", "归母净利润同比"])
     rev_l, net_l = facts.val_str(rev), facts.val_str(net)
     if rev_yoy is not None or net_yoy is not None:
         line = (
@@ -494,6 +503,9 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
     by_llm = [t for t, g in gen.items() if g == "llm"]
     by_tpl = [t for t, g in gen.items() if g == "template"]
     thin = [t for t, g in gen.items() if g == "insufficient"]
+    # v1.6.0（审计 E2）：补第四类 —— 生成失败段（fallback 也崩的最后兜底）此前在
+    # 证据分层栏凭空消失，来源统计与实际段落数对不上。
+    by_err = [t for t, g in gen.items() if g == "error"]
     lines = []
     if by_llm:
         lines.append(f"模型撰写：{'、'.join(by_llm)}（基于结构化事实块，凡未出现在事实块中的判断均为定性推断）")
@@ -501,6 +513,8 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
         lines.append(f"规则模板撰写：{'、'.join(by_tpl)}（模型不可用、调用失败或输出含禁用表述，已降级）")
     if thin:
         lines.append(f"数据不足未展开：{'、'.join(thin)}")
+    if by_err:
+        lines.append(f"生成失败（占位文案）：{'、'.join(by_err)}")
     parts.append("【生成来源】" + ("；".join(lines) if lines else "全部由规则模板生成。") + "。本报告不构成投资建议。")
     return "\n".join(parts)
 
@@ -723,9 +737,16 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
     # temperature 统一 1.0：o3 / QwQ 等推理模型拒绝非默认 temperature，
     # 设 0.7 会让这些模型整段静默回退模板。
     # streaming=True：报告分段改真流式，逐 token 吐给前端（见下方 astream 循环）。
+    # v1.6.0（审计 P0）：推理模型的 max_tokens 官方语义**包含思维链输出**，且
+    # langchain-openai 不把 reasoning_content 提进 .content —— 480 token 全被 CoT 吃掉时
+    # finish_reason=length、content 为空串，四段全静默回退模板（生产日志成片复现）。
+    # 推理模型放宽到 4096（正文长度仍由下方 cap 字符上限约束），普通模型维持 480。
+    model_name = str(((state.get("llm_config") or {}).get("model")) or "")
+    base_tokens = max(64, int(getattr(settings, "report_section_max_tokens", 480)))
+    section_max_tokens = 4096 if is_reasoning_model(model_name) else base_tokens
     llm = build_llm(
         streaming=True,
-        max_tokens=max(64, int(getattr(settings, "report_section_max_tokens", 480))),
+        max_tokens=section_max_tokens,
         override=state.get("llm_config"),
     )
     if llm is None:
@@ -773,7 +794,10 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
         # 空/纯空白兜底：模型在并发限流、内容审查、max_tokens 被 reasoning 吃满等情况下偶发返回空。
         # 空返回当撰写失败、回退规则模板（body 必非空），如实标注来源 template；否则渲染成空白章节。
         if not text.strip():
-            logger.warning("%s LLM 流式返回空内容，回退模板", spec.key)
+            logger.warning(
+                "%s LLM 流式返回空内容，回退模板（模型=%s，max_tokens=%s；推理模型 CoT 吃满上限为最常见根因）",
+                spec.key, model_name or "(默认)", section_max_tokens,
+            )
             finalize_diag(diag, _elapsed(), error="empty_llm_output")
             return spec.fallback(fv), "template"
         text, truncated = _bound_generated_text(text, cap)
@@ -899,7 +923,10 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
     ) or "指标数据不足"
 
     rev = facts.row_vals(fins, "营业收入")
-    net = facts.row_vals(fins, "净利润")
+    # v1.6.0：别名兼容（v1.5 及更早行名为「扣非净利润」），同比优先读上游增速行真值
+    net = facts.row_vals(fins, ["净利润", "扣非净利润"])
+    rev_yoy_row = facts.row_vals(fins, ["营收同比", "营业收入同比"])
+    net_yoy_row = facts.row_vals(fins, ["净利润同比", "归母净利润同比"])
     risk_signals = "；".join(state.get("risk_flags") or []) or "未触发明确风险信号"
 
     m = _quote_measures(quote)
@@ -911,9 +938,9 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
         "as_of": quote.get("as_of") or state.get("data_as_of", "") or facts.MISSING,
         "roe": facts.val_str(facts.row_vals(fins, "ROE")),
         "revenue": facts.val_str(rev),
-        "rev_yoy": facts.pct(facts.yoy_pct(rev), 1),
+        "rev_yoy": facts.val_str(rev_yoy_row) if rev_yoy_row else facts.pct(facts.yoy_pct(rev), 1),
         "net_profit": facts.val_str(net),
-        "net_yoy": facts.pct(facts.yoy_pct(net), 1),
+        "net_yoy": facts.val_str(net_yoy_row) if net_yoy_row else facts.pct(facts.yoy_pct(net), 1),
         "gross_margin": facts.val_str(facts.row_vals(fins, "毛利率")),
         "debt_ratio": facts.val_str(facts.row_vals(fins, "资产负债率")),
         "tech_direction": direction,
@@ -1010,8 +1037,9 @@ def _compose_risks(risk_flags: list, fv: dict) -> list:
 async def summary_node(state: ResearchState) -> dict:
     """在详细段落开始前产出摘要，降低研究任务的首段等待时间。
 
-    1.2.3：默认使用 LLM 撰写摘要（config.report_use_llm_summary=True），
-    与四个详细段落口吻统一；LLM 不可用时自动回退模板。
+    v1.6.0（审计 D4，注释与实现对齐）：出厂默认 report_use_llm_summary=False ——
+    规则模板摘要先行，保证首屏可见速度；置 True 时走 LLM 撰写（口吻与详细段落统一），
+    LLM 不可用自动回退模板。此前 docstring 声称"默认 True"与 config 实际值相矛盾。
     """
     t0 = time.perf_counter()
     findings = state.get("findings", [])

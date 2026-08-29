@@ -116,10 +116,16 @@ def build_llm(
     streaming: bool = False,
     max_tokens: Optional[int] = None,
     override: Optional[dict] = None,
+    timeout: float = 120.0,
+    max_retries: int = 1,
 ) -> Optional[ChatOpenAI]:
     """构造分析师级 LLM。override（前端选择）优先；都无配置返回 None。
 
     temperature 默认由 _resolve_temperature(model) 智能决定；调用方显式传值则尊重。
+
+    v1.6.0（审计 B11）：默认 timeout=120s / max_retries=1。此前不传时 openai 客户端
+    默认 600s 总超时 + 2 次重试 —— 厂商挂起时对话流可卡 10 分钟且 SSE 无任何产出。
+    120s 是 read 超时（两次字节之间的间隔上限），长回复流式不受影响。
     """
     resolved = _resolve(override)
     if resolved is None:
@@ -136,6 +142,8 @@ def build_llm(
         max_tokens=max_tokens,
         base_url=base_url,
         api_key=api_key,
+        timeout=timeout,
+        max_retries=max_retries,
     )
 
 

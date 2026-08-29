@@ -9,6 +9,7 @@ import {
   Plus,
   Send,
   Sparkles,
+  Square,
   Trash2,
   UserRound,
   X,
@@ -88,6 +89,17 @@ export function ChatDesk({
   const [stage, setStage] = useState("");
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // v1.6.0（审计 C1）：会话守卫与流控制。
+  // activeConvIdRef —— 流回调据此判断"用户是否已切走"，防止旧流 onDone 覆盖新会话；
+  // openSeqRef —— 会话打开请求序号，防乱序返回；
+  // stopRef —— 当前流的 AbortController（停止按钮/看门狗触发）。
+  const activeConvIdRef = useRef<string | null>(null);
+  const openSeqRef = useRef(0);
+  const stopRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    activeConvIdRef.current = current?.id ?? null;
+  }, [current]);
 
   // 图片上传状态
   const [pendingImages, setPendingImages] = useState<string[]>([]); // 待发送的 base64 data URL
@@ -126,11 +138,15 @@ export function ChatDesk({
 
   async function openConversation(id: string) {
     setError("");
+    // v1.6.0（审计 C1）：请求序号守卫 —— 快速切换会话时，旧请求的返回不得覆盖新会话
+    const seq = ++openSeqRef.current;
     try {
       const r = await api.chatConversation(id);
+      if (openSeqRef.current !== seq) return;
       setCurrent(r.conversation);
       setMessages(r.messages);
     } catch (e) {
+      if (openSeqRef.current !== seq) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }
@@ -165,6 +181,8 @@ export function ChatDesk({
   async function deleteConversation(c: ChatConversation) {
     if (!window.confirm(`确定删除「${c.title || "新对话"}」及其全部本地历史吗？`)) return;
     setError("");
+    // v1.6.0（审计 C1）：删除正在流式的对话先停流，避免 done 回调把已删会话写回状态
+    if (current?.id === c.id) stopRef.current?.abort();
     try {
       await api.deleteChatConversation(c.id);
       if (current?.id === c.id) {
@@ -200,6 +218,13 @@ export function ChatDesk({
       { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
     ]);
     setStreamingId(assistantId);
+    // v1.6.0（审计 C1）：流可中断 + 90s 无输出看门狗
+    const ac = new AbortController();
+    stopRef.current = ac;
+    const watchdog = window.setTimeout(
+      () => ac.abort(new Error("模型长时间无输出")),
+      90_000,
+    );
     try {
       let conv = current;
       if (!conv) {
@@ -208,27 +233,42 @@ export function ChatDesk({
         setCurrent(conv);
         setConversations((prev) => [conv!, ...prev]);
       }
-      await api.sendChatMessageStream(conv.id, text, llm, imgs.length ? imgs : undefined, {
-        onStage: (_s, label) => setStage(label),
-        onToken: (piece) =>
-          setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x))),
+      const convId = conv.id;
+      const isStale = () => activeConvIdRef.current !== convId;
+      await api.sendChatMessageStream(convId, text, llm, imgs.length ? imgs : undefined, {
+        signal: ac.signal,
+        onStage: (_s, label) => { if (!isStale()) setStage(label); },
+        onToken: (piece) => {
+          if (isStale()) return;
+          setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
+        },
         onDone: (payload) => {
+          if (isStale()) return; // 用户已切走：旧流的完成态不得覆盖当前会话
           if (payload.conversation) setCurrent(payload.conversation);
           setMessages(payload.messages?.length ? payload.messages : (m) => m);
           setStreamingId(null);
           refreshList(false);
         },
         onError: (msg) => {
+          if (isStale()) return;
           setError(msg);
           setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
           setStreamingId(null);
         },
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content) && x.id !== optimistic.id));
+      if ((e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出") {
+        // 用户停止/看门狗：已生成部分保留（后端会把部分回复落库并标注「生成中断」）
+        setError("已停止生成");
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      // 后端在流开始前已持久化用户消息：只移除空的助手占位，不再回删提问
+      setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
       setStreamingId(null);
     } finally {
+      window.clearTimeout(watchdog);
+      if (stopRef.current === ac) stopRef.current = null;
       setLoading(false);
       setStage("");
     }
@@ -493,6 +533,15 @@ export function ChatDesk({
                 rows={2}
                 className="min-h-[44px] flex-1 resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60"
               />
+              {loading && (
+                <button
+                  onClick={() => stopRef.current?.abort()}
+                  className="grid place-items-center size-10 rounded-lg bg-destructive/15 text-destructive hover:bg-destructive/25 transition-colors shrink-0"
+                  title="停止生成"
+                >
+                  <Square className="size-3.5 fill-current" />
+                </button>
+              )}
               <button
                 onClick={send}
                 disabled={!canSend}

@@ -216,7 +216,8 @@ export function MarketView({
         const qq = await api.quote(code, ac.signal);
         if (cancelled || ac.signal.aborted || seq !== loadSeq.current) return;
         if (!isUsableQuote(qq)) {
-          const reason = qq?.provenance?.error || "行情接口未返回有效价格";
+          // 类型守卫的负分支把 qq 收窄成 null；显式宽化回 Quote|null 再取失败原因
+          const reason = (qq as Quote | null)?.provenance?.error || "行情接口未返回有效价格";
           setQuoteError(reason);
           return;
         }

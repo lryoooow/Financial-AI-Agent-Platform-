@@ -118,5 +118,5 @@ agent loop 上限 `agent_recursion_limit=30`（langgraph super-step，实测覆�
   但 sina 不返回这些估值字段。报告会如实标注"未获取"而非编造。行业级 PE/PB 走申万/新浪接口，正常可取。
   若需恢复个股估值：排查本机到 `push2.eastmoney.com` 的网络，或接入第三方源（`TUSHARE_TOKEN` 已留槽位）。
 - 检查点降级 MemorySaver 后任务状态不持久（重启丢失）。
-- PDF 导出需 `pip install -e ".[pdf]"` 装 weasyprint（Windows 需 GTK）。
+- PDF 导出由 reportlab 内置实现（STSong CID 字体，无 GTK 依赖）。
 - 财务指标接口字段名以 akshare 2026 现状为准，缺失字段显示"—"而非 0。

@@ -107,14 +107,12 @@ def render_html(doc: dict) -> str:
 
 
 def render_pdf(html: str) -> Optional[bytes]:
-    """可选 PDF 导出。weasyprint 未安装返回 None。"""
-    try:
-        from weasyprint import HTML  # type: ignore
+    """[v1.6.0 已废弃] PDF 导出实际由 tools/export.py 的 reportlab 实现负责。
 
-        return HTML(string=html).write_pdf()
-    except Exception as e:  # noqa: BLE001
-        logger.info("PDF 导出跳过（weasyprint 未安装或失败）：%s", e)
-        return None
+    保留本签名仅为兼容历史 import；weasyprint 方案（依赖 GTK）从未进入打包产物。
+    """
+    logger.debug("report.render_pdf 已废弃：PDF 由 export.render_pdf（reportlab）实现")
+    return None
 
 
 def build_doc(

@@ -27,12 +27,18 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const r = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+  let r: Response;
+  try {
+    r = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (e) {
+    if ((e as DOMException)?.name === "AbortError") throw e;
+    throw new Error("后端连接失败，请稍后重试"); // v1.6.0：与 getJson 同款友好文案
+  }
   if (!r.ok) {
     let detail = "";
     try {
@@ -45,12 +51,17 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
 }
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(`${API_BASE}${path}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    cache: "no-store",
-  });
+  let r: Response;
+  try {
+    r = await fetch(`${API_BASE}${path}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("后端连接失败，请稍后重试");
+  }
   if (!r.ok) {
     let detail = "";
     try {
@@ -64,17 +75,22 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
 
 /** 前端所选 LLM 配置（研究/速读时随请求传后端，真正打通前后端模型）。 */
 async function deleteJson<T>(path: string): Promise<T> {
-  const r = await fetch(`${API_BASE}${path}`, {
-    method: "DELETE",
-    cache: "no-store",
-  });
+  let r: Response;
+  try {
+    r = await fetch(`${API_BASE}${path}`, {
+      method: "DELETE",
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("后端连接失败，请稍后重试");
+  }
   if (!r.ok) {
     let detail = "";
     try {
       const payload = await r.json();
       detail = payload?.detail || payload?.message || payload?.error || "";
     } catch {}
-    throw new Error(detail ? `${path} -> ${r.status}: ${detail}` : `${path} -> ${r.status}`);
+    throw new Error(detail ? `${path} → ${r.status}: ${detail}` : `${path} → ${r.status}`);
   }
   return (await r.json()) as T;
 }
@@ -404,7 +420,7 @@ export const api = {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n"); // v1.6.0：兼容 CRLF 分隔
       const frames = buf.split("\n\n");
       buf = frames.pop() || "";
       for (const frame of frames) {

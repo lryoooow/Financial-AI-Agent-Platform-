@@ -14,9 +14,14 @@ interface Props {
 }
 
 /**
- * 研究任务页（1.2.0）：独立的深度研究入口。
- * 上：辅助行情组件 MarketView（可折叠，按需复用）；下：研究工作台 Workspace（搜索标的/选模型/选模板/生成报告/管线+耗时）。
+ * 研究任务页：独立的深度研究入口。
+ * 上：辅助行情组件 MarketView（可折叠，按需复用）；下：研究工作台 Workspace。
  * 共享 selectedCode：行情图上"生成研究报告"一键带到下方法线跑研究。
+ *
+ * v1.6.0（审计 C2）：结构收敛为单一父级 —— 此前 showMarket 两分支的父节点类型不同
+ * （PanelGroup vs div），切换「隐藏行情/行情辅助」会整树重挂载：Workspace 里的研究
+ * SSE 连接泄漏、运行中任务从 UI 消失。现在 Workspace 始终挂在同一个 PanelGroup 下，
+ * 折叠只卸载 MarketView 子树。
  */
 export function ResearchTasks({ activeModel, onGoSettings, onReportGenerated }: Props) {
   const [code, setCode] = useState("600519.SH");
@@ -43,39 +48,30 @@ export function ResearchTasks({ activeModel, onGoSettings, onReportGenerated }: 
         </button>
       </div>
       <div className="flex-1 min-h-0 p-3 pt-1">
-        {showMarket ? (
-          <PanelGroup direction="vertical" className="h-full">
-            <Panel defaultSize={46} minSize={22}>
-              <div className="h-full min-h-0 overflow-y-auto">
-                <MarketView code={code} onSelect={setCode} onResearch={analyze} />
-              </div>
-            </Panel>
-            <PanelResizeHandle className="h-1.5 bg-border hover:bg-gold/50 data-[resize-handle-state=drag]:bg-gold transition-colors" />
-            <Panel defaultSize={54} minSize={25}>
-              <div className="h-full min-h-0 overflow-y-auto">
-                <Workspace
-                  key={trigger ?? "idle"}
-                  initialCode={trigger}
-                  selectedCode={code}
-                  activeModel={activeModel}
-                  onGoSettings={onGoSettings}
-                  onReportGenerated={onReportGenerated}
-                />
-              </div>
-            </Panel>
-          </PanelGroup>
-        ) : (
-          <div className="h-full min-h-0 overflow-y-auto">
-            <Workspace
-              key={trigger ?? "idle"}
-              initialCode={trigger}
-              selectedCode={code}
-              activeModel={activeModel}
-              onGoSettings={onGoSettings}
-              onReportGenerated={onReportGenerated}
-            />
-          </div>
-        )}
+        <PanelGroup direction="vertical" className="h-full">
+          {showMarket && (
+            <>
+              <Panel defaultSize={46} minSize={22}>
+                <div className="h-full min-h-0 overflow-y-auto">
+                  <MarketView code={code} onSelect={setCode} onResearch={analyze} />
+                </div>
+              </Panel>
+              <PanelResizeHandle className="h-1.5 bg-border hover:bg-gold/50 data-[resize-handle-state=drag]:bg-gold transition-colors" />
+            </>
+          )}
+          <Panel defaultSize={showMarket ? 54 : 100} minSize={25}>
+            <div className="h-full min-h-0 overflow-y-auto">
+              <Workspace
+                key={trigger ?? "idle"}
+                initialCode={trigger}
+                selectedCode={code}
+                activeModel={activeModel}
+                onGoSettings={onGoSettings}
+                onReportGenerated={onReportGenerated}
+              />
+            </div>
+          </Panel>
+        </PanelGroup>
       </div>
     </div>
   );

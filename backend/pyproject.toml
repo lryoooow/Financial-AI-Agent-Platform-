@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finresearch"
-version = "1.5.0"
+version = "1.6.0"
 description = "景渊 JingYuan · 家用本地金融研究助手后端（akshare + LangGraph 固定管线）"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,7 +14,6 @@ dependencies = [
   # Web
   "fastapi>=0.110",
   "uvicorn[standard]>=0.29",
-  "sse-starlette>=2.1",
   # DB（桌面默认 SQLite/aiosqlite；开发可用 PG/psycopg）
   "sqlalchemy[asyncio]>=2.0.29",
   "aiosqlite>=0.20",                   # SQLite async 驱动（桌面默认）
@@ -55,9 +54,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pdf = ["weasyprint>=61"]
-desktop = ["pywebview>=5.0"]           # 真软件窗口（pywebview + WebView2，打包用）
+pdf = ["weasyprint>=61"]               # 可选（默认 PDF 走 reportlab，无需本项）
 packaging = ["pyinstaller>=6.0"]       # 打包成 exe
+# v1.6.0：desktop(pywebview) 入口已移除（Electron 是唯一桌面外壳），extra 一并删除
 server = [                             # PostgreSQL 检查点（仅服务端部署用，桌面不装）
   "psycopg[binary]>=3.1.18",
   "langgraph-checkpoint-postgres>=0.2.0",

@@ -1,8 +1,88 @@
 # 更新日志
 
-## 1.5.0
+## 1.6.0
 
-大版本：报告分段真流式 + 报告库真删除 + 对话稳定性修复。
+审计修复大版本：基于 2026-08-28 全量代码审计（P0×5 / P1×16 / P2×18 / P3×16，含 6 项本机复现实证），
+全部问题修复 + 新增 25 个测试文件 + 重新打包。
+
+### 修复（P0 · 必现故障）
+
+- **新闻搜索在本机 100% 失败（双根因）**：① Referer 头裸拼中文关键词（HTTP 头仅 latin-1，
+  行业研究固定传中文行业名必炸）→ percent-encode；② curl_cffi 在 Windows 按本机 ANSI 代码页
+  编码 CA 证书路径，安装路径含代码页外字符（如「渊」∉ cp950）时必崩 → 启动时把 certifi 证书
+  复制到纯 ASCII 路径并设 SSL_CERT_FILE 等环境变量。故障机上实测从必炸转为正常返回。
+- **五档盘口功能 100% 死亡（三重契约错误）**：传带前缀代码（akshare 要纯代码）、对 dict 调
+  .iloc、期待中文标签（实际是 sell_5/buy_5 英文键 + 价格/挂单量独立行）→ 按真实返回形状重写。
+- **报告「营业收入」恒为「—」**：pick 候选键与接口真实列名不符 → 按实测列名补齐候选，并在
+  provenance.note 留痕实际命中列。
+- **「净利润」取到却渲染不出、同报告自相矛盾**：生产行名「扣非净利润」与消费方查询的
+  「净利润」精确匹配不上 → 行名统一 + row_vals 别名机制 + 同比改读专用增速行（不再从
+  绝对值二次计算），v1.5 旧数据形状兼容。
+- **推理模型生成报告四段全空回退模板**：max_tokens=480 被思维链吃满 → content 为空。
+  按 is_reasoning_model() 放宽到 4096（普通模型维持 480），空返回日志补根因提示。
+
+### 修复（P1 · 高频错误 / 安全 / 资源）
+
+- **API Key 明文落库**：model-configs 读取/写入透明加解密（Windows DPAPI 首选，旧 enc: 兼容，
+  失败返空串不再把密文当明文用）；CORS 从「任意 localhost:\*」收紧为仅 vite dev 显式来源。
+- **双开竞态**：Electron 加单实例锁；port.txt 原子写；后端父进程看门狗（Electron 崩溃后
+  不再遗留孤儿 FinResearch.exe）。
+- **优雅退出**：新增 POST /api/shutdown 握手，Electron 退出先握手等 lifespan 收尾（检查点
+  flush / 「关闭。」日志），超时 5s 才硬杀。此前生产路径 lifespan 收尾 0 次执行过。
+- **检查点线程泄漏**：删除会话连带清理 LangGraph 检查点线程与诊断行；失败研究任务新增
+  DELETE /api/research/{task_id} 删除入口；启动时清扫僵尸 pending/running 任务（生产库
+  实证 3 条永久卡 running）。
+- **东八区时区 bug**：任务年龄统一 aware-UTC 计算（旧实现 naive-UTC 与本地时间直接相减，
+  恒偏 +8h，pending 任务 30s 复用窗口永远失效）；所有对外时间戳统一带 +00:00。
+- **北交所 920xxx 全线判为深证**（种子表 325 只全灭）→ 前缀组补 "92"（entity/market/
+  market_provider/前端五处）。
+- **行业研究 ticker 被错转 801735.SZ** → is_industry 标志 + 80 前缀双判据原样透传。
+- **公司资料直连熔断**：push2 端点持续不可达时 5 分钟熔断 + 会话复用 + 统一 UA/Referer，
+  不再每次研究连烧必败请求；Windows 注册表代理先物化进 env 再 NO_PROXY bypass（修复
+  「必须走代理出网」环境被全局断网的副作用）；NO_PROXY 通配符形态清洗。
+- **对话合规闸**：聊天 token 流与报告共用同一份禁用词检测，命中即截断并附提示（用户批准）。
+- **同会话并发守卫**：会话级锁，第二个并发 POST 返回 409；客户端断开/用户停止时已生成的
+  部分回复照常落库（标注「生成中断」），不再整条丢失。
+- **前端三条 P1**：对话流加会话守卫（切会话不再被旧流覆盖）+ AbortController + 停止按钮 +
+  90s 看门狗；研究 SSE 连接由 useResearchStream hook 托管（卸载必关、单连接）+ 挂载时自动
+  重连运行中任务（后端 history 回放终于有消费者）+ ResearchTasks 结构收敛消除重挂载；
+  「测试连通性」从 sleep(1100)+随机延迟的假测试改为真拉厂商 /models。
+- **启动体验**：Electron 先出 splash 再等后端（最长 4 分钟黑等消除）；后端 3 次重启失败
+  弹错误框退出；waitHealth 加单次 3s 超时；前端加 ErrorBoundary（渲染异常不再白屏）；
+  active-model 先写后读竞态守卫；Settings 非法 providerId 兜底。
+
+### 修复（P2/P3 · 质量与卫生）
+
+- LLM 客户端默认 timeout=120s / max_retries=1（原 openai 默认 600s+2 重试，厂商挂起可卡 10 分钟）。
+- SSE 重连回放窗口 600→3000 帧（真流式四段 ≈1200-1700 帧，旧窗口把摘要挤出回放）。
+- 财务工具超时根因缓解：超时线程自然完成后仍会写入缓存，下次命中（附说明）。
+- tqdm 全局禁用（不再污染 sidecar 日志）；两份日志 5MB 轮转；Electron 不再双份采集 stdout。
+- 版本号单一来源（__version__ == pyproject == 前端 package.json == API 自报，1.6.0）。
+- /docs /redoc /openapi.json 生产关闭（FIN_DOCS=1 可开）；Electron 加固
+  （setWindowOpenHandler 全拒 / will-navigate 白名单 / IPC 校验 sender）。
+- normalize_ticker 去掉 zfill 静默补齐（"600"→000600 张冠李戴类）；盘前快照 trading_date
+  如实标注；新闻 provenance 如实标直连源；MACD 金叉/死叉改判交叉事件（未交叉标多头/空头）；
+  图表速读 facts JSON 按键裁剪（不再喂断尾 JSON）；节假日表 chinese_calendar 动态补未来年份；
+  缓存容量上限；报告 _STORE FIFO→LRU + 槽位确定性释放；行业取数失败改结构化错误（前端
+  不再误显绿色 ok）；entity 节点同步读盘挪线程池；证据分层补「生成失败」类别；注释漂移
+  五处对齐（含 report_use_llm_summary 出厂 False 的说明澄清，行为不变）。
+- 前端网络错误统一友好文案；SSE 解析兼容 CRLF；tsc --noEmit 进入构建门禁（补装 typescript
+  与 @types，此前 vite/esbuild 从不做类型检查）。
+
+### 清理（已授权删除，归档于 _deprecated/）
+
+ResearchStation.tsx、46 个未引用 ui 组件、src/imports、emptyKeyState；desktop.py + run_desktop.py
+（pywebview 第三入口）、build_installer.bat + installer.iss（Inno 独立安装包路径——曾会产出
+无窗口后台进程冒充分发产品）、infra/postgres + docker-compose（弱口令遗留）、PACKAGING.md、
+sse-starlette 死依赖、pywebview extra、report.py 的 weasyprint 死函数、entity.py 别名索引死代码
+（62 行，连带启动预热开销）。README 过期描述同步修正。
+
+### 已知事项
+
+- **Python 维持 3.14**（用户决策）：实测确认 pydantic.v1 兼容层在 3.14 因 PEP 649 会丢必填
+  字段（test_py314_compat.py 固化该形态为哨兵）；本项目实际工具/结构化路径走 v2 不受影响。
+  若日后依赖升级触发该路径，回落 3.13 打包即可（spec 无需改）。
+- 打包链内前端静态资源不再双份打入（spec 移除重复 static 收集）。
 
 ### 新增
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TitleBar } from "./components/TitleBar";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { ChatDesk } from "./components/pages/ChatDesk";
@@ -9,13 +9,26 @@ import { api } from "./api/client";
 
 interface ActiveModel { providerId: string; modelId: string; provider: string; model: string; accent: string; }
 
+function isValidActiveModel(p: any): p is ActiveModel {
+  // v1.6.0（审计 C4）：后端 payload 形状校验 —— providers 清单变更后老存量记录
+  // 会带非法 providerId 进来，Settings 渲染 undefined 会白屏
+  return !!p && typeof p.providerId === "string" && typeof p.modelId === "string";
+}
+
 export default function App() {
   // 1.2.0：默认首页"专业对话"
   const [page, setPage] = useState<PageId>("chat");
   const [active, setActive] = useState<ActiveModel | null>(() => {
-    try { return JSON.parse(localStorage.getItem("finresearch_active") || "null"); } catch { return null; }
+    try {
+      const p = JSON.parse(localStorage.getItem("finresearch_active") || "null");
+      return isValidActiveModel(p) ? p : null;
+    } catch { return null; }
   });
   const [reportsTick, setReportsTick] = useState(0); // 新报告生成后触发报告库刷新
+  // v1.6.0（审计 C4）：先写后读竞态守卫 —— GET 未返回前不触发保存，
+  // 否则 localStorage 为空但后端已存当前模型时，null 会把后端值永久覆盖
+  // （Settings 的 configsLoadedRef 同款模式，这里此前漏防）。
+  const activeLoadedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -23,11 +36,17 @@ export default function App() {
       .then((r) => { if (!cancelled && r.payload) localStorage.setItem("finresearch_keys", JSON.stringify(r.payload)); })
       .catch(() => {});
     api.localSetting("active-model")
-      .then((r) => { if (!cancelled && r.payload) setActive(r.payload as ActiveModel); })
-      .catch(() => {});
+      .then((r) => {
+        if (cancelled || !r.payload) return;
+        const p = r.payload as ActiveModel | null;
+        if (isValidActiveModel(p)) setActive(p);
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) activeLoadedRef.current = true; });
     return () => { cancelled = true; };
   }, []);
   useEffect(() => {
+    if (!activeLoadedRef.current) return;
     localStorage.setItem("finresearch_active", JSON.stringify(active));
     api.saveLocalSetting("active-model", active).catch(() => {});
   }, [active]);

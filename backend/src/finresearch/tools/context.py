@@ -87,7 +87,10 @@ def render_profile_block(profile: Optional[dict]) -> str:
 _WEEKDAYS = "周一 周二 周三 周四 周五 周六 周日".split()
 
 
-# 1.2.3：中国交易所休市日历（每年维护）
+# 1.2.3：中国交易所休市日历（静态兜底表，覆盖到 2026）。
+# v1.6.0（审计 E2）：_cn_holiday 优先 chinese_calendar（随包更新、覆盖未来年份）；
+# 本表仅在包不可用/超出覆盖年份时兜底 —— 超出 2026 的年份由下方 _dynamic_holidays
+# 在 chinese_calendar 可用时自动补齐，静态表不再是唯一未来来源。
 _HOLIDAYS = {
     # 2025
     "2025-01-01", "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31",
@@ -102,6 +105,32 @@ _HOLIDAYS = {
     "2026-06-19",
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
 }
+
+
+def _dynamic_holidays(years: list) -> set:
+    """尝试从 chinese_calendar 生成指定年份的法定节假日集合（失败返回空集）。"""
+    out: set = set()
+    try:
+        import chinese_calendar as cc
+
+        for year in years:
+            d = dt.date(year, 1, 1)
+            while d.year == year:
+                try:
+                    is_hol, name = cc.get_holiday_detail(d)
+                    if is_hol and name:
+                        out.add(d.isoformat())
+                except Exception:  # noqa: BLE001  超出包覆盖年份
+                    break
+                d += dt.timedelta(days=1)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+# 静态表未覆盖的未来年份，启动时用 chinese_calendar 生成一次（模块级缓存）
+_extra_years = [y for y in (dt.date.today().year, dt.date.today().year + 1) if y > 2026]
+_HOLIDAYS |= _dynamic_holidays(_extra_years)
 
 
 def _cn_holiday(now: dt.datetime) -> bool:
@@ -404,7 +433,23 @@ def build_report_section_context(
 def build_chart_context(*, system_prompt: str, facts_json: str) -> List[Tuple[str, str]]:
     """图表速读：system(CHART_SYSTEM) + 事实 JSON。轻量单次调用，无历史。"""
     # 1.2.3：facts_json 防爆——超 4000 字截断（图表速读只需近期数据，无需全文 JSON）
+    # v1.6.0（审计 E2）：防爆改「按键裁剪」而非字符硬切 —— 硬切会喂给模型断尾非法 JSON；
+    # 先逐个丢弃占空间最大的顶层键直到序列化长度进预算，仍超才退回截断+标注。
     _CAP = 4000
+    if len(facts_json) > _CAP:
+        try:
+            import json as _json
+
+            data = _json.loads(facts_json)
+            if isinstance(data, dict) and len(data) > 1:
+                for key in sorted(data, key=lambda k: len(str(data[k])), reverse=True):
+                    data.pop(key, None)
+                    candidate = _json.dumps(data, ensure_ascii=False)
+                    if len(candidate) <= _CAP or len(data) <= 1:
+                        facts_json = candidate
+                        break
+        except Exception:  # noqa: BLE001
+            pass
     if len(facts_json) > _CAP:
         facts_json = facts_json[:_CAP].rstrip() + "\n…（JSON 已截断）"
     return [("system", system_prompt.strip()), ("human", f"【事实】(JSON)：{facts_json}\n请速读。")]

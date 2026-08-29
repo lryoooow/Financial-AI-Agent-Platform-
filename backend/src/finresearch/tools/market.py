@@ -89,8 +89,12 @@ def _ensure_fresh(result: dict, *, kind: str) -> None:
 
 
 def _is_bj(raw: str) -> bool:
-    """北交所代码（东方财富直连 secid 对 BJ 不可靠，需跳过 eastmoney-direct）。"""
-    return raw.startswith(("43", "83", "87", "88"))
+    """北交所代码（东方财富直连 secid 对 BJ 不可靠，需跳过 eastmoney-direct）。
+
+    v1.6.0（审计 B7）：北交所 2024 年起新代码全部 920xxx（种子表 325 只全是 920 开头），
+    只认 43/83/87/88 会把 920 全线判成深证。补 "92"。
+    """
+    return raw.startswith(("43", "83", "87", "88", "92"))
 
 
 def _enrich(prov: dict, *, trading_date: str = "", attempts: Optional[list] = None) -> dict:
@@ -226,6 +230,11 @@ def get_realtime_quote(code: str) -> dict:
             "trading_date": _today(),
             "provenance": make_provenance(source="akshare", endpoint="stock_zh_a_spot_em", raw_value=raw),
         }
+        # v1.6.0（审计 E2）：akshare 全市场快照无逐行数据时点，盘前/盘后取到的是上一交易
+        # 日的旧快照却被盖上今日戳（_ensure_fresh 因此失去判旧能力）。如实标注，不伪造时点。
+        _now_hm = dt.datetime.now().strftime("%H:%M")
+        if not ("09:15" <= _now_hm <= "15:05"):
+            result["provenance"]["note"] = "盘前/盘后获取的全市场快照，实际数据时点可能为上一交易日"
         return finish(result, "akshare")
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "akshare", "ok": False, "error": str(e)})
@@ -477,34 +486,47 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
 # 五档盘口（仅 AkShare；无可靠免费直连 5 档源，失败明确标注）
 # ────────────────────────────────────────────────────────────
 def get_bid_ask(code: str) -> dict:
-    """五档盘口（akshare，无可靠免费备用源；失败明确标注，不伪造）。"""
+    """五档盘口（akshare，无可靠免费备用源；失败明确标注，不伪造）。
+
+    v1.6.0 修复（审计 P0：本接口此前 100% 死亡，三重契约错误）：
+    1. stock_bid_ask_em 接收**纯 6 位代码**并自行拼 secid（传 "sh600519" 会发出非法
+       secid=0.sh600519）；
+    2. 返回 DataFrame 是 item/value 两列（已核对打包内 akshare 源码），价格与挂单量是
+       **独立行**（sell_5 / sell_5_vol），不是并排列——旧代码对 dict 调 .iloc 必抛
+       AttributeError；
+    3. 行键是英文 sell_N/buy_N（非中文「卖五/买一」）。
+    """
     raw = normalize_ticker(code)
     attempts: list[dict] = []
     t0 = time.perf_counter()
     try:
         import akshare as ak
-        mkt = "sh" if raw.startswith(("60", "68", "90", "11", "51", "56")) else (
-            "bj" if _is_bj(raw) else "sz"
-        )
-        df = ak.stock_bid_ask_em(symbol=f"{mkt}{raw}")
+        df = ak.stock_bid_ask_em(symbol=raw)
         if df is None or df.empty:
             raise ValueError("空数据")
-        rec = {str(r.iloc[0]): (r.iloc[1], r.iloc[2] if df.shape[1] > 2 else 0) for r in df.to_dict("index").values()}
+        rec = {str(i): v for i, v in zip(df["item"], df["value"])}
 
-        def pick(labels):
-            for lab in labels:
-                if lab in rec:
-                    p, v = rec[lab]
-                    return {"label": lab, "price": _f(p), "vol": int(_f(v))}
-            return None
+        # 显式档位表：卖五→卖一（asks 降序）、买一→买五（bids 升序），标签给前端中文
+        levels = [
+            ("sell", 5, "卖五"), ("sell", 4, "卖四"), ("sell", 3, "卖三"),
+            ("sell", 2, "卖二"), ("sell", 1, "卖一"),
+            ("buy", 1, "买一"), ("buy", 2, "买二"), ("buy", 3, "买三"),
+            ("buy", 4, "买四"), ("buy", 5, "买五"),
+        ]
 
-        asks = [pick(x) for x in (["卖五", "卖5"], ["卖四", "卖4"], ["卖三", "卖3"], ["卖二", "卖2"], ["卖一", "卖1"])]
-        bids = [pick(x) for x in (["买一", "买1"], ["买二", "买2"], ["买三", "买3"], ["买四", "买4"], ["买五", "买5"])]
-        asks = [a for a in asks if a]
-        bids = [b for b in bids if b]
+        def pick(side: str, i: int, label: str):
+            p = rec.get(f"{side}_{i}")
+            if p is None:
+                return None
+            v = rec.get(f"{side}_{i}_vol", 0)
+            return {"label": label, "price": _f(p), "vol": int(_f(v))}
+
+        entries = [pick(s, i, lab) for s, i, lab in levels]
+        asks = [e for e in entries[:5] if e]
+        bids = [e for e in entries[5:] if e]
         attempts.append({"source": "akshare", "ok": True})
         _record("book", "akshare", True)
-        prov = make_provenance(source="akshare", endpoint="stock_bid_ask_em", raw_value=f"{mkt}{raw}")
+        prov = make_provenance(source="akshare", endpoint="stock_bid_ask_em", raw_value=raw)
         return {
             "asks": asks, "bids": bids, "trading_date": _today(),
             "elapsed_ms": int((time.perf_counter() - t0) * 1000),
@@ -550,12 +572,15 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
     out.append({"name": "MA5", "value": f"{ma5:.2f}", "signal": "多头" if last_close > ma5 > 0 else "空头"})
     out.append({"name": "MA20", "value": f"{ma20:.2f}", "signal": ("多头" if ma5 > ma20 else "空头") if ma5 and ma20 else "中性"})
 
-    macd_hist = rsi_v = kdj_j = None
+    macd_hist = prev_macd_hist = rsi_v = kdj_j = None
     try:
         import pandas_ta_classic as ta  # noqa: F401
         macd_df = close.ta.macd() if hasattr(close, "ta") else None
         if macd_df is not None and not macd_df.empty:
             macd_hist = _f(macd_df.iloc[-1].get(f"MACDh_12_26_9"))
+            # v1.6.0（审计 E2）：金叉/死叉是「交叉事件」，需要上一根的柱值对比
+            if len(macd_df) >= 2:
+                prev_macd_hist = _f(macd_df.iloc[-2].get(f"MACDh_12_26_9"))
         rsi_s = close.ta.rsi()
         if rsi_s is not None and len(rsi_s):
             rsi_v = _f(rsi_s.iloc[-1])
@@ -573,7 +598,10 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
         ema26 = close.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
         dea = dif.ewm(span=9, adjust=False).mean()
-        macd_hist = _f((dif - dea).iloc[-1])
+        hist_series = dif - dea
+        macd_hist = _f(hist_series.iloc[-1])
+        if len(hist_series) >= 2:
+            prev_macd_hist = _f(hist_series.iloc[-2])
     if rsi_v is None:
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
@@ -589,7 +617,17 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
         d = k.ewm(com=2, adjust=False).mean()
         kdj_j = _f((3 * k - 2 * d).iloc[-1]) if len(d) else 50.0
 
-    out.append({"name": "MACD", "value": f"{macd_hist:.2f}", "signal": "金叉" if macd_hist > 0 else "死叉"})
+    # v1.6.0（审计 E2）：金叉/死叉判「交叉事件」（上一根柱值与当前柱值跨零），
+    # 未发生交叉时如实标注当前 多头/空头 状态 —— 旧实现 hist>0 就叫"金叉"是误称。
+    if prev_macd_hist is not None:
+        macd_signal = (
+            "金叉" if (macd_hist > 0 and prev_macd_hist <= 0)
+            else "死叉" if (macd_hist < 0 and prev_macd_hist >= 0)
+            else ("多头" if macd_hist > 0 else "空头")
+        )
+    else:
+        macd_signal = "多头" if macd_hist > 0 else "空头"
+    out.append({"name": "MACD", "value": f"{macd_hist:.2f}", "signal": macd_signal})
     out.append({"name": "RSI(14)", "value": f"{rsi_v:.1f}", "signal": "超买" if rsi_v >= 70 else ("超卖" if rsi_v <= 30 else "中性")})
     out.append({"name": "KDJ-J", "value": f"{kdj_j:.1f}", "signal": "超买" if kdj_j >= 90 else ("超卖" if kdj_j <= 10 else "中性")})
 

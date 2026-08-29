@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import time
 from typing import Optional
 
 from ..cache import slow_cache
@@ -18,21 +19,51 @@ from .entity import normalize_ticker, to_market_ticker
 
 logger = logging.getLogger(__name__)
 
+# 直连会话（连接复用 + 统一 UA/Referer）。旧实现每次裸 requests.get 新建 TCP+TLS，
+# 且无 UA —— push2 对无 UA 请求更易直接断开（审计实测本网络 RemoteDisconnected）。
+_DIRECT_SESSION = None
+# 直连熔断：push2/qt 接口在部分网络持续不可达，不熔断则每次研究连烧 2 个必败请求。
+_DIRECT_FAIL_AT = 0.0
+_DIRECT_BREAKER_S = 300.0
+
+
+def _direct_session():
+    global _DIRECT_SESSION
+    if _DIRECT_SESSION is None:
+        import requests
+
+        _DIRECT_SESSION = requests.Session()
+        _DIRECT_SESSION.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        })
+    return _DIRECT_SESSION
+
 
 def _company_profile_direct(raw: str) -> dict:
-    """直接解析东方财富 data 字典，绕过 AkShare 对返回列数的固定假设。"""
-    import requests
+    """直接解析东方财富 data 字典，绕过 AkShare 对返回列数的固定假设。
+
+    v1.6.0：带 5 分钟失败熔断 —— 该端点在本机网络实测持续不可达时，
+    直接抛给上层走行情名称兜底，不再每次研究连烧必败请求。
+    """
     from .market_provider import configure_market_network
 
+    global _DIRECT_FAIL_AT
     configure_market_network()
+    if time.time() - _DIRECT_FAIL_AT < _DIRECT_BREAKER_S:
+        raise ConnectionError("公司资料直连接口近 5 分钟内失败，熔断中（直接走行情名称兜底）")
     market = 1 if raw.startswith(("6", "9")) else 0
     fields = "f57,f58,f84,f85,f127,f116,f117,f189"
-    resp = requests.get(
-        "https://push2.eastmoney.com/api/qt/stock/get",
-        params={"fltt": "2", "invt": "2", "fields": fields, "secid": f"{market}.{raw}"},
-        timeout=6,
-    )
-    resp.raise_for_status()
+    try:
+        resp = _direct_session().get(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            params={"fltt": "2", "invt": "2", "fields": fields, "secid": f"{market}.{raw}"},
+            timeout=6,
+        )
+        resp.raise_for_status()
+    except Exception:
+        _DIRECT_FAIL_AT = time.time()
+        raise
     data = (resp.json() or {}).get("data") or {}
     return {
         "股票代码": data.get("f57"),
@@ -182,20 +213,44 @@ def get_financial_indicators(code: str) -> dict:
                 return f"{v/1e8:.2f}{unit}" if abs(v) > 1e6 else f"{v:.2f}"
             return "—"
 
-        revenue_vals = [fmt_num(pick(r, "营业总收入", "营业收入", "主营业务收入(元)")) for r in rows]
-        net_vals = [fmt_num(pick(r, "净利润", "归母净利润", "扣除非经常性损益后的净利润(元)")) for r in rows]
+        # v1.6.0（审计 P0 修复）：pick 候选键按接口真实列名补齐 —— 实测 86 列中存在
+        # 「主营业务收入增长率(%)」「扣除非经常性损益后的净利润(元)」等，但不存在旧候选
+        # 「营业总收入/营业收入」，导致营收行恒为「—」。
+        revenue_keys = ("营业总收入", "营业收入", "主营业务收入(元)", "营业总收入(元)", "营业收入(元)")
+        net_keys = ("净利润", "归母净利润", "扣除非经常性损益后的净利润(元)")
+        revenue_vals = [fmt_num(pick(r, *revenue_keys)) for r in rows]
+        net_vals = [fmt_num(pick(r, *net_keys)) for r in rows]
         rev_yoy_vals = [fmt_pct(pick(r, "主营业务收入增长率(%)", "营业收入同比增长率(%)")) for r in rows]
         net_yoy_vals = [fmt_pct(pick(r, "净利润增长率(%)", "归母净利润同比增长率(%)")) for r in rows]
         roe_vals = [fmt_pct(pick(r, "净资产收益率(%)", "加权净资产收益率(%)", "净资产收益率", "ROE")) for r in rows]
         gm_vals = [fmt_pct(pick(r, "销售毛利率(%)", "销售毛利率", "毛利率")) for r in rows]
         debt_vals = [fmt_pct(pick(r, "资产负债率(%)", "资产负债率")) for r in rows]
 
+        # 口径溯源：行名统一叫「净利润」，但值实际来自哪个上游列必须留痕（零幻觉原则：
+        # 标签不撒谎，扣非就是扣非）。旧行名「扣非净利润」与全部消费方查询的「净利润」
+        # 精确匹配不上，导致事实块/基本面段恒「未获取」而风险段却引用真值（同报告自相矛盾）。
+        def _hit_col(keys):
+            for k in keys:
+                if any(k in r and r[k] not in (None, "", "nan") for r in rows):
+                    return k
+            return ""
+
+        prov = make_provenance(
+            source="akshare",
+            endpoint="stock_financial_analysis_indicator",
+            raw_value=raw,
+        )
+        prov["note"] = (
+            f"净利润列={_hit_col(net_keys) or '未获取'}；营收列={_hit_col(revenue_keys) or '未获取'}"
+            "（净利润行含扣非口径候选，实际命中列以本注为准）"
+        )
+
         return {
             "financials": {
                 "years": years,
                 "rows": [
                     {"name": "营业收入", "values": revenue_vals},
-                    {"name": "扣非净利润", "values": net_vals},
+                    {"name": "净利润", "values": net_vals},
                     {"name": "营收同比", "values": rev_yoy_vals},
                     {"name": "净利润同比", "values": net_yoy_vals},
                     {"name": "ROE", "values": roe_vals},
@@ -203,11 +258,7 @@ def get_financial_indicators(code: str) -> dict:
                     {"name": "资产负债率", "values": debt_vals},
                 ],
             },
-            "provenance": make_provenance(
-                source="akshare",
-                endpoint="stock_financial_analysis_indicator",
-                raw_value=raw,
-            ),
+            "provenance": prov,
         }
     except Exception as e:  # noqa: BLE001
         logger.warning("get_financial_indicators 失败：%s", e)

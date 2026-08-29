@@ -9,6 +9,7 @@ import json
 import logging
 import re
 from typing import List
+from urllib.parse import quote
 
 from ..cache import slow_cache
 from . import make_provenance
@@ -40,7 +41,9 @@ def _news_direct(raw: str, limit: int) -> List[dict]:
     resp = requests.get(
         "https://search-api-web.eastmoney.com/search/jsonp",
         params={"cb": callback, "param": json.dumps(inner, ensure_ascii=True), "_": "1"},
-        headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://so.eastmoney.com/news/s?keyword={raw}"},
+        # HTTP 头只允许 latin-1：中文关键词必须 percent-encode，否则 UnicodeEncodeError
+        #（行业研究固定用中文行业名调本接口，不编码则直连路径 100% 失败）。
+        headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://so.eastmoney.com/news/s?keyword={quote(raw)}"},
         timeout=6,
     )
     resp.raise_for_status()
@@ -64,8 +67,10 @@ def search_news(code: str, limit: int = 12) -> dict:
     if cached is not None:
         return cached
     try:
+        direct_used = False
         try:
             items = _news_direct(raw, int(limit))
+            direct_used = bool(items)
         except Exception as direct_error:  # noqa: BLE001
             logger.info("新闻直连失败，回退 AkShare：%s", direct_error)
             items = []
@@ -81,10 +86,14 @@ def search_news(code: str, limit: int = 12) -> dict:
             } for _, r in df.head(int(limit)).iterrows()]
         if not items:
             raise ValueError("无新闻")
+        # v1.6.0（审计 E2）：溯源如实 —— 直连成功就标直连源，别把东财搜索说成 akshare
+        #（诊断面板此前据此误报）。
         result = {
             "items": items,
             "provenance": make_provenance(
-                source="akshare", endpoint="stock_news_em", raw_value=raw
+                source="eastmoney_search" if direct_used else "akshare",
+                endpoint="search/jsonp" if direct_used else "stock_news_em",
+                raw_value=raw,
             ),
         }
         record("news", "akshare", True)

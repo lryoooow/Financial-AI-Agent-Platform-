@@ -1,7 +1,7 @@
 """FastAPI app。
 
 - async 单进程 uvicorn
-- CORS 允许 localhost:* 与 tauri://*
+- CORS 仅显式放行本地 vite dev（5173）；生产为后端同源伺服前端
 - lifespan：init_db（create_all）+ 初始化检查点
 """
 
@@ -25,6 +25,7 @@ socket.setdefaulttimeout(15)
 
 # 行情代理策略（根因 1）：在导入路由/工具（可能触发 akshare 行为）之前，
 # 对东方财富/Sina 行情域名写入 NO_PROXY，绕过会被远端断开的系统/环境代理。
+from . import __version__
 from .tools.market_provider import configure_market_network
 configure_market_network()
 
@@ -44,13 +45,16 @@ logger = logging.getLogger("finresearch")
 
 
 def _warmup_indexes() -> None:
-    """后台线程预加载别名/搜索索引（首次构建约 1-3s），消除对话首轮冷启动超时。"""
+    """后台线程预加载搜索索引（首次构建约 1-2s），消除对话首轮冷启动超时。
+
+    v1.6.0（审计 E1）：别名索引（_load_alias_index）随标的检测器一起废弃，
+    构建它纯属启动开销，已整体移除。
+    """
     try:
-        from .tools.entity import _load_alias_index, _load_search_index
+        from .tools.entity import _load_search_index
 
         _load_search_index()
-        _load_alias_index()
-        logger.info("索引预加载完成（alias + search）")
+        logger.info("索引预加载完成（search）")
     except Exception as e:  # noqa: BLE001
         logger.debug("索引预加载跳过：%s", e)
 
@@ -58,27 +62,42 @@ def _warmup_indexes() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from .agents.graph import close_checkpointer  # 延迟导入避免循环
+    from .api.routes import sweep_stale_research_tasks
 
     logger.info("启动：init_db + checkpointer")
     await init_db()
+    # v1.6.0（审计 B4）：启动清扫上一进程遗留的 pending/running 研究任务（僵尸终结）
+    try:
+        await sweep_stale_research_tasks()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("启动清扫失败（不影响启动）：%s", e)
     await init_checkpointer()
-    # 后台预加载别名索引与搜索索引，消除对话首轮 detect_ticker 冷启动超时
+    # 后台预加载搜索索引，消除对话首轮冷启动超时
     asyncio.get_event_loop().run_in_executor(None, _warmup_indexes)
     yield
     await close_checkpointer()
     logger.info("关闭。")
 
 
+# v1.6.0（审计 D6）：生产关闭 /docs /redoc /openapi.json（API 自描述不随包分发）；
+# 开发需要时设 FIN_DOCS=1。
+_docs = bool(os.environ.get("FIN_DOCS"))
+
 app = FastAPI(
     title="景渊 JingYuan · 家用金融研究助手",
-    version="1.3.1",
+    version=__version__,
     lifespan=lifespan,
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
 
-# CORS：允许本地前端与 Tauri
+# v1.6.0（审计 B1）：CORS 收紧。此前 allow_origin_regex 放行任意 localhost:* 源 ——
+# 本机任何端口上的网页都能跨域读走 /api/local-settings/model-configs 里的明文密钥。
+# 打包形态是后端同源伺服前端（无需 CORS）；仅为 vite dev（5173）保留两个显式来源。
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"(http://localhost(:\d+)?|tauri://localhost|http://127\.0\.0\.1(:\d+)?)",
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -137,7 +156,7 @@ else:
     async def root() -> dict:
         return {
             "name": "景渊 JingYuan · 家用金融研究助手",
-            "version": "1.3.1",
+            "version": __version__,
             "llm_configured": settings.llm_configured,
-            "docs": "/docs",
+            "docs": "/docs" if _docs else None,
         }

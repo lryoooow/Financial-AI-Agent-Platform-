@@ -1,18 +1,16 @@
-"""机器绑定的轻量对称加密（供 API Key 落库前加密、读取时解密）。
+"""机器绑定的密钥保护（供 API Key 落库前加密、读取时解密）。
 
-设计：
-- 密钥由本机特征（节点名 + MAC）经 PBKDF2-HMAC-SHA256 派生，绑定到当前机器。
-  数据库被复制到其他机器后无法解密，降低整库明文泄露风险。
-- 算法：随机 nonce(16B) 派生 keystream(SHA256 计数器模式) 与明文 XOR，base64 编码。
-  非军用强度，但在"防止数据库明文泄露 API Key"这一有限目标上足够，且零外部依赖、
-  PyInstaller 友好（无需 C 扩展或联网取 BPE 词表）。
-- 前缀 "enc:" 区分密文与旧明文：读取时无前缀原样返回，升级零迁移、解密失败回退原文。
+v1.6.0（审计 B1）强化，两级方案：
+- 首选 **Windows DPAPI**（win32crypt.CryptProtectData，entropy 绑定本机特征）：
+  系统级用户凭据保护，非本机/本用户不可解，且带完整性校验（篡改可检出）。
+  前缀 "dpapi:"。
+- 回落 **旧自研方案**（"enc:"，主机名+MAC 派生密钥的 XOR 流）：仅非 Windows 或
+  DPAPI 不可用时使用。保留解密能力以平滑迁移存量数据；下次保存自动升级为 dpapi:。
 
-API：
-- encrypt_value(plaintext) -> str  （带 "enc:" 前缀）
-- decrypt_value(stored)    -> str  （无前缀原样返回；有前缀解密失败回退原文，绝不抛异常）
-- encrypt_config(config)   -> dict  （深拷贝并对 api_key 加密；None/非 dict 原样返回）
-- decrypt_config(config)   -> dict  （深拷贝并对 api_key 解密）
+行为铁律：
+- 解密失败返回 **空串**（v1.5 及之前返回密文原文是缺陷：`enc:Base64...` 会被当作
+  API Key 发给模型网关，产生极难排查的鉴权失败）。
+- 无前缀原样返回（兼容历史明文数据），升级零迁移。
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ import uuid
 from functools import lru_cache
 
 _PREFIX = "enc:"
+_DPAPI_PREFIX = "dpapi:"
 _NONCE_LEN = 16
 
 
@@ -57,10 +56,43 @@ def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     return bytes(out[:length])
 
 
+def _dpapi_available() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        from win32 import win32crypt  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dpapi_protect(plaintext: str) -> str:
+    from win32 import win32crypt
+
+    blob = win32crypt.CryptProtectData(
+        plaintext.encode("utf-8"), "finresearch", _machine_fingerprint(), None, None, 0
+    )
+    return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
+
+
+def _dpapi_unprotect(stored: str) -> str:
+    from win32 import win32crypt
+
+    blob = base64.b64decode(stored[len(_DPAPI_PREFIX):])
+    _desc, data = win32crypt.CryptUnprotectData(blob, _machine_fingerprint(), None, None, 0)
+    return data.decode("utf-8")
+
+
 def encrypt_value(plaintext: str) -> str:
-    """加密单个字符串，返回带 "enc:" 前缀的 base64 文本。空串原样返回。"""
+    """加密单个字符串。Windows 首选 DPAPI（"dpapi:"），否则回落自研（"enc:"）。空串原样返回。"""
     if not plaintext:
         return plaintext
+    if _dpapi_available():
+        try:
+            return _dpapi_protect(plaintext)
+        except Exception:  # noqa: BLE001
+            pass  # DPAPI 异常时回落旧方案，绝不因加密失败阻塞保存
     pt = plaintext.encode("utf-8")
     nonce = os.urandom(_NONCE_LEN)
     ks = _keystream(_derive_key(), nonce, len(pt))
@@ -69,9 +101,14 @@ def encrypt_value(plaintext: str) -> str:
 
 
 def decrypt_value(stored: str) -> str:
-    """解密。无 "enc:" 前缀原样返回（兼容旧明文）；解密失败回退原文，绝不抛异常。"""
+    """解密。无前缀原样返回（兼容旧明文）；解密失败返回空串（绝不返回密文冒充明文）。"""
     if not stored or not isinstance(stored, str):
         return stored or ""
+    if stored.startswith(_DPAPI_PREFIX):
+        try:
+            return _dpapi_unprotect(stored)
+        except Exception:  # noqa: BLE001
+            return ""
     if not stored.startswith(_PREFIX):
         return stored
     try:
@@ -81,26 +118,67 @@ def decrypt_value(stored: str) -> str:
         pt = bytes(a ^ b for a, b in zip(ct, ks))
         return pt.decode("utf-8")
     except Exception:  # noqa: BLE001
-        return stored
+        return ""
+
+
+# 密钥字段两种键名并存：后端 LLM 配置用 snake_case（api_key），
+# 前端 model-configs 用 camelCase（apiKey）。
+_KEY_FIELDS = ("api_key", "apiKey")
 
 
 def encrypt_config(config):
-    """深拷贝 config dict，对其中的 api_key 加密。None/非 dict 原样返回。"""
+    """深拷贝 config dict，对其中的密钥字段加密。None/非 dict 原样返回。"""
     if not isinstance(config, dict):
         return config
     out = dict(config)
-    key = out.get("api_key")
-    if isinstance(key, str) and key:
-        out["api_key"] = encrypt_value(key)
+    for field in _KEY_FIELDS:
+        key = out.get(field)
+        if isinstance(key, str) and key:
+            out[field] = encrypt_value(key)
     return out
 
 
 def decrypt_config(config):
-    """深拷贝 config dict，对其中的 api_key 解密。None/非 dict 原样返回。"""
+    """深拷贝 config dict，对其中的密钥字段解密。None/非 dict 原样返回。"""
     if not isinstance(config, dict):
         return config
     out = dict(config)
-    key = out.get("api_key")
-    if isinstance(key, str) and key:
-        out["api_key"] = decrypt_value(key)
+    for field in _KEY_FIELDS:
+        key = out.get(field)
+        if isinstance(key, str) and key:
+            out[field] = decrypt_value(key)
     return out
+
+
+def encrypt_nested(obj):
+    """递归加密 dict/list 树中所有密钥字段（api_key / apiKey）。
+
+    供 model-configs 这类「{厂商id: {apiKey: ...}}」嵌套形状使用。
+    已加密值（dpapi:/enc: 前缀）原样跳过，杜绝二次加密。
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _KEY_FIELDS and isinstance(v, str) and v and not v.startswith((_DPAPI_PREFIX, _PREFIX)):
+                out[k] = encrypt_value(v)
+            else:
+                out[k] = encrypt_nested(v)
+        return out
+    if isinstance(obj, list):
+        return [encrypt_nested(x) for x in obj]
+    return obj
+
+
+def decrypt_nested(obj):
+    """递归解密 dict/list 树中所有密钥字段；无前缀值（历史明文）原样保留。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _KEY_FIELDS and isinstance(v, str) and v:
+                out[k] = decrypt_value(v)
+            else:
+                out[k] = decrypt_nested(v)
+        return out
+    if isinstance(obj, list):
+        return [decrypt_nested(x) for x in obj]
+    return obj

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from importlib import resources
 from typing import Optional
@@ -29,13 +28,16 @@ _EXCHANGE_MAP = {
 
 
 def _classify_exchange(code: str) -> str:
-    """按代码前缀判断交易所（akshare 仅给 code，不给交易所）。"""
+    """按代码前缀判断交易所（akshare 仅给 code，不给交易所）。
+
+    v1.6.0（审计 B7）：北交所 2024 年起新代码全部 920xxx，补 "92" 前缀。
+    """
     c = code.strip()
     if c.startswith(("60", "68", "90", "11", "51", "56")):
         return _EXCHANGE_MAP["sh"]
     if c.startswith(("00", "30", "20", "12", "15", "16")):
         return _EXCHANGE_MAP["sz"]
-    if c.startswith(("43", "83", "87", "88")):
+    if c.startswith(("43", "83", "87", "88", "92")):
         return _EXCHANGE_MAP["bj"]
     return "A股"
 
@@ -44,6 +46,10 @@ def normalize_ticker(code: str) -> str:
     """归一化前端传入的 ticker 到纯 6 位代码。
 
     前端用 "600519.SH"，akshare 大多数接口要纯代码 "600519"。
+
+    v1.6.0（审计 D8）：去掉 zfill 静默补齐 —— "600" 会被补成 "000600"（建投能源），
+    部分数字串查询会张冠李戴到另一只真股票。归一化只做剥离，不做猜测；
+    长度校验留给 resolve_entity（len==6 精确匹配）与各数据源（查不到如实报错）。
     """
     if not code:
         return ""
@@ -55,15 +61,18 @@ def normalize_ticker(code: str) -> str:
     for prefix in ("SH", "SZ", "BJ"):
         if c.startswith(prefix):
             c = c[len(prefix):]
-    return c.zfill(6) if c.isdigit() else c
+    return c
 
 
 def to_market_ticker(code: str) -> str:
-    """纯代码 → 前端格式（600519.SH）。"""
+    """纯代码 → 前端格式（600519.SH）。
+
+    v1.6.0（审计 B7）：920xxx → .BJ。
+    """
     c = normalize_ticker(code)
     if c.startswith(("60", "68", "90", "11", "51", "56")):
         return f"{c}.SH"
-    if c.startswith(("43", "83", "87", "88")):
+    if c.startswith(("43", "83", "87", "88", "92")):
         return f"{c}.BJ"
     return f"{c}.SZ"
 
@@ -242,68 +251,6 @@ def resolve_entity(query: str, limit: int = 8) -> dict:
                 error=str(e),
             ),
         }
-
-
-# ────────────────────────────────────────────────────────────
-# 自然语言里的标的检测（对话事实注入用）
-#
-# resolve_entity 拿整句话做模糊匹配会命中噪声；而"公司全称必须是问题的子串"这条守卫
-# 又太严——"茅台现在多少钱"里没有"贵州茅台"，最常见的问法反而不触发。
-# 这里改为：从问题中切出 2–6 字的候选片段，去别名索引里查"该片段是某公司名的子串"。
-# ────────────────────────────────────────────────────────────
-_CJK_RUN = re.compile(r"[一-鿿]{2,}")
-_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
-
-# 高频通用词：要么是行业通名（出现在大量公司名里），要么是日常/行情词汇，
-# 单独出现时不构成标的提及。"今天大盘怎么样"不该命中"今天国际"。
-_ALIAS_STOPWORDS = {
-    # 行业通名
-    "公司", "股份", "集团", "科技", "控股", "中国", "国际", "实业", "发展", "电子",
-    "信息", "网络", "数据", "智能", "新材", "材料", "能源", "电力", "银行", "证券",
-    "保险", "医药", "生物", "食品", "环保", "机械", "设备", "制造", "有限", "通信",
-    # 日常与行情词汇
-    "今天", "明天", "昨天", "现在", "目前", "最近", "未来", "大盘", "行情", "走势",
-    "股票", "股市", "市场", "板块", "指数", "基金", "投资", "风险", "收益", "估值",
-    "财报", "业绩", "分析", "建议", "帮我", "这家", "那家", "怎么", "什么", "如何",
-    "多少", "价格", "情况", "表现", "前景", "机会", "请问", "一下", "可以", "应该",
-}
-# 一个片段匹配到超过这么多家公司，说明它是通用词而非标的名
-_ALIAS_MAX_FANOUT = 8
-
-
-def _name_affixes(name: str) -> list[str]:
-    """公司名的前缀与后缀（长度 ≥2），不含中间子串。
-
-    "贵州茅台" → 贵州/贵州茅/贵州茅台/州茅台/茅台
-    只收前后缀是精确率的关键：中间子串（如"德时"之于"宁德时代"）不是任何人的简称。
-    """
-    out = []
-    n = len(name)
-    for size in range(2, n + 1):
-        out.append(name[:size])       # 前缀
-        if size < n:
-            out.append(name[n - size:])  # 后缀（size == n 时与前缀重复）
-    return out
-
-
-def _load_alias_index() -> dict:
-    """{片段: [row, ...]}，片段为公司名的前后缀。构建一次，缓存 12h。"""
-    from ..cache import slow_cache
-
-    cached = slow_cache.get("a_alias_index")
-    if cached is not None:
-        return cached
-    alias: dict[str, list] = {}
-    for r in _load_code_name_list():
-        name = _compact_text(str(r.get("name", "")))
-        if not name:
-            continue
-        for tok in _name_affixes(name):
-            alias.setdefault(tok, []).append(r)
-    slow_cache.set("a_alias_index", alias, ttl=12 * 3600)
-    return alias
-
-
 
 
 def get_company_name(code: str) -> Optional[str]:

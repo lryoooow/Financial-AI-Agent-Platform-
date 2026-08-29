@@ -7,8 +7,6 @@ import { api, type UserProfile } from "../../api/client";
 type Status = "idle" | "testing" | "connected" | "error";
 interface Cfg { baseUrl: string; apiKey: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 interface Props {
   active: { providerId: string; modelId: string } | null;
   onActivate: (p: { providerId: string; modelId: string; provider: string; model: string; accent: string }) => void;
@@ -79,7 +77,14 @@ export function Settings({ active, onActivate }: Props) {
     }, 300);
     return () => window.clearTimeout(t);
   }, [configs]);
-  const [selectedId, setSelectedId] = useState(active?.providerId || PROVIDERS[0].id);
+  // v1.6.0（审计 C4）：selectedId 兜底 —— 存量记录里的 providerId 不在清单时回落首个，
+  // 否则 configs[selectedId] 为 undefined，下方 value={cfg.baseUrl} 直接 TypeError 白屏
+  const [selectedId, setSelectedId] = useState(
+    () => (active?.providerId && PROVIDERS.some((p) => p.id === active.providerId) ? active.providerId : PROVIDERS[0].id),
+  );
+  useEffect(() => {
+    if (!PROVIDERS.some((p) => p.id === selectedId)) setSelectedId(PROVIDERS[0].id);
+  }, [selectedId]);
   const [showKey, setShowKey] = useState(false);
   const [regionFilter, setRegionFilter] = useState<Region | "all">("all");
   const [profile, setProfile] = useState<UserProfile>({
@@ -110,8 +115,8 @@ export function Settings({ active, onActivate }: Props) {
     return () => window.clearTimeout(t);
   }, [profile]);
 
-  const provider = PROVIDERS.find((p) => p.id === selectedId)!;
-  const cfg = configs[selectedId];
+  const provider = PROVIDERS.find((p) => p.id === selectedId) ?? PROVIDERS[0];
+  const cfg = configs[selectedId] ?? configs[PROVIDERS[0].id]!;
   const patch = (id: string, p: Partial<Cfg>) => setConfigs((c) => ({ ...c, [id]: { ...c[id], ...p } }));
 
   const activeProvider = active ? PROVIDERS.find((p) => p.id === active.providerId) : null;
@@ -119,12 +124,22 @@ export function Settings({ active, onActivate }: Props) {
     ?? configs[active?.providerId ?? ""]?.models.find((m) => m.id === active?.modelId);
 
   async function testConn() {
+    // v1.6.0（审计 C3）：真连通测试 —— 此前是 sleep(1100) + 长度≥8 判成功、
+    // 延迟用 Math.random() 伪造的假测试，乱码 key 也显示「连接成功 · 347ms」。
+    // 现在走后端 /api/models 真拉厂商模型列表，延迟为实测。
     if (!cfg.apiKey.trim()) { patch(selectedId, { status: "error", message: "请先填入 API Key" }); return; }
     patch(selectedId, { status: "testing", message: "" });
-    await sleep(1100);
-    const ok = cfg.apiKey.trim().length >= 8;
-    if (ok) patch(selectedId, { status: "connected", latency: Math.round(120 + Math.random() * 380), message: "连接成功" });
-    else patch(selectedId, { status: "error", message: "认证失败：API Key 无效（示例校验需 ≥ 8 位）" });
+    const t0 = performance.now();
+    try {
+      const r = await api.models(cfg.baseUrl, cfg.apiKey);
+      const err = r.provenance?.error as string | undefined;
+      const ok = !err && (r.models?.length ?? 0) > 0;
+      patch(selectedId, ok
+        ? { status: "connected", latency: Math.round(performance.now() - t0), message: `连接成功（拉到 ${r.models!.length} 个模型）` }
+        : { status: "error", message: `认证失败：${err || "未返回任何模型"}` });
+    } catch (e) {
+      patch(selectedId, { status: "error", message: `连接失败：${e instanceof Error ? e.message : String(e)}` });
+    }
   }
 
   async function fetchModels() {

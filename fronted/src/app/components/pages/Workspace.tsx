@@ -6,6 +6,7 @@ import { TEMPLATES, type TemplateId, type ReportDoc } from "../../data/report";
 import { fmt, signed, trendClass } from "../../lib/format";
 import { api, type EvidenceStatus, type LlmConfig, type ResolveHit } from "../../api/client";
 import { ModelPicker } from "../ModelPicker";
+import { useResearchStream } from "../../hooks/useResearchStream";
 
 interface ActiveModel { provider: string; model: string; accent: string; }
 interface Props {
@@ -71,6 +72,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   const [llm, setLlm] = useState<LlmConfig | null>(null);
   const runId = useRef(0);
   const reportRef = useRef<HTMLDivElement>(null);
+  // v1.6.0（审计 C2）：研究 SSE 连接由 hook 托管（卸载必关 / 单连接），并支持断线重连
+  const stream = useResearchStream();
+  const [reconnectedCode, setReconnectedCode] = useState<string | null>(null);
 
   useEffect(() => {
     if (initialCode) {
@@ -111,6 +115,39 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     };
   }, []);
 
+  // v1.6.0（审计 C2）：挂载时重连仍在运行的研究任务。
+  // 后端研究流与 SSE 订阅者解耦（断连后任务继续跑 + history 回放），但前端此前
+  // 没有任何重连接入 —— 切页/刷新后运行中的研究从 UI 消失且无法找回。
+  useEffect(() => {
+    let cancelled = false;
+    api.researchTasks()
+      .then((r) => {
+        if (cancelled) return;
+        const live = (r.tasks || []).find((t) => t.status === "running" || t.status === "pending");
+        if (!live) return;
+        const id = ++runId.current;
+        setPhase("running");
+        setReconnectedCode(live.code);
+        stream.connect(live.id, live.code, live.template || "equity_deep", (ev) => {
+          if (cancelled) return;
+          if (ev.type === "done" || ev.type === "error" || ev.type === "__disconnected__") {
+            setReconnectedCode(null);
+          }
+          handleResearchEvent(ev, {
+            id,
+            resolved: { code: live.code, name: live.code },
+            runTemplate: (live.template as TemplateId) || "equity_deep",
+            finish: () => {},
+          });
+        });
+      })
+      .catch(() => { /* 后端不可用时静默：新任务提交路径自会报错 */ });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const now = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
 
   function normalizeCode(input: string): string | null {
@@ -120,7 +157,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     const pure = m[1];
     if (m[2]) return `${pure}.${m[2]}`;
     if (/^(60|68|90|11|51|56)/.test(pure)) return `${pure}.SH`;
-    if (/^(43|83|87|88)/.test(pure)) return `${pure}.BJ`;
+    if (/^(43|83|87|88|92)/.test(pure)) return `${pure}.BJ`; // v1.6.0：北交所 920xxx
     return `${pure}.SZ`;
   }
 
@@ -143,6 +180,129 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   }
 
   // —— 后端真实流程（SSE）：失败直接展示错误，禁止回退 mock ——
+  /** 进度文字挂到"当前正在跑的那个工具"下面；还没有工具时先放一条占位，不丢事件。 */
+  const emit = (text: string) =>
+    setToolCalls((calls) => {
+      if (!calls.length) {
+        return [{ name: "_task", label: "研究任务", status: "start", events: [{ text, time: now() }] }];
+      }
+      const last = calls[calls.length - 1];
+      return [...calls.slice(0, -1), { ...last, events: [...last.events, { text, time: now() }] }];
+    });
+
+  /**
+   * 研究 SSE 事件统一处理（v1.6.0，审计 C2：从 runBackend 的 onmessage 抽出，
+   * 供「新任务」与「断线重连」两条路径复用；ctx.finish 负责结束当前 await）。
+   */
+  const handleResearchEvent = (ev: any, ctx: {
+    id: number;
+    resolved: CurrentStock;
+    runTemplate: TemplateId;
+    finish: () => void;
+  }) => {
+    if (runId.current !== ctx.id) { ctx.finish(); return; }
+    const { resolved, runTemplate, finish } = ctx;
+    if (ev.type === "tool_call") {
+      // agent 真实工具调用：start 追加一条，ok/error 更新最后那条同名的状态。
+      setToolCalls((calls) => {
+        if (ev.status === "start") {
+          const placeholder = calls.length === 1 && calls[0].name === "_task" ? calls[0].events : [];
+          const base = calls.filter((c) => c.name !== "_task");
+          return [...base, { name: ev.name, label: ev.label || ev.name, status: "start", events: placeholder }];
+        }
+        for (let i = calls.length - 1; i >= 0; i--) {
+          if (calls[i].name === ev.name) {
+            const next = [...calls];
+            next[i] = { ...next[i], status: ev.status };
+            return next;
+          }
+        }
+        return calls;
+      });
+    } else if (ev.type === "todo") {
+      setTodos(ev.items ?? []);
+    } else if (ev.type === "tool") {
+      emit(ev.text);
+    } else if (ev.type === "summary") {
+      setTyped(ev.text ?? "");
+      if (ev.name || ev.ticker) {
+        setStock((current) => ({
+          ...current,
+          name: ev.name || current.name,
+          code: ev.ticker || current.code,
+          price: ev.price ?? current.price,
+          change: ev.change ?? current.change,
+          changePct: ev.changePct ?? current.changePct,
+        }));
+      }
+    } else if (ev.type === "token") {
+      // 兼容旧后端；新后端使用 summary 快照，重连时不会重复 append。
+      setTyped((t) => t + (ev.text ?? ""));
+    } else if (ev.type === "section_start") {
+      // 真流式：某板块开始撰写，建一个空 body 的段并按模板序插入（不重复建段）
+      const title = ev.title ?? "分析章节";
+      setPartialSections((items) =>
+        items.some((item) => item.title === title)
+          ? items
+          : [...items, { title, body: "" }].sort((a, b) => {
+              const order = SECTION_ORDER[runTemplate];
+              const ai = order.indexOf(a.title);
+              const bi = order.indexOf(b.title);
+              return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+            })
+      );
+    } else if (ev.type === "section_token") {
+      // 真流式：逐 token 追加到对应板块 body（打字机效果）
+      const title = ev.title ?? "分析章节";
+      const token = ev.text ?? "";
+      setPartialSections((items) => {
+        const idx = items.findIndex((item) => item.title === title);
+        if (idx === -1) return [...items, { title, body: token }];
+        const next = items.slice();
+        next[idx] = { title, body: next[idx].body + token };
+        return next;
+      });
+    } else if (ev.type === "section") {
+      // 权威收口：用最终 body 覆盖流式累积（截断/禁用词回退后以此为准）
+      const section = { title: ev.title ?? "分析章节", body: ev.body ?? "" };
+      setPartialSections((items) => [
+        ...items.filter((item) => item.title !== section.title),
+        section,
+      ].sort((a, b) => {
+        const order = SECTION_ORDER[runTemplate];
+        const ai = order.indexOf(a.title);
+        const bi = order.indexOf(b.title);
+        return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+      }));
+    } else if (ev.type === "done") {
+      const rep = ev.report;
+      const reportId = ev.report_id || `${resolved.code}-${Date.now()}`;
+      setDoc(rep);
+      setStock((current) => ({
+        ...current,
+        code: rep?.ticker || current.code,
+        name: rep?.name || current.name,
+      }));
+      setPhase("done");
+      setReconnectedCode(null);
+      reportRef.current?.scrollTo({ top: 0 });
+      onReportGenerated({ id: reportId, name: rep?.name || resolved.name, code: rep?.ticker || resolved.code, template: TEMPLATES.find((t) => t.id === runTemplate)!.label, date: rep?.as_of ?? new Date().toLocaleString("zh-CN", { hour12: false }), summary: rep?.summary ?? "" });
+      finish();
+    } else if (ev.type === "error") {
+      const message = ev.message ?? "研究管线失败";
+      emit(`⚠ ${message}`);
+      setError(message);
+      setPhase("idle");
+      setReconnectedCode(null);
+      finish();
+    } else if (ev.type === "__disconnected__") {
+      setError("研究流连接中断，请检查后端服务或模型响应。");
+      setPhase("idle");
+      setReconnectedCode(null);
+      finish();
+    }
+  };
+
   async function runBackend(resolved: CurrentStock): Promise<boolean> {
     const id = ++runId.current;
     const runTemplate = template;
@@ -155,15 +315,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     setError("");
     setToolCalls([]);
     setTodos([]);
-    /** 进度文字挂到"当前正在跑的那个工具"下面；还没有工具时先放一条占位，不丢事件。 */
-    const emit = (text: string) =>
-      setToolCalls((calls) => {
-        if (!calls.length) {
-          return [{ name: "_task", label: "研究任务", status: "start", events: [{ text, time: now() }] }];
-        }
-        const last = calls[calls.length - 1];
-        return [...calls.slice(0, -1), { ...last, events: [...last.events, { text, time: now() }] }];
-      });
+    setReconnectedCode(null);
 
     let taskId: string;
     try {
@@ -178,112 +330,19 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
 
     emit(`提交研究任务 ${taskId.slice(0, 8)}…`);
     await new Promise<void>((resolve) => {
-      const es = new EventSource(api.researchStreamUrl(taskId, resolved.code, runTemplate));
-      const finish = () => { try { es.close(); } catch {} resolve(); };
-      es.onmessage = (e: MessageEvent) => {
-        if (runId.current !== id) { finish(); return; }
-        let ev: any;
-        try { ev = JSON.parse(e.data); } catch { return; }
-        if (ev.type === "tool_call") {
-          // agent 真实工具调用：start 追加一条，ok/error 更新最后那条同名的状态。
-          setToolCalls((calls) => {
-            if (ev.status === "start") {
-              const placeholder = calls.length === 1 && calls[0].name === "_task" ? calls[0].events : [];
-              const base = calls.filter((c) => c.name !== "_task");
-              return [...base, { name: ev.name, label: ev.label || ev.name, status: "start", events: placeholder }];
-            }
-            for (let i = calls.length - 1; i >= 0; i--) {
-              if (calls[i].name === ev.name) {
-                const next = [...calls];
-                next[i] = { ...next[i], status: ev.status };
-                return next;
-              }
-            }
-            return calls;
-          });
-        } else if (ev.type === "todo") {
-          setTodos(ev.items ?? []);
-        } else if (ev.type === "tool") {
-          emit(ev.text);
-        } else if (ev.type === "summary") {
-          setTyped(ev.text ?? "");
-          if (ev.name || ev.ticker) {
-            setStock((current) => ({
-              ...current,
-              name: ev.name || current.name,
-              code: ev.ticker || current.code,
-              price: ev.price ?? current.price,
-              change: ev.change ?? current.change,
-              changePct: ev.changePct ?? current.changePct,
-            }));
-          }
-        } else if (ev.type === "token") {
-          // 兼容旧后端；新后端使用 summary 快照，重连时不会重复 append。
-          setTyped((t) => t + (ev.text ?? ""));
-        } else if (ev.type === "section_start") {
-          // 真流式：某板块开始撰写，建一个空 body 的段并按模板序插入（不重复建段）
-          const title = ev.title ?? "分析章节";
-          setPartialSections((items) =>
-            items.some((item) => item.title === title)
-              ? items
-              : [...items, { title, body: "" }].sort((a, b) => {
-                  const order = SECTION_ORDER[runTemplate];
-                  const ai = order.indexOf(a.title);
-                  const bi = order.indexOf(b.title);
-                  return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-                })
-          );
-        } else if (ev.type === "section_token") {
-          // 真流式：逐 token 追加到对应板块 body（打字机效果）
-          const title = ev.title ?? "分析章节";
-          const token = ev.text ?? "";
-          setPartialSections((items) => {
-            const idx = items.findIndex((item) => item.title === title);
-            if (idx === -1) return [...items, { title, body: token }];
-            const next = items.slice();
-            next[idx] = { title, body: next[idx].body + token };
-            return next;
-          });
-        } else if (ev.type === "section") {
-          // 权威收口：用最终 body 覆盖流式累积（截断/禁用词回退后以此为准）
-          const section = { title: ev.title ?? "分析章节", body: ev.body ?? "" };
-          setPartialSections((items) => [
-            ...items.filter((item) => item.title !== section.title),
-            section,
-          ].sort((a, b) => {
-            const order = SECTION_ORDER[runTemplate];
-            const ai = order.indexOf(a.title);
-            const bi = order.indexOf(b.title);
-            return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-          }));
-        } else if (ev.type === "done") {
-          const rep = ev.report;
-          const reportId = ev.report_id || `${resolved.code}-${Date.now()}`;
-          setDoc(rep);
-          setStock((current) => ({
-            ...current,
-            code: rep?.ticker || current.code,
-            name: rep?.name || current.name,
-          }));
-          setPhase("done");
-          reportRef.current?.scrollTo({ top: 0 });
-          onReportGenerated({ id: reportId, name: rep?.name || resolved.name, code: rep?.ticker || resolved.code, template: TEMPLATES.find((t) => t.id === runTemplate)!.label, date: rep?.as_of ?? new Date().toLocaleString("zh-CN", { hour12: false }), summary: rep?.summary ?? "" });
-          finish();
-        } else if (ev.type === "error") {
-          const message = ev.message ?? "研究管线失败";
-          emit(`⚠ ${message}`);
-          setError(message);
-          setPhase("idle");
-          finish();
-        }
+      let finished = false;
+      // 终态必须主动关连接：done/error 后服务端断流，EventSource 会自动重连并触发
+      // onerror（否则其 __disconnected__ 事件会覆盖刚设置的完成态）。finished 拦截迟到事件。
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        stream.close();
+        resolve();
       };
-      es.onerror = () => {
-        if (runId.current === id) {
-          setError("研究流连接中断，请检查后端服务或模型响应。");
-          setPhase("idle");
-        }
-        finish();
-      };
+      stream.connect(taskId, resolved.code, runTemplate, (ev) => {
+        if (finished) return;
+        handleResearchEvent(ev, { id, resolved, runTemplate, finish });
+      });
     });
     return true;
   }
@@ -332,6 +391,11 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
               className="bg-transparent outline-none text-sm w-full placeholder:text-muted-foreground"
             />
           </div>
+          {reconnectedCode && !error && (
+            <div className="mt-2 text-xs text-gold/90 bg-gold/10 border border-gold/20 rounded-md px-2 py-1.5">
+              已重连进行中的研究：{reconnectedCode}（断线期间任务在后端持续运行）
+            </div>
+          )}
           {error && <div className="mt-2 text-xs text-destructive leading-relaxed">{error}</div>}
 
           <div className="mt-3 rounded-lg border border-border bg-secondary/30 px-3 py-2">

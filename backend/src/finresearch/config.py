@@ -69,14 +69,16 @@ class Settings(BaseSettings):
     # 按 token 实测管理（含历史卸载到文件系统），不再靠手写的字符数估算。
     section_facts_max_chars: int = Field(default=2400)   # 报告单段事实块预算
 
-    # 报告多段并发撰写：家用 key 的 RPS 有限，不加闸会成片 429 → 各段静默回退模板。
-    # 1.2.3：摘要改为默认走 LLM（+1 并发给 summary），四段分析不受影响。
+    # 报告分段撰写：1.5.0 起四段改「逐段串行真流式」，本并发值退化为全链路闸门。
+    # v1.6.0（审计 D4）：注释与实现对齐 —— report_use_llm_summary 出厂为 False
+    # （模板摘要先快速可见），不要按旧注释「1.2.3 默认走 LLM」理解。
     report_llm_concurrency: int = Field(default=4)
     report_section_timeout_s: float = Field(default=30.0)
     # 提示词中的字数要求不是协议约束；同时限制 completion token 与最终展示字符数。
+    # 480 是普通模型上限；推理模型在 report.py 按 is_reasoning_model 放宽到 4096
+    #（推理输出含思维链，480 会被 CoT 吃满导致 content 为空、四段全回退模板）。
     report_section_max_tokens: int = Field(default=480)
     report_section_max_chars: int = Field(default=420)
-    # 摘要必须先快速可见，详细章节再并发增强；避免“摘要 60s + 章节 60s”的串行双超时。
     report_use_llm_summary: bool = Field(default=False)
     context_summary_timeout_s: float = Field(default=20.0)
 

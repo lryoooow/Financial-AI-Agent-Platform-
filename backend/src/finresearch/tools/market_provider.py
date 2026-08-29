@@ -37,6 +37,7 @@ MARKET_HOSTS = [
     "datacenter.eastmoney.com",
     "quote.eastmoney.com",
     "search-api-web.eastmoney.com",
+    "so.eastmoney.com",
     # Sina（备用源）
     "hq.sinajs.cn",
     "hq.sinajs.com.cn",
@@ -102,9 +103,15 @@ def configure_market_network() -> dict:
     - market_proxy 显式设置时：额外写入 HTTP_PROXY/HTTPS_PROXY（用于确实需要代理出网的环境）。
     纯 os.environ 操作，无重型 import，调用顺序安全。
 
+    v1.6.0（审计 B6）：设 NO_PROXY 前先把 Windows 注册表系统代理物化进 env ——
+    requests/urllib 的 getproxies() 是「环境变量 or 注册表」短路逻辑，仅设 NO_PROXY
+    会让 getproxies_environment() 返回非空 dict，注册表代理被整体忽略，在「必须走
+    代理出网」的环境里等于全局断网开关。先物化再 bypass，两者兼得。
+
     返回生效后的摘要（供诊断接口回显）。
     """
     import os
+    import sys
 
     from ..config import settings
 
@@ -113,9 +120,26 @@ def configure_market_network() -> dict:
         "market_proxy_set": bool(settings.market_proxy),
     }
 
+    # ① 注册表代理物化（仅 Windows 且 env 未显式配置代理时）
+    if sys.platform == "win32" and not (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
+        try:
+            import urllib.request
+
+            reg = urllib.request.getproxies_registry()
+            for scheme in ("http", "https"):
+                p = reg.get(scheme) or (reg.get("https") if scheme == "http" else None)
+                if p:
+                    os.environ.setdefault(scheme.upper() + "_PROXY", p)
+                    summary.setdefault("materialized_registry_proxy", p)
+        except Exception:  # noqa: BLE001
+            pass
+
     if settings.market_bypass_proxy:
         existing = ",".join([os.environ.get("NO_PROXY", ""), os.environ.get("no_proxy", "")])
         parts = [h.strip() for h in existing.split(",") if h.strip()]
+        # 过滤无效通配符形态：Python 的 NO_PROXY 是 endswith 后缀匹配，`*.eastmoney.com`
+        # 永远匹配不上任何主机（Electron 侧曾注入这种形态，v1.6.0 已改为后端单一权威清单）
+        parts = [h[2:] if h.startswith("*.") else h for h in parts]
         parts += [h for h in MARKET_HOSTS if h not in parts]
         val = ",".join(dict.fromkeys(parts))  # 去重保序
         os.environ["NO_PROXY"] = val
@@ -136,10 +160,14 @@ def configure_market_network() -> dict:
 # 市场前缀（Sina/Sina kline 用 sh/sz/bj 前缀）
 # ────────────────────────────────────────────────────────────
 def _sina_symbol(raw: str) -> str:
-    """纯 6 位代码 → Sina 前缀（sh/sz/bj）。"""
+    """纯 6 位代码 → Sina 前缀（sh/sz/bj）。
+
+    v1.6.0（审计 B7）：北交所 2024 年起新代码全部为 920xxx（种子表 325 只全是 920 开头），
+    此前只认 43/83/87/88 → 920 被判深证（sz920000 实测返回空），补 "92" 前缀。
+    """
     if raw.startswith(("60", "68", "90", "11", "51", "56")):
         return f"sh{raw}"
-    if raw.startswith(("43", "83", "87", "88")):
+    if raw.startswith(("43", "83", "87", "88", "92")):
         return f"bj{raw}"
     return f"sz{raw}"
 
