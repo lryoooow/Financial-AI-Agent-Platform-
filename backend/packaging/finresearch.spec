@@ -25,7 +25,8 @@ binaries = []
 hiddenimports = []
 
 # 重型 / 动态导入的库：全量收集（数据 + 二进制 + 子模块）
-for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar"]:
+# v1.6.0：+psutil（run_server 父进程看门狗的懒导入，显式收集防静态分析漏网）
+for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar", "psutil"]:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -67,10 +68,10 @@ datas += [(f, "finresearch/report_templates") for f in glob.glob(os.path.join(_t
 _data_dir = os.path.join(_SRC_DIR, "finresearch", "data")
 datas += [(f, "finresearch/data") for f in glob.glob(os.path.join(_data_dir, "*.json"))]
 
-# 前端构建产物（build_installer.bat 已复制到 src/finresearch/static）
-static = os.path.join(_SRC_DIR, "finresearch", "static")
-if os.path.isdir(static):
-    datas += [(static, "static")]
+# v1.6.0（审计 P2）：移除显式重复收集 —— collect_data_files("finresearch") 已包含
+# src/finresearch/static/**，此前再收一份到顶层 "static" 导致包内两份前端产物
+# （实测各 1004K）且两处来源可能不同步（升级出现"改了前端没生效"）。
+# main.py 的 _MEIPASS/static 查找分支随之自然失效（只剩 finresearch/static 一处）。
 
 # uvicorn / 桌面运行时子模块（静态分析发现不了）
 hiddenimports += [
