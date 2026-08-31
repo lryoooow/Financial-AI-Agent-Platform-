@@ -27,7 +27,7 @@ os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_db}"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from fastapi import HTTPException  # noqa: E402
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import delete, select  # noqa: E402
 from finresearch.db.session import init_db, session_scope  # noqa: E402
 from finresearch.db.models import ChatConversation, ChatDelta, LocalSetting, ResearchTask  # noqa: E402
 from finresearch.api import routes  # noqa: E402
@@ -373,6 +373,43 @@ async def t_cancel_persist_real_cancellation_semantics():
         routes._deepagent_chat_stream = orig
 
 
+async def t_overlay_no_active_model_full_table_fallback():
+    """v1.6.3 C2：无 active-model 时按 base_url 扫 model-configs 全表兜底覆盖。"""
+    conv_id = "conv-overlay2"
+    async with session_scope() as s:
+        s.add(ChatConversation(id=conv_id, title="t"))
+        await s.commit()
+    # 清掉 active-model（模拟从未点选过模型的用户）
+    async with session_scope() as s:
+        await s.execute(delete(LocalSetting).where(LocalSetting.key == "active-model"))
+        await s.commit()
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "deepseek": {"baseUrl": "https://api.deepseek.com",
+                     "apiKey": "sk-db-current", "selectedModel": "m"},
+    }))
+
+    captured = {}
+
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+        captured["llm_cfg"] = llm_cfg
+        yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
+
+    orig = routes._deepagent_chat_stream
+    routes._deepagent_chat_stream = fake_stream
+    try:
+        resp = await send_chat_message(conv_id, ChatSendRequest(
+            message="hi",
+            llm={"base_url": "https://api.deepseek.com", "api_key": "sk-stale-cache", "model": "m"},
+        ))
+        async for _ in resp.body_iterator:
+            pass
+        cfg = captured.get("llm_cfg") or {}
+        check(cfg.get("api_key") == "sk-db-current",
+              "无 active-model 时按 base_url 全表兜底覆盖（旧缓存 key 不得发出）")
+    finally:
+        routes._deepagent_chat_stream = orig
+
+
 async def main() -> None:
     await init_db()
     # 初始化检查点（与生产 lifespan 同序），让会话删除的线程清理断言真实生效
@@ -389,6 +426,7 @@ async def main() -> None:
         await t_active_llm_fallback_overrides_stale_conv_config()
         await t_active_llm_cfg_none_when_unconfigured()
         await t_overlay_current_key_wins_over_stale_cache()
+        await t_overlay_no_active_model_full_table_fallback()
         await t_cancel_persist_real_cancellation_semantics()
     finally:
         # 不关检查点的话，aiosqlite 残留线程会让解释器在退出阶段挂死

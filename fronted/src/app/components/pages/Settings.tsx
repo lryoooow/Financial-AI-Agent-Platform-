@@ -76,10 +76,18 @@ export function Settings({ active, onActivate }: Props) {
     // 聊天页选择器仍握挂载时的旧缓存，带着旧 key 请求 401）
     window.dispatchEvent(new CustomEvent("finresearch:configs-updated"));
     const t = window.setTimeout(() => {
-      api.saveLocalSetting("model-configs", toSave).catch(() => {});
+      // v1.6.3（C1）：保存失败绝不静默 —— DB 是后端 overlay 的事实源，失败必须让
+      // 用户知道（否则 DB 留旧 key，后端会把前端新 key 反向覆盖回 401）
+      api.saveLocalSetting("model-configs", toSave).catch((e) => {
+        const msg = `密钥保存失败（${e instanceof Error ? e.message : String(e)}）。请检查后端连接后重试，否则换 key 不会生效。`;
+        setSaveError(msg);
+        console.error("[Settings] model-configs save failed:", e);
+      });
     }, 300);
     return () => window.clearTimeout(t);
   }, [configs]);
+  // v1.6.3（C1）：保存失败横幅（用户再编辑任一配置时清除）
+  const [saveError, setSaveError] = useState("");
   // v1.6.0（审计 C4）：selectedId 兜底 —— 存量记录里的 providerId 不在清单时回落首个，
   // 否则 configs[selectedId] 为 undefined，下方 value={cfg.baseUrl} 直接 TypeError 白屏
   const [selectedId, setSelectedId] = useState(
@@ -120,7 +128,10 @@ export function Settings({ active, onActivate }: Props) {
 
   const provider = PROVIDERS.find((p) => p.id === selectedId) ?? PROVIDERS[0];
   const cfg = configs[selectedId] ?? configs[PROVIDERS[0].id]!;
-  const patch = (id: string, p: Partial<Cfg>) => setConfigs((c) => ({ ...c, [id]: { ...c[id], ...p } }));
+  const patch = (id: string, p: Partial<Cfg>) => {
+    setSaveError(""); // 用户再编辑即清除上次保存失败横幅
+    setConfigs((c) => ({ ...c, [id]: { ...c[id], ...p } }));
+  };
 
   const activeProvider = active ? PROVIDERS.find((p) => p.id === active.providerId) : null;
   const activeModel = activeProvider?.models.find((m) => m.id === active?.modelId)
@@ -177,6 +188,12 @@ export function Settings({ active, onActivate }: Props) {
 
   return (
     <div className="h-full grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-4 p-5 overflow-hidden">
+      {saveError && (
+        <div className="col-span-full rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive flex items-start gap-2">
+          <AlertCircle className="size-3.5 shrink-0 mt-0.5" />
+          <span>{saveError}</span>
+        </div>
+      )}
       {/* 供应商列表 */}
       <div className="flex flex-col gap-3 min-h-0">
         <div className="rounded-xl border border-border bg-card p-1 flex gap-1">

@@ -27,6 +27,8 @@ export function useChartAI(
     if (timer.current) clearTimeout(timer.current);
     request.current?.abort();
     request.current = null;
+    // v1.6.3（C5）：切点先清旧速读文案（悬停跨点残留旧文案），有缓存则立即回填
+    setAi(undefined);
     if (!code || !point) return;
     // 归一化 price（分时用 price，K线用 close）
     const price = point.price ?? point.close;

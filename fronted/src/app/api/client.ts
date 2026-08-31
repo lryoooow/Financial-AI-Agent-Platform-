@@ -73,6 +73,22 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
   return (await r.json()) as T;
 }
 
+/** v1.6.3（C1）：model-configs 专用保存通道 —— 3 次退避重试 + 最终失败上抛。
+ *  旧实现单发 PUT 失败被调用方 .catch(()=>{}) 静默吞掉，DB 留旧 key 而前端已持新 key，
+ *  后端 overlay 会把新 key 反向覆盖回旧 key（401 持续到用户再次编辑设置）。 */
+async function putJsonRetry<T>(path: string, body: unknown, retries = 3): Promise<T> {
+  let lastErr: unknown = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await putJson<T>(path, body);
+    } catch (e) {
+      lastErr = e;
+      if (i < retries) await new Promise((r) => setTimeout(r, 300 * 2 ** i));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 /** 前端所选 LLM 配置（研究/速读时随请求传后端，真正打通前后端模型）。 */
 async function deleteJson<T>(path: string): Promise<T> {
   let r: Response;
@@ -365,10 +381,17 @@ export const api = {
     getJson<{ key: string; payload: any | null }>(`/api/local-settings/${encodeURIComponent(key)}`),
 
   saveLocalSetting: (key: string, payload: any) =>
-    putJson<{ ok: boolean; key: string }>(
-      `/api/local-settings/${encodeURIComponent(key)}`,
-      { payload }
-    ),
+    // v1.6.3（C1）：密钥配置走重试通道（保存失败绝不能静默 —— DB 是后端 overlay 的
+    // 事实源，旧 key 留库会把前端新 key 反向覆盖回 401）
+    key === "model-configs"
+      ? putJsonRetry<{ ok: boolean; key: string }>(
+          `/api/local-settings/${encodeURIComponent(key)}`,
+          { payload }
+        )
+      : putJson<{ ok: boolean; key: string }>(
+          `/api/local-settings/${encodeURIComponent(key)}`,
+          { payload }
+        ),
 
   chatConversations: (archived = false) =>
     getJson<{ conversations: ChatConversation[]; channel: "deltachannel" }>(

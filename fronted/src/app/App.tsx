@@ -30,7 +30,13 @@ export default function App() {
   // （Settings 的 configsLoadedRef 同款模式，这里此前漏防）。
   const activeLoadedRef = useRef(false);
   // 核验修复：GET 返回前用户已改选模型时，不让迟到的 GET 覆盖用户操作
+  // v1.6.3（C4）：ModelPicker 直接选模型（不经 App onActivate）也要置位
   const userTouchedRef = useRef(false);
+  useEffect(() => {
+    const onTouch = () => { userTouchedRef.current = true; };
+    window.addEventListener("finresearch:model-changed", onTouch);
+    return () => window.removeEventListener("finresearch:model-changed", onTouch);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

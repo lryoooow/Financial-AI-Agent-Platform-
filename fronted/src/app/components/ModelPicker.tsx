@@ -79,7 +79,9 @@ export function loadActiveLlm(): LlmConfig | null {
   return options[0].llm;
 }
 
-/** 选中即持久化（localStorage + 后端 active-model）。 */
+/** 选中即持久化（localStorage + 后端 active-model）。v1.6.3：广播 model-changed
+ *  —— 其余常驻 ModelPicker 实例（聊天页/研究页）据此同步默认选中，App 据此置
+ *  userTouchedRef（防迟到 GET 覆盖用户选择）。 */
 function persistActive(o: PickerOption) {
   const payload = {
     providerId: o.providerId, modelId: o.model,
@@ -89,6 +91,7 @@ function persistActive(o: PickerOption) {
     localStorage.setItem("finresearch_active", JSON.stringify(payload));
   } catch { /* 存不进就只走后端 */ }
   api.saveLocalSetting("active-model", payload).catch(() => {});
+  window.dispatchEvent(new CustomEvent("finresearch:model-changed", { detail: payload }));
 }
 
 export function ModelPicker({
@@ -114,10 +117,15 @@ export function ModelPicker({
   }, []);
   // v1.6.2：Settings 保存（含换 key）即时同步 —— 广播一响就重读 localStorage，
   // 下面的重发 effect 会用新配置刷新宿主组件的 llm（杀"带着旧 key 请求"的缓存链）
+  // v1.6.3（C3/C4）：+ model-changed（另一实例换了模型 → 本实例刷新默认选中）
   useEffect(() => {
     const refresh = () => setOptions(loadPickerOptions());
     window.addEventListener("finresearch:configs-updated", refresh);
-    return () => window.removeEventListener("finresearch:configs-updated", refresh);
+    window.addEventListener("finresearch:model-changed", refresh);
+    return () => {
+      window.removeEventListener("finresearch:configs-updated", refresh);
+      window.removeEventListener("finresearch:model-changed", refresh);
+    };
   }, []);
 
   // 默认选中：active-model 精确匹配 > prop 匹配 > 第一项

@@ -187,23 +187,53 @@ def _start_research_runtime(
     return runtime
 
 
+async def _current_key_for_base(base_url: str) -> Optional[str]:
+    """按 base_url 在 model-configs 全表找当前 key（v1.6.3 C2）。
+
+    v1.6.2 的 overlay 只看 active-model —— 用户从未点选过模型 / active 指向已删
+    供应商时覆盖失效（旧缓存 key 仍可能发出）。这里扫全表按 baseUrl 精确匹配。
+    """
+    req_base = (base_url or "").strip()
+    if not req_base:
+        return None
+    try:
+        async with session_scope() as s:
+            if s is None:
+                return None
+            c_row = await s.get(LocalSetting, "model-configs")
+            configs = c_row.payload if (c_row and isinstance(c_row.payload, dict)) else {}
+        for cfg in decrypt_nested(configs).values():
+            if str(cfg.get("baseUrl") or "").strip() == req_base:
+                key = str(cfg.get("apiKey") or "").strip()
+                if key:
+                    return key
+    except Exception as e:  # noqa: BLE001
+        logger.debug("按 base_url 找当前 key 失败：%s", e)
+    return None
+
+
 async def _overlay_current_key(llm_cfg: Optional[dict]) -> Optional[dict]:
-    """缓存防腐（v1.6.2）：同供应商时以 DB 当前配置的 key/base_url 覆盖前端传来的缓存。
+    """缓存防腐（v1.6.2/v1.6.3）：同供应商时以 DB 当前配置的 key 覆盖前端传来的缓存。
 
     用户实测链：应用开着 → Settings 换 key → 聊天页选择器仍握着挂载时缓存的旧 key →
     401。DB（model-configs）是唯一事实源，localStorage/组件缓存只是缓存。
     仅当 base_url 完全一致（同一供应商）才覆盖 —— 用户显式选了别家供应商时不越权替换。
+    v1.6.3（C2）：不再只依赖 active-model —— 无 active / active 指向别家时，
+    按 base_url 扫 model-configs 全表兜底（修"从未点选过模型"用户覆盖失效的洞）。
     """
     if not llm_cfg:
         return llm_cfg
-    current = await _active_llm_cfg()
-    if not current:
-        return llm_cfg
     req_base = (llm_cfg.get("base_url") or "").strip()
-    cur_base = (current.get("base_url") or "").strip()
-    if req_base and cur_base and req_base == cur_base:
-        if (current.get("api_key") or "") != (llm_cfg.get("api_key") or ""):
-            return {**llm_cfg, "base_url": cur_base, "api_key": current["api_key"]}
+    if not req_base:
+        return llm_cfg
+    current_key = None
+    current = await _active_llm_cfg()
+    if current and (current.get("base_url") or "").strip() == req_base:
+        current_key = (current.get("api_key") or "").strip() or None
+    if not current_key:
+        current_key = await _current_key_for_base(req_base)
+    if current_key and current_key != (llm_cfg.get("api_key") or ""):
+        return {**llm_cfg, "api_key": current_key}
     return llm_cfg
 
 
@@ -1580,8 +1610,10 @@ async def chart_analyze(req: ChartAnalyzeRequest) -> dict:
         raw_value={"code": req.code, "kind": req.kind, "prevClose": req.prevClose},
     )
 
-    llm = build_chart_llm(override=req.llm)
-    used_model = resolved_chart_model(req.llm)
+    # v1.6.3（C5）：图表速读同样过缓存防腐覆盖（同供应商 DB 当前 key 优先）
+    chart_llm_cfg = await _overlay_current_key(req.llm)
+    llm = build_chart_llm(override=chart_llm_cfg)
+    used_model = resolved_chart_model(chart_llm_cfg)
     logger.info("chart_analyze target host=%s model=%s", target_host, used_model)
     if llm is None:
         return {
