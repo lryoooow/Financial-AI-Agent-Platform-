@@ -1,5 +1,48 @@
 # 更新日志
 
+## 1.6.3
+
+深挖修复大版本：基于 66 个 agent 对抗式深挖（6 猎手 → 54 反驳者 → 完整性批评者），
+确认 45 条仍存问题（P1×3 / P2×19 / P3×23），全部修复。
+
+### P1（全部经本机真实栈复现实证）
+
+- **取消落库从未真正生效**：uvicorn/anyio level-triggered 取消下，except CancelledError
+  里的裸 await 被立即再取消、或 yield 悬停点的生成器被弃置（GeneratorExit）——
+  v1.6.0 同名修复从未生效（测试直调协程绕过了真实取消语义）。重写为统一 finally 落库点
+  + anyio.CancelScope(shield=True) + contextlib.aclosing；chat_lock 随之确定释放。
+- **调休补班周六全行情挂**：A 股周末从不开市——旧实现用 chinese_calendar.is_workday
+  （补班周六返 True），_ensure_fresh 全天判所有源"陈旧"而拒绝。先按周末排除。
+- **财务表最新年行为中报值**：同年优先取年报（12-31），无年报回落中期并如实标注
+  （茅台 ROE 同比从错误的 -15.9pct 修正为真实 -1.3pct 级别）。
+
+### P2 金融数据族
+
+- sina 源缺 PE/PB/总市值/行业时向腾讯借（旧实现 sina 必胜→估值段恒"未获取"）
+- 营收+毛利率由新浪利润表补全（茅台营收 949→1709亿、毛利率 91.4-91.9% 全对；
+  营业成本绝不用营业总成本混算）；北交所腾讯日K qfqday 缺失时回退 day 并标注不复权；
+  停牌股 price<=0 判废不渲染 0.00 假价。
+
+### P2 认证/运行时/前端族
+
+- overlay 按 base_url 扫全表兜底（修从未点选用户覆盖失效）；model-configs PUT 3 次重试
+  + 失败横幅；双 ModelPicker 实例同步；chart_analyze 过 overlay；chart_llm 补超时。
+- 研究 SSE 3 次指数退避自动重连 + 页面可见性恢复；聊天看门狗仅前台+当前会话计时；
+  Workspace done 后报告头部锁定、error 互斥渲染、同名工具按序配对。
+- main.cjs：backendPort 重启同步；did-fail-load 兜底关 splash；APPDATA 算法对齐。
+- run_server：cacert 第三候选；轮转失败自恢复。后端：409 锁前移；_TASK_LLM 即清。
+
+### P3 清单
+
+_RESEARCH_RUNS 60s 延迟回收；选择器默认选中 selectedModel；搜索服务错误区分；
+pointercancel 清理；盘前/盘后 Asia/Shanghai；CORS 仅 FIN_DEV 放行 5173；PIL 13MB 瘦身；
+节假日 2027 降级（周末+静态表+标注）。
+
+### 驳回误报（14 条）
+
+hfq 复权返回 qfq、打包版 DPAPI 不可用、NSIS 升级文件锁、看门狗误杀推理模型流等——
+对抗核证均证伪。
+
 ## 1.6.0
 
 审计修复大版本：基于 2026-08-28 全量代码审计（P0×5 / P1×16 / P2×18 / P3×16，含 6 项本机复现实证），
