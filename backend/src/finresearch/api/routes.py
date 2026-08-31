@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -22,6 +23,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional
+
+import anyio  # v1.6.3：取消落库的 CancelScope(shield=True)（P1 修复）
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -833,9 +836,12 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
 
     async def gen():
         nonlocal summary_snapshot
-        # 统一闭环：无论是否有模型/是否出错，都最终持久化助手回复并发 done。
+        # 统一闭环：无论是否有模型/是否出错/是否被取消，都最终持久化助手回复；正常路径再发 done。
         reply_text = ""
         violated = False
+        interrupted = False   # CancelledError / 生成器被弃置（GeneratorExit）
+        completed = False     # 正常走完流式主体
+        failed_note = ""
 
         async def _persist_reply(final_text: str):
             """持久化助手回复（独立 session），返回 (meta, messages, assistant_msg)。"""
@@ -855,6 +861,7 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
             return final_meta, final_messages, assistant_msg
 
         async with chat_lock:
+          try:
             if not has_model:
                 # 无模型：不是 transient error，给出可操作提示并正常闭环（发 token + 持久化 + done）
                 reply_text = (
@@ -875,7 +882,9 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
                 #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
                 try:
                     gate_acc = ""
-                    async for _line, _piece in _deepagent_chat_stream(
+                    # v1.6.3（P1）：aclosing 确定性关闭上游 agent 流（break/取消/弃置都立即收尾，
+                    # 不再依赖 GC 异步终结器）。
+                    async with contextlib.aclosing(_deepagent_chat_stream(
                         conv_id=conv_id,
                         text=text,
                         history=history_snapshot,
@@ -883,49 +892,66 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
                         llm_cfg=llm_cfg,
                         images=req.images,
                         user_msg=history_snapshot[-1] if history_snapshot else None,
-                    ):
-                        # v1.6.0（审计 B10，用户已批准）：对话链路禁用词闸 —— 与报告同一份
-                        # FORBIDDEN_VERBS 检测（此前报告有闸、聊天 token 原样直出，同一产品双标）。
-                        # 命中即停流：不再外发该 token 及后续内容，落库文本同样截断。
-                        if _piece:
-                            gate_acc += _piece
-                            if check_generated(gate_acc):
-                                violated = True
-                                break
-                        yield _line
-                        reply_text += _piece
+                    )) as agent_stream:
+                        async for _line, _piece in agent_stream:
+                            # v1.6.0（审计 B10，用户已批准）：对话链路禁用词闸 —— 与报告同一份
+                            # FORBIDDEN_VERBS 检测（此前报告有闸、聊天 token 原样直出，同一产品双标）。
+                            # 命中即停流：不再外发该 token 及后续内容，落库文本同样截断。
+                            if _piece:
+                                gate_acc += _piece
+                                if check_generated(gate_acc):
+                                    violated = True
+                                    break
+                            yield _line
+                            reply_text += _piece
                 except asyncio.CancelledError:
-                    # v1.6.0（审计 B9）：客户端断开/用户点停止 —— 已生成部分照样落库。
-                    # 此前生成器被取消=回复整体丢失，重开会话只剩提问没有回答。
-                    if (reply_text or "").strip():
-                        await _persist_reply(_strip_md(reply_text) + "\n\n（生成中断）")
+                    # 客户端断开/用户点停止：标记中断，落库交给 finally（shield 保护）。
+                    interrupted = True
                     raise
                 except Exception as e:  # noqa: BLE001
                     logger.exception("对话链路失败")
                     # 已流式输出的部分保留；补失败说明后照常持久化 + done（闭环）
-                    note = f"\n\n⚠️ 模型调用失败：{e}"
-                    reply_text = (reply_text + note).strip() or note.strip()
+                    failed_note = f"\n\n⚠️ 模型调用失败：{e}"
                     yield sse.ev_error(str(e))
                 if violated:
                     note = "\n\n（以上内容包含受限的投资建议表述，已按合规要求截断。本助手不提供买卖建议。）"
                     reply_text = _strip_md(reply_text) + note
                     yield sse.ev_token(note)
-                if not reply_text:
+                if not reply_text and not failed_note:
                     reply_text = "⚠️ 模型返回为空。可以换一个模型或把问题拆得更具体。"
                     yield sse.ev_token(reply_text)
 
             # 落库前对完整文本再清洗一次（状态安全网：兜住逐 token 清洗无法处理的跨 token 拼接，如 ** 重组）
-            reply_text = _strip_md(reply_text)
-
-            # 2) 持久化助手回复（独立 session）——统一闭环
-            final_meta, final_messages, assistant_msg = await _persist_reply(reply_text)
-        yield sse.sse({
-            "type": "done",
-            "conversation": final_meta,
-            "messages": final_messages,
-            "reply": assistant_msg,
-            "channel": "deltachannel",
-        })
+            reply_text = _strip_md((reply_text + failed_note).strip() or failed_note.strip())
+            completed = True
+          finally:
+            # v1.6.3（P1·统一落库点）：正常 / 异常 / CancelledError / 生成器被弃置
+            # （GeneratorExit，finally 仍会执行）四条路径都在这里落库。
+            # 真实栈实证：uvicorn 断连时 anyio 以 level-triggered 方式重复投递取消，
+            # except 分支里的裸 await 会被立即再次取消（v1.6.0 的"取消落库"因此从未生效）；
+            # CancelScope(shield=True) 隔离外部取消，保证落库完成。
+            final_text = reply_text
+            if interrupted or not completed:
+                if final_text.strip():
+                    final_text = final_text + "\n\n（生成中断）"
+            if final_text.strip():
+                try:
+                    with anyio.CancelScope(shield=True):
+                        final_meta, final_messages, assistant_msg = await _persist_reply(final_text)
+                except Exception:  # noqa: BLE001
+                    logger.exception("中断/收尾落库失败 conv=%s", conv_id)
+                    final_meta, final_messages, assistant_msg = None, [], None
+            else:
+                final_meta, final_messages, assistant_msg = None, [], None
+        # 仅正常完成才发 done（取消/弃置路径连接已不在，yield 会再次抛出）
+        if completed and not interrupted:
+            yield sse.sse({
+                "type": "done",
+                "conversation": final_meta,
+                "messages": final_messages,
+                "reply": assistant_msg,
+                "channel": "deltachannel",
+            })
 
     return StreamingResponse(
         gen(),

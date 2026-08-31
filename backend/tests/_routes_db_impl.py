@@ -18,6 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import anyio  # noqa: E402（取消语义测试用；放在标准库后仅因排版）
+
 _tmp = tempfile.mkdtemp()
 _db = os.path.join(_tmp, "t.db").replace(os.sep, "/")
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_db}"
@@ -318,6 +320,59 @@ async def t_overlay_current_key_wins_over_stale_cache():
         routes._deepagent_chat_stream = orig
 
 
+async def t_cancel_persist_real_cancellation_semantics():
+    """v1.6.3 P1：取消/弃置时部分回复必须真实落库（穿过 anyio 取消语义，不是直调协程）。
+
+    v1.6.0 的同名修复在真实 uvicorn/anyio level-triggered 取消下从未生效——
+    except 里的裸 await 被立即再取消。此处用 anyio task group + move_on_after
+    复现相同语义，断言 shield 落库成立且 chat_lock 释放。
+    """
+    import anyio
+
+    conv_id = "conv-cancel"
+    async with session_scope() as s:
+        s.add(ChatConversation(id=conv_id, title="t"))
+        await s.commit()
+
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+        for i in range(50):
+            await asyncio.sleep(0.02)
+            yield f'data: {{"type":"token","text":"chunk{i}"}}\n\n', f"chunk{i} "
+
+    orig = routes._deepagent_chat_stream
+    routes._deepagent_chat_stream = fake_stream
+    consumed = []
+
+    async def scenario():
+        resp = await send_chat_message(conv_id, ChatSendRequest(
+            message="hi",
+            llm={"base_url": "https://x", "api_key": "sk-k", "model": "m"},
+        ))
+        body = resp.body_iterator
+        # 取消打在生成器内部 await（v1.6.0 失效的两路径之一）：消费几帧后悬停等取消
+        with anyio.move_on_after(0.25):
+            async for chunk in body:
+                consumed.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+                if len(consumed) >= 2:
+                    await anyio.sleep(2.0)  # 悬停在生成器内部 await，取消打在这里
+        await body.aclose()  # 模拟 starlette 任务组收尾关闭弃置的响应生成器
+
+    try:
+        await scenario()
+        await anyio.sleep(0.2)  # 给 shield 落库时间
+        async with session_scope() as s:
+            stmt = select(ChatDelta).where(ChatDelta.conversation_id == conv_id,
+                                           ChatDelta.role == "assistant").order_by(ChatDelta.seq.desc())
+            rows = list((await s.execute(stmt)).scalars().all())
+        latest = rows[0].payload["message"]["content"] if rows else ""
+        check("chunk" in latest and "生成中断" in latest,
+              f"取消路径部分回复已落库（shield 生效），落库片段: {latest[:40]!r}")
+        # chat_lock 必须已释放（弃置生成器不得持有锁导致后续 409）
+        check(not routes._chat_lock(conv_id).locked(), "取消后 chat_lock 已释放")
+    finally:
+        routes._deepagent_chat_stream = orig
+
+
 async def main() -> None:
     await init_db()
     # 初始化检查点（与生产 lifespan 同序），让会话删除的线程清理断言真实生效
@@ -334,6 +389,7 @@ async def main() -> None:
         await t_active_llm_fallback_overrides_stale_conv_config()
         await t_active_llm_cfg_none_when_unconfigured()
         await t_overlay_current_key_wins_over_stale_cache()
+        await t_cancel_persist_real_cancellation_semantics()
     finally:
         # 不关检查点的话，aiosqlite 残留线程会让解释器在退出阶段挂死
         # （生产 lifespan 收尾同样会 close；这里必须对称）

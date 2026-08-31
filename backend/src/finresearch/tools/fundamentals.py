@@ -160,7 +160,14 @@ def get_company_profile(code: str) -> dict:
 
 
 def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
-    """取最近 n 年财务指标（带缓存）。返回 list[dict]。"""
+    """取最近 n 年财务指标（带缓存）。返回 list[dict]。
+
+    v1.6.3（P1 修复）：同年**优先取年报**（报告期 12-31）。旧实现 keep="last" 在
+    年报发布前的月份会把"最新年"行换成中报/三季报值，与其它年份的年报行混排成
+    一张表 —— 同比全错（茅台实测 ROE 同比 -15.9pct，真实约 -1.3pct；资产负债率
+    同比符号翻转）。当年尚无年报时回落最新报告期，并在行上标记 `_interim=True`
+    供调用方在 provenance 如实标注（零幻觉：口径不撒谎）。
+    """
     cache_key = f"fin_indicator:{raw}:{n}"
     cached = slow_cache.get(cache_key)
     if cached is not None:
@@ -176,9 +183,18 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
     date_col = df.columns[0]
     df["_date"] = df[date_col].astype(str)
     df["_year"] = df["_date"].str[:4]
-    # 同一年保留最新报告期，不能取第一季度冒充全年/最新口径。
-    df = df.sort_values("_date").drop_duplicates("_year", keep="last").sort_values("_year")
-    rows = df.to_dict(orient="records")
+    df = df.sort_values("_date")
+    picked_rows = []
+    for year, group in df.groupby("_year", sort=True):
+        annual = group[group["_date"].str.slice(5, 7) == "12"]
+        if not annual.empty:
+            rec = annual.iloc[-1].to_dict()
+            rec["_interim"] = False
+        else:
+            rec = group.iloc[-1].to_dict()
+            rec["_interim"] = True  # 当年尚无年报：中期报告口径，调用方须标注
+        picked_rows.append(rec)
+    rows = picked_rows
     slow_cache.set(cache_key, rows, ttl=6 * 3600)
     return rows
 
@@ -244,9 +260,15 @@ def get_financial_indicators(code: str) -> dict:
             endpoint="stock_financial_analysis_indicator",
             raw_value=raw,
         )
+        # v1.6.3：中期报告口径如实披露（该年份行是中报/三季报而非年报）
+        interim_years = [str(r.get("_year", "")) for r in rows if r.get("_interim")]
+        interim_note = (
+            f"；{','.join(interim_years)} 年暂无年报、行为中期报告口径（同比勿直接与年报行比较）"
+            if interim_years else ""
+        )
         prov["note"] = (
             f"净利润列={_hit_col(net_keys) or '未获取'}；营收列={_hit_col(revenue_keys) or '未获取'}"
-            "（净利润行含扣非口径候选，实际命中列以本注为准）"
+            f"（净利润行含扣非口径候选，实际命中列以本注为准）{interim_note}"
         )
 
         return {

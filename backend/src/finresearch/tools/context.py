@@ -148,21 +148,24 @@ def _cn_holiday(now: dt.datetime) -> bool:
 
 
 def is_trading_day(now: Optional[dt.datetime] = None) -> bool:
-    """判断当前日期是否为 A 股交易日（工作日且不在休市日历中）。
+    """判断当前日期是否为 A 股交易日（周一~周五且不在休市日历中）。
 
     供 market.py 的数据新鲜度检查使用：节假日（工作日休市）不应拒绝上一交易日数据。
     日历每年维护（与 _trading_session 共用 _HOLIDAYS）；超出日历覆盖年份时保守按工作日判断。
+
+    v1.6.3（P1 修复）：**A 股周末从不开市**——调休补班的周六对股市仍是休市日
+    （国务院调休只调"上班"，交易所从不安排周末开市）。旧实现直接用
+    chinese_calendar.is_workday（补班周六返 True），导致 _ensure_fresh 在补班周六
+    把所有数据源判为"陈旧"而拒绝 → 补班日全天行情/分时/K线全挂。先按周末排除，
+    再查工作日是否为法定节假日。
     """
     n = now or dt.datetime.now()
+    if n.weekday() >= 5:
+        return False
     try:
         import chinese_calendar as cc
-        # is_workday 正确处理四种情况：工作日(True) / 周末(False) /
-        # 法定节假日(False) / 调休补班周末(True)。旧实现 weekday()>=5 先判 False，
-        # 会把调休补班的交易日误判为非交易日，导致 _ensure_fresh 画上一交易日旧线。
         return cc.is_workday(n.date())
-    except Exception:  # NotImplementedError(超年份)/ImportError(未安装) → 回退硬编码（无法识别调休补班）
-        if n.weekday() >= 5:
-            return False
+    except Exception:  # NotImplementedError(超年份)/ImportError(未安装) → 回退硬编码
         return n.strftime("%Y-%m-%d") not in _HOLIDAYS
 
 
