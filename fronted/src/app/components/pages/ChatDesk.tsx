@@ -218,18 +218,22 @@ export function ChatDesk({
       { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
     ]);
     setStreamingId(assistantId);
-    // v1.6.0（核验修复）：真「无输出」看门狗 —— 旧实现是 90s 总时长定时器，
-    // 正常流式中的长回复（推理模型常态）到点也被误杀。现改为活动刷新：
-    // 每次收到 token/stage 重置基准，连续 90s 无任何输出才中止。
+    // v1.6.3（D2）：真「无输出」看门狗（活动刷新），且仅在本会话前台可见时才计时 ——
+    // 页面隐藏/用户切到其他会话时暂停计时（后台流不应被误杀），回前台重置基准。
     const ac = new AbortController();
     stopRef.current = ac;
     let lastAct = Date.now();
+    let convId = ""; // send 域内声明，catch 的 stale 判定用它（闭包 current 会过期）
+    const isStale = () => convId !== "" && activeConvIdRef.current !== convId;
     const watchdog = window.setInterval(() => {
+      if (document.hidden || isStale()) return; // 后台/切走：暂停看门狗
       if (Date.now() - lastAct > 90_000) {
         window.clearInterval(watchdog);
         ac.abort(new Error("模型长时间无输出"));
       }
     }, 5_000);
+    const onVisible = () => { if (!document.hidden) lastAct = Date.now(); };
+    document.addEventListener("visibilitychange", onVisible);
     try {
       let conv = current;
       if (!conv) {
@@ -238,8 +242,7 @@ export function ChatDesk({
         setCurrent(conv);
         setConversations((prev) => [conv!, ...prev]);
       }
-      const convId = conv.id;
-      const isStale = () => activeConvIdRef.current !== convId;
+      convId = conv.id;
       await api.sendChatMessageStream(convId, text, llm, imgs.length ? imgs : undefined, {
         signal: ac.signal,
         onStage: (_s, label) => {
@@ -267,9 +270,8 @@ export function ChatDesk({
         },
       });
     } catch (e) {
-      // 核验修复：会话已删/已切走时不落无关的错误横幅
-      const convIdAtSend = (current?.id) ?? null;
-      const stale = convIdAtSend !== null && activeConvIdRef.current !== convIdAtSend;
+      // 会话已删/已切走时不落无关的错误横幅（用 send 域 convId 判定，闭包 current 已过期）
+      const stale = isStale();
       if ((e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出") {
         // 用户停止/看门狗：已生成部分保留（后端会把部分回复落库并标注「生成中断」）
         if (!stale) setError("已停止生成");
@@ -281,6 +283,7 @@ export function ChatDesk({
       setStreamingId(null);
     } finally {
       window.clearInterval(watchdog);
+      document.removeEventListener("visibilitychange", onVisible);
       if (stopRef.current === ac) stopRef.current = null;
       setLoading(false);
       setStage("");

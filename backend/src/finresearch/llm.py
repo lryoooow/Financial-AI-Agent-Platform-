@@ -163,6 +163,9 @@ def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
         streaming=False,
         base_url=base_url,
         api_key=api_key,
+        # v1.6.3（D3）：与 build_llm 同款加固（此前 chart 速读仍是 openai 默认 600s+2 重试）
+        timeout=120.0,
+        max_retries=1,
     )
 
 

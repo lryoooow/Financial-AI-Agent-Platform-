@@ -59,8 +59,11 @@ function backendExe() {
 // 产品名 1.2.2 起改为「景渊 JingYuan」，但用户数据目录仍沿用 FinResearch：
 // 这里存着 SQLite（对话、报告）、模型密钥与 port.txt。改名会让老用户的数据凭空消失，
 // 且必须与 backend/config.py 的 app_data_dir() 保持一致（两端靠 port.txt 握手）。
+// v1.6.3（D5）：APPDATA 环境变量优先（与后端 config.py 同算法——后端读
+// os.environ["APPDATA"]，旧实现硬拼 homedir，APPDATA 被重定向时两端目录分叉、握手必失败）。
 function appDataDir() {
-  return path.join(os.homedir(), 'AppData', 'Roaming', 'FinResearch');
+  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  return path.join(appData, 'FinResearch');
 }
 
 function backendLogFile() {
@@ -203,6 +206,13 @@ function createWindow(port) {
     win.show();
     closeSplash();
   });
+  // v1.6.3（D5）：加载失败兜底 —— 后端在 health 通过后、窗口加载前死掉时
+  // ready-to-show 永不触发，splash 会永久卡死。失败即关 splash + 弹错（restart 循环自会接手）。
+  win.webContents.once('did-fail-load', (_e, code, desc, url, isMain) => {
+    if (!isMain) return;
+    appendBackendLog(`[did-fail-load] code=${code} desc=${desc}`);
+    closeSplash();
+  });
   win.on('closed', () => { win = null; });
 
   // [D7] 加固：渲染内容来自本地后端，不允许开新窗口与外部跳转。
@@ -334,6 +344,9 @@ async function restartBackend() {
       try {
         appendBackendLog(`[restart] attempt=${backendRestartAttempts}`);
         const port = await launchBackend();
+        // v1.6.3（D5）：同步 backendPort —— 退出握手 POST 用它；旧实现不更新，
+        // 重启换端口后握手打到旧端口，优雅停机静默退化成硬杀。
+        backendPort = port;
         if (win && !win.isDestroyed()) {
           win.loadURL(`http://127.0.0.1:${port}/`);
         }

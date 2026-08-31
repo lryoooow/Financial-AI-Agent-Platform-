@@ -60,7 +60,12 @@ class _RotatingStdio:
                 os.replace(self._path, backup)
             self._stream = open(self._path, "a", encoding="utf-8", buffering=1, errors="replace")
         except Exception:  # noqa: BLE001
-            pass
+            # v1.6.3（D6）：轮转失败自恢复 —— close 与 replace 之间抛异常时流已关闭，
+            # 旧实现吞掉后所有后续日志静默丢失。重开流保证日志不断流。
+            try:
+                self._stream = open(self._path, "a", encoding="utf-8", buffering=1, errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
 
     def write(self, s) -> int:  # pragma: no cover - IO 薄包装
         try:
@@ -168,6 +173,9 @@ def _ensure_ascii_cacert() -> None:
         candidates = (
             os.path.join(app_data_dir(), "cacert-ascii.pem"),
             os.path.join(os.environ.get("TEMP", "."), "cacert-ascii.pem"),
+            # v1.6.3（D6）：第三候选 —— 用户名含 ANSI 外字符时 TEMP 与 AppData 路径
+            # 全部非 ASCII（正是本 bug 的触发人群），系统目录永远纯 ASCII。
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Temp", "cacert-ascii.pem"),
         )
         for cand in candidates:
             try:

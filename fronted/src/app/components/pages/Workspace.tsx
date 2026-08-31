@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Search, Sparkles, Check, Loader2, Circle, FileText, ShieldAlert, Link2, ArrowRight, Waypoints, Globe2 } from "lucide-react";
 import { WATCHLIST } from "../../data/market";
@@ -121,12 +121,14 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   // v1.6.0（审计 C2）：挂载时重连仍在运行的研究任务。
   // 后端研究流与 SSE 订阅者解耦（断连后任务继续跑 + history 回放），但前端此前
   // 没有任何重连接入 —— 切页/刷新后运行中的研究从 UI 消失且无法找回。
-  useEffect(() => {
-    let cancelled = false;
+  // v1.6.3（D1）：研究页常驻不卸载（hidden div），挂载 effect 只跑一次 ——
+  // 增加 visibilitychange→visible 时检查「phase=running 但流已断且自动重连耗尽」
+  // 的死局场景并恢复（睡眠唤醒/回环闪断后此前必须整页刷新）。
+  const reconnectLiveTask = useCallback((cancelled: () => boolean) => {
     api.researchTasks()
       .then((r) => {
-        if (cancelled) return;
-        // 核验修复：用户本轮已发起研究（含提交中）时不抢连接 —— hook.connect 会先关旧连接
+        if (cancelled()) return;
+        // 用户本轮已发起研究（含提交中）时不抢连接 —— hook.connect 会先关旧连接
         if (activeRunRef.current !== null || stream.isConnected()) return;
         const live = (r.tasks || []).find((t) => t.status === "running" || t.status === "pending");
         if (!live) return;
@@ -135,23 +137,46 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
         setPhase("running");
         setReconnectedCode(live.code);
         stream.connect(live.id, live.code, live.template || "equity_deep", (ev) => {
-          if (cancelled) return;
+          if (cancelled()) return;
           if (ev.type === "done" || ev.type === "error" || ev.type === "__disconnected__") {
             setReconnectedCode(null);
+            if (activeRunRef.current === id) activeRunRef.current = null;
           }
           handleResearchEvent(ev, {
             id,
             resolved: { code: live.code, name: live.code },
             runTemplate: (live.template as TemplateId) || "equity_deep",
-            // 核验修复：终态必须主动关连接（与 runBackend 一致）—— 服务端终帧后断流会触发
+            // 终态必须主动关连接（与 runBackend 一致）—— 服务端终帧后断流会触发
             // EventSource onerror→__disconnected__，把刚设置的完成态覆盖成「连接中断」错误
-            finish: () => { stream.close(); },
+            finish: () => {
+              if (activeRunRef.current === id) activeRunRef.current = null;
+              stream.close();
+            },
           });
         });
       })
       .catch(() => { /* 后端不可用时静默：新任务提交路径自会报错 */ });
+  }, [stream]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const isCancelled = () => cancelled;
+    reconnectLiveTask(isCancelled);
+    const onVisible = () => {
+      if (document.visibilityState !== "visible" || cancelled) return;
+      // 页面回到前台且没有活跃连接时尝试恢复（死局自愈入口）
+      if (!stream.isConnected() && activeRunRef.current === null) {
+        reconnectLiveTask(isCancelled);
+      } else if (!stream.isConnected()) {
+        // runBackend 中断连接（自动重连耗尽）：清占位再试
+        activeRunRef.current = null;
+        reconnectLiveTask(isCancelled);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -808,6 +808,12 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     if not text:
         raise HTTPException(400, "message is empty")
 
+    # v1.6.3（D7）：会话锁检查前移到用户消息持久化**之前** —— 旧实现 409 时提问已落库，
+    # 重发会出现重复提问行（无回复的悬挂行）。
+    chat_lock = _chat_lock(conversation_id)
+    if chat_lock.locked():
+        raise HTTPException(409, "该对话仍在生成上一条回复，请等它完成或先停止")
+
     # 1) 持久化用户消息（独立 session，提交后才进入流式，确保即使流式中断也保留提问）
     async with session_scope() as s:
         if s is None:
@@ -856,13 +862,7 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     # 只判"有没有配模型"，不在这里构造模型：真正要用的那个由 build_chat_agent 内部建，
     # 这里再建一个只为判空是白白多造一套 httpx 客户端。
     has_model = llm_available(llm_cfg)
-
-    # v1.6.0（审计 B9）：会话级并发守卫。前端单输入框通常不会并发，但双开窗口/刷新
-    # 竞态会让两个 POST 打进同一 thread_id：两个 agent 实例并发写同一检查点，
-    # 状态交错、轮次重复/丢失。已有流在跑直接 409。
-    chat_lock = _chat_lock(conversation_id)
-    if chat_lock.locked():
-        raise HTTPException(409, "该对话仍在生成上一条回复，请等它完成或先停止")
+    # 会话锁已在持久化前检查并获取（见上方 D7 注释），此处直接使用 chat_lock。
 
     async def gen():
         nonlocal summary_snapshot
@@ -1309,6 +1309,8 @@ async def research_stream(
             # v1.6.0（审计 E2）：draft 已取回即确定性释放 _STORE 槽位（配合 LRU，
             # 不再依赖上限挤出；运行中任务不会被后续任务挤出）
             research_clear_task(task_id)
+            # v1.6.3（D7）：_TASK_LLM 同步清理（明文 key 不在进程内滞留，旧实现仅删除路径弹出）
+            _TASK_LLM.pop(task_id, None)
 
             if not draft:
                 async with session_scope() as s:

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 import time
 from threading import Lock
@@ -165,7 +166,14 @@ def is_trading_day(now: Optional[dt.datetime] = None) -> bool:
     try:
         import chinese_calendar as cc
         return cc.is_workday(n.date())
-    except Exception:  # NotImplementedError(超年份)/ImportError(未安装) → 回退硬编码
+    except NotImplementedError:
+        # v1.6.3（D8）：超出包覆盖年份（当前数据止于 2026）——降级为「周末+静态已知表」，
+        # 2027 起的法定节假日会误判为交易日（仅影响 _ensure_fresh 新鲜度检查的方向，
+        # 不影响数据本身的展示）。日历覆盖后自动恢复（chinese_calendar 随国务院公告发版）。
+        logging.getLogger(__name__).debug(
+            "节假日日历不覆盖 %s，降级为周末+静态表（2027 起休市日可能被误判为交易日）", n.year)
+        return n.strftime("%Y-%m-%d") not in _HOLIDAYS
+    except Exception:  # ImportError(未安装) 等 → 同上回退
         return n.strftime("%Y-%m-%d") not in _HOLIDAYS
 
 
