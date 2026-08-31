@@ -484,6 +484,12 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     if payload.get("code") != 0:
         raise ValueError(f"Tencent K线响应异常：{payload.get('msg')}")
     rows = (((payload.get("data") or {}).get(sym) or {}).get(key) or [])[-int(n):]
+    # v1.6.3（B3）：北交所符号腾讯只回 'day' 键（不复权），即便请求了 qfq。
+    # 如实降级为不复权并显式标注——绝不把不复权数据冒充前复权（口径不撒谎）。
+    bj_unadjusted = False
+    if not rows and key == "qfqday" and raw.startswith(("43", "83", "87", "88", "92")):
+        rows = (((payload.get("data") or {}).get(sym) or {}).get("day") or [])[-int(n):]
+        bj_unadjusted = True
     if not rows:
         raise ValueError("Tencent 日K 空数据")
 
@@ -531,8 +537,11 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
             "source": "tencent",
             "endpoint": "web.ifzq.gtimg.cn/appstock/app/fqkline/get",
             "fetched_at": now_iso(),
-            "raw_value": {"symbol": sym, "n": n, "adjust": adjust},
+            "raw_value": {"symbol": sym, "n": n,
+                          "adjust": "none" if bj_unadjusted else adjust},
             "error": None,
+            **({"note": "北交所腾讯源仅提供不复权日K（已如实降级标注），技术指标基于不复权价计算"}
+               if bj_unadjusted else {}),
         },
     }
 

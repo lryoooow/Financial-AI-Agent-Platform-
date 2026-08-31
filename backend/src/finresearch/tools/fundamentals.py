@@ -199,6 +199,77 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
     return rows
 
 
+def _income_statement_annual(raw: str, years: list) -> dict:
+    """新浪利润表取营收绝对值与毛利率（v1.6.3 B2）。
+
+    财务指标接口无营收绝对值列（实测 86 列），营收/毛利率行恒「—」。本函数从
+    ak.stock_financial_report_sina(symbol="利润表") 按年取**年报**行（12-31），
+    返回 {year: {"revenue": 元, "gross_margin_pct": float}}；任何失败返回空 dict
+    （调用方保持现状如实「—」，绝不编造）。北交所（bj 前缀）该源同样可取。
+    """
+    cache_key = f"income_sina:{raw}"
+    cached = slow_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    import akshare as ak
+
+    from .market_provider import _sina_symbol
+
+    sym = _sina_symbol(raw)  # sh600519 / sz000001 / bj920000
+    try:
+        df = ak.stock_financial_report_sina(stock=sym, symbol="利润表")
+    except Exception as e:  # noqa: BLE001
+        logger.info("利润表换源失败（保持现状如实「—」）：%s", e)
+        slow_cache.set(cache_key, {}, ttl=600)
+        return {}
+    if df is None or df.empty:
+        slow_cache.set(cache_key, {}, ttl=600)
+        return {}
+
+    def _num(v):
+        try:
+            x = float(str(v).replace(",", ""))
+            return x if math.isfinite(x) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    date_col = next((c for c in df.columns if "日期" in str(c)), df.columns[0])
+
+    def _pref_col(candidates):
+        """按候选优先级选列（显式偏好序；旧实现按 DataFrame 列序撞大运，
+        抓到「营业总成本」（含税金及三费）冒充营业成本，毛利率语义全错——
+        茅台实测 68.7% vs 真实 ~91%）。"""
+        cols = {str(c).strip(): c for c in df.columns}
+        for name in candidates:
+            if name in cols:
+                return cols[name]
+        return None
+
+    # 营业收入口径：优先「营业收入」（与利润表毛利率口径一致）；「营业总收入」次之
+    rev_col = _pref_col(("营业收入", "营业总收入"))
+    # 营业成本口径：仅「营业成本」——绝不用「营业总成本」（前者是毛利率分子口径）
+    cost_col = _pref_col(("营业成本",))
+    out: dict = {}
+    if rev_col:
+        df = df.copy()
+        df["_d"] = df[date_col].astype(str)
+        df["_y"] = df["_d"].str[:4]
+        for y, g in df.groupby("_y", sort=True):
+            annual = g[g["_d"].str.slice(5, 7) == "12"]
+            rec = (annual if not annual.empty else g).iloc[-1]
+            rev = _num(rec.get(rev_col))
+            if rev is None or rev <= 0:
+                continue
+            entry: dict = {"revenue": rev}
+            if cost_col:
+                cost = _num(rec.get(cost_col))
+                if cost is not None and rev > 0:
+                    entry["gross_margin_pct"] = (rev - cost) / rev * 100.0
+            out[str(y)] = entry
+    slow_cache.set(cache_key, out, ttl=6 * 3600)
+    return out
+
+
 def get_financial_indicators(code: str) -> dict:
     """财务指标（前端 financials 形状：years + rows[name, values[]]）。
 
@@ -246,6 +317,27 @@ def get_financial_indicators(code: str) -> dict:
         gm_vals = [fmt_pct(pick(r, "销售毛利率(%)", "销售毛利率", "毛利率")) for r in rows]
         debt_vals = [fmt_pct(pick(r, "资产负债率(%)", "资产负债率")) for r in rows]
 
+        # v1.6.3（B2）：营收绝对值/毛利率换源补全 —— 财务指标接口无营收绝对值列、
+        # 毛利率列全量 NaN（均经实测），从新浪利润表按年（年报口径）补真值；
+        # 换源失败保持「—」。
+        income = {}
+        if any(v == "—" for v in revenue_vals) or any(v == "—" for v in gm_vals):
+            try:
+                income = _income_statement_annual(raw, years)
+            except Exception as e:  # noqa: BLE001
+                logger.info("营收/毛利率换源补全失败：%s", e)
+        income_filled = []
+        for i, y in enumerate(years):
+            entry = income.get(str(y)) or {}
+            if revenue_vals[i] == "—" and entry.get("revenue"):
+                v = entry["revenue"]
+                revenue_vals[i] = f"{v/1e8:.2f}亿" if abs(v) > 1e6 else f"{v:.2f}"
+                income_filled.append(f"营收{y}")
+            if gm_vals[i] == "—" and entry.get("gross_margin_pct") is not None:
+                gm_vals[i] = fmt_pct(entry["gross_margin_pct"])
+                if f"毛利率{y}" not in income_filled:
+                    income_filled.append(f"毛利率{y}")
+
         # 口径溯源：行名统一叫「净利润」，但值实际来自哪个上游列必须留痕（零幻觉原则：
         # 标签不撒谎，扣非就是扣非）。旧行名「扣非净利润」与全部消费方查询的「净利润」
         # 精确匹配不上，导致事实块/基本面段恒「未获取」而风险段却引用真值（同报告自相矛盾）。
@@ -266,9 +358,13 @@ def get_financial_indicators(code: str) -> dict:
             f"；{','.join(interim_years)} 年暂无年报、行为中期报告口径（同比勿直接与年报行比较）"
             if interim_years else ""
         )
+        income_note = (
+            f"；营收/毛利率部分年份由新浪利润表（年报口径）补全：{','.join(income_filled)}"
+            if income_filled else ""
+        )
         prov["note"] = (
             f"净利润列={_hit_col(net_keys) or '未获取'}；营收列={_hit_col(revenue_keys) or '未获取'}"
-            f"（净利润行含扣非口径候选，实际命中列以本注为准）{interim_note}"
+            f"（净利润行含扣非口径候选，实际命中列以本注为准）{interim_note}{income_note}"
         )
 
         return {

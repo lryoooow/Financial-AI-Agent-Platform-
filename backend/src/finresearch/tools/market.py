@@ -185,13 +185,33 @@ def get_realtime_quote(code: str) -> dict:
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
         return result
 
-    # 1) Sina 直连（最快）
+    # 1) Sina 直连（最快；但 hq 接口无 PE/PB/总市值/行业）
     try:
-        return finish(market_provider.sina_realtime(raw), "sina")
+        result = market_provider.sina_realtime(raw)
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "sina", "ok": False, "error": str(e)})
         _record("quote", "sina", False, str(e))
         logger.debug("sina 实时失败，尝试 Tencent：%s", e)
+    else:
+        # v1.6.3（B1）：字段补全 —— sina 成功但缺估值字段时向 Tencent 借，
+        # 不整源降级（旧实现 sina 必胜 → PE/PB/总市值/行业在行情事实块系统性缺失，
+        # 报告估值段恒「未获取」，而 Tencent 同刻有全量数据）。
+        missing = [f for f in ("pe", "pb", "marketCap", "industry") if not result.get(f) or result.get(f) in (0.0, "—")]
+        if missing:
+            try:
+                tx = market_provider.tencent_realtime(raw)
+                merged = [f for f in missing if tx.get(f) not in (None, 0.0, "", "—")]
+                for f in merged:
+                    result[f] = tx[f]
+                if merged:
+                    prov = result.get("provenance") or {}
+                    note = prov.get("note") or ""
+                    prov["note"] = (note + f"；{','.join(merged)} 由腾讯源补全").lstrip("；")
+                    result["provenance"] = prov
+                    _record("quote", "tencent-merge", True)
+            except Exception as e:  # noqa: BLE001
+                _record("quote", "tencent-merge", False, str(e))
+        return finish(result, "sina")
 
     # 2) Tencent 直连
     try:
@@ -207,6 +227,10 @@ def get_realtime_quote(code: str) -> dict:
         if not row:
             raise ValueError(f"akshare 未找到 {raw}")
         price = _f(row.get("最新价"))
+        if price <= 0:
+            # v1.6.3（B4）：全市场快照对停牌股「最新价」为 0/空 —— 直接判废走
+            # 结构化失败（旧实现会渲染 0.00 元的假价格，违背零幻觉）
+            raise ValueError(f"akshare 快照价格无效（{raw}，最新价={row.get('最新价')}，可能停牌）")
         prev_close = _f(row.get("昨收", price))
         result = {
             "code": to_market_ticker(raw),

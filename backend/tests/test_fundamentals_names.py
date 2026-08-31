@@ -37,6 +37,8 @@ def test_financial_rows_use_unified_net_profit_name(monkeypatch):
     import finresearch.tools.fundamentals as fundamentals
 
     monkeypatch.setattr(fundamentals, "_last_n_years_indicator", lambda raw, n=6: _ROWS)
+    # v1.6.3：隔离换源（网络）——本用例只验行名统一，营收补全行为另测
+    monkeypatch.setattr(fundamentals, "_income_statement_annual", lambda raw, years: {})
     result = fundamentals.get_financial_indicators("600519.SH")
     fins = result["financials"]
 
@@ -46,9 +48,36 @@ def test_financial_rows_use_unified_net_profit_name(monkeypatch):
     net_row = next(r for r in fins["rows"] if r["name"] == "净利润")
     assert net_row["values"][-1] == "744.50亿"
 
-    # 营收绝对值上游确实无列 → 如实「—」（零幻觉），但不得让整表崩
+    # 营收绝对值主源无列 + 换源也不可用 → 如实「—」（零幻觉），但不得让整表崩
     rev_row = next(r for r in fins["rows"] if r["name"] == "营业收入")
     assert rev_row["values"][-1] == "—"
+
+
+def test_income_statement_fills_revenue_and_gross_margin(monkeypatch):
+    """v1.6.3 B2：营收/毛利率由新浪利润表（年报口径）补全 + note 留痕。"""
+    import finresearch.tools.fundamentals as fundamentals
+
+    # 变体夹具：2024 行去掉毛利率列（模拟真实上游「销售毛利率」列全量 NaN 的实测形态）
+    rows_variant = []
+    for r in _ROWS:
+        r2 = dict(r)
+        if r2["_year"] == "2024":
+            r2.pop("销售毛利率(%)", None)
+        rows_variant.append(r2)
+
+    monkeypatch.setattr(fundamentals, "_last_n_years_indicator", lambda raw, n=6: rows_variant)
+    monkeypatch.setattr(fundamentals, "_income_statement_annual", lambda raw, years: {
+        "2024": {"revenue": 1241.0e8, "gross_margin_pct": 91.9},
+    })
+    result = fundamentals.get_financial_indicators("600519.SH")
+    fins = result["financials"]
+    rev = next(r for r in fins["rows"] if r["name"] == "营业收入")
+    gm = next(r for r in fins["rows"] if r["name"] == "毛利率")
+    i = fins["years"].index("2024")
+    assert rev["values"][i] == "1241.00亿", f"营收应由利润表补全，实际 {rev['values'][i]}"
+    assert gm["values"][i] == "91.9%", f"毛利率应补全，实际 {gm['values'][i]}"
+    note = (result.get("provenance") or {}).get("note") or ""
+    assert "新浪利润表" in note and "补全" in note, f"换源必须留痕：{note!r}"
 
     # 同比行有真值
     yoy_row = next(r for r in fins["rows"] if r["name"] == "净利润同比")
