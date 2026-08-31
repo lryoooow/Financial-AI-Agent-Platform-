@@ -94,10 +94,11 @@ app = FastAPI(
 
 # v1.6.0（审计 B1）：CORS 收紧。此前 allow_origin_regex 放行任意 localhost:* 源 ——
 # 本机任何端口上的网页都能跨域读走 /api/local-settings/model-configs 里的明文密钥。
-# 打包形态是后端同源伺服前端（无需 CORS）；仅为 vite dev（5173）保留两个显式来源。
+# v1.6.3（E）：打包生产不放行任何来源（同源伺服无需 CORS）；FIN_DEV=1 才开 vite dev 5173。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=(["http://localhost:5173", "http://127.0.0.1:5173"]
+                   if os.environ.get("FIN_DEV") else []),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

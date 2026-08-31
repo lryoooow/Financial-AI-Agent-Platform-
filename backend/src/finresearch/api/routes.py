@@ -86,6 +86,21 @@ class _ResearchRuntime:
 
 
 _RESEARCH_RUNS: dict[str, _ResearchRuntime] = {}
+# v1.6.3（E）：终态 runtime 延迟清理（最后一个订阅者离开 + 终态标记 → 延迟 60s 弹出，
+# 给回放窗口留缓冲；旧实现永不回收，每个完成任务最多持 3000 帧回放历史至进程退出）
+_RESEARCH_RUNS_CAP = 64
+
+
+def _maybe_evict_research_runs() -> None:
+    if len(_RESEARCH_RUNS) <= _RESEARCH_RUNS_CAP:
+        return
+    evictable = [
+        k for k, rt in _RESEARCH_RUNS.items()
+        if rt.terminal and not rt.subscribers
+    ]
+    for k in evictable[: len(_RESEARCH_RUNS) - _RESEARCH_RUNS_CAP]:
+        _RESEARCH_RUNS.pop(k, None)
+
 # v1.6.0（审计 B9）：同会话并发发送守卫。研究链路有 _start_research_runtime 去重，
 # 对话此前没有 —— 两个并发 POST 在同一 thread_id 上并发跑两个 agent 实例，检查点
 # 状态交错、轮次重复/丢失，_chat_next_seq 还会分到相同 seq。
@@ -182,9 +197,26 @@ def _start_research_runtime(
             runtime.terminal = True
             for queue in tuple(runtime.subscribers):
                 queue.put_nowait(None)
+            _maybe_evict_research_runs()  # 超上限时先回收无订阅者的终态条目
+            _schedule_run_eviction(task_id)  # 60s 后延迟回收（给回放窗口留缓冲）
 
     runtime.task = asyncio.create_task(pump(), name=f"research:{task_id}")
     return runtime
+
+
+def _schedule_run_eviction(task_id: str) -> None:
+    """终态 runtime 延迟 60s 弹出（订阅者可在窗口内重连回放；到期仍无订阅者则回收）。"""
+
+    async def _evict() -> None:
+        await asyncio.sleep(60)
+        rt = _RESEARCH_RUNS.get(task_id)
+        if rt is not None and rt.terminal and not rt.subscribers:
+            _RESEARCH_RUNS.pop(task_id, None)
+
+    try:
+        asyncio.get_running_loop().create_task(_evict(), name=f"evict:{task_id}")
+    except RuntimeError:  # 无运行 loop（单测直调）
+        pass
 
 
 async def _current_key_for_base(base_url: str) -> Optional[str]:

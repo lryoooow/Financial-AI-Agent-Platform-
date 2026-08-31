@@ -90,6 +90,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
 
   useEffect(() => {
     if (!selectedCode || phase === "running") return;
+    // v1.6.3（E）：done 后锁定报告头部 —— 已完成报告显示时不再被行情页新选标的覆盖
+    //（旧实现在 done 状态切换标的，右侧报告头部换成新标的但正文仍是旧报告，数据张冠李戴）
+    if (phase === "done" && doc) return;
     setQuery(selectedCode);
     setStock((s) => (
       s.code === selectedCode
@@ -236,7 +239,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     if (runId.current !== ctx.id) { ctx.finish(); return; }
     const { resolved, runTemplate, finish } = ctx;
     if (ev.type === "tool_call") {
-      // agent 真实工具调用：start 追加一条，ok/error 更新最后那条同名的状态。
+      // agent 真实工具调用：start 追加一条，ok/error 更新最后那条**仍处于 start 状态**的同名条目
+      //（v1.6.3 E：同名工具连续调用按调用序配对——旧实现倒序找首个同名，
+      // 会把已完成的旧条目再次翻转成 ok/error，新条目永久转圈）。
       setToolCalls((calls) => {
         if (ev.status === "start") {
           const placeholder = calls.length === 1 && calls[0].name === "_task" ? calls[0].events : [];
@@ -244,7 +249,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
           return [...base, { name: ev.name, label: ev.label || ev.name, status: "start", events: placeholder }];
         }
         for (let i = calls.length - 1; i >= 0; i--) {
-          if (calls[i].name === ev.name) {
+          if (calls[i].name === ev.name && calls[i].status === "start") {
             const next = [...calls];
             next[i] = { ...next[i], status: ev.status };
             return next;
@@ -567,7 +572,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
 
       {/* 右：报告 */}
       <div ref={reportRef} className="rounded-xl border border-border bg-card min-h-0 overflow-y-auto">
-        {!doc && phase !== "running" && (
+        {!doc && phase !== "running" && !typed && partialSections.length === 0 && (
           <div className="h-full grid place-items-center p-8 text-center">
             <div>
               <div className="mx-auto grid place-items-center size-14 rounded-2xl bg-secondary mb-4">

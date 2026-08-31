@@ -50,6 +50,13 @@ def _parse_date(value: str) -> Optional[dt.date]:
         return None
 
 
+def _now_cst() -> dt.datetime:
+    """当前北京时刻（v1.6.3 E：盘前/盘后与交易日判断此前用本地时区，非东八区机器
+    系统性误判——海外部署/旅行场景下，A股交易时段被当成盘前，旧快照被盖今日戳）。"""
+    from zoneinfo import ZoneInfo
+    return dt.datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+
+
 def _requires_today_intraday(now: Optional[dt.datetime] = None) -> bool:
     """交易日上午开盘后，分时不能继续展示上一交易日。
 
@@ -58,14 +65,14 @@ def _requires_today_intraday(now: Optional[dt.datetime] = None) -> bool:
     _ensure_fresh 会把所有源全部判为"陈旧"而拒绝 → 节假日行情全挂。
     """
     from .context import is_trading_day
-    n = now or dt.datetime.now()
+    n = now or _now_cst()
     return is_trading_day(n) and n.time() >= dt.time(9, 35)
 
 
 def _requires_today_kline(now: Optional[dt.datetime] = None) -> bool:
     """收盘后一段时间，日 K 不能继续停留在上一交易日（同样排除节假日）。"""
     from .context import is_trading_day
-    n = now or dt.datetime.now()
+    n = now or _now_cst()
     return is_trading_day(n) and n.time() >= dt.time(15, 10)
 
 

@@ -39,9 +39,10 @@ export function loadPickerOptions(): PickerOption[] {
     const rawModels: string[] = Array.isArray(s.models) && s.models.length
       ? s.models.map((m: any) => (typeof m === "string" ? m : m?.id || "")).filter(Boolean)
       : p.models.map((m) => m.id);
-    // 去重 + 保证 selectedModel 在列（旧数据 selectedModel 可能不在 models 里）
+    // 去重 + selectedModel 排首位（v1.6.3 E：无 active-model 时默认选中用户在 Settings
+    // 点选的 selectedModel，而非厂商列表的第一个——旧实现按字母序抓到任意微调模型）
     const ids: string[] = [];
-    for (const id of [...rawModels, s.selectedModel || ""].filter(Boolean)) {
+    for (const id of [s.selectedModel || "", ...rawModels].filter(Boolean)) {
       if (!ids.includes(id)) ids.push(id);
     }
     for (const model of ids) {

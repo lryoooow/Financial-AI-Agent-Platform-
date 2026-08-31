@@ -41,7 +41,8 @@ for pkg in [
     "aiosqlite",
     "docx",
     "reportlab",
-    "PIL",
+    # v1.6.3（E）：PIL 移出显式收集 —— 唯一消费者是 make_brand_assets.py（dev 工具，
+    # 运行期 App 永不导入），13MB 纯死体积。若 reportlab 内部需要会通过自身 hook 收集。
     # deepagents 对话链路（agents/deep/*）。中间件/后端有动态导入（graph.py 用 import_module
     # 解析 profile 与 model），静态分析追不全，按子模块收。
     "deepagents",

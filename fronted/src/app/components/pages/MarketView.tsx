@@ -189,9 +189,13 @@ export function MarketView({
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousSelect;
       window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointercancel", onUp);
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp, { once: true });
+    // v1.6.3（E）：手势被系统取消（触摸滚动接管/Alt+Tab）时同 pointerup 清理
+    //（旧实现 pointerup 一次性监听不会触发 → move 监听与 body 光标锁死泄漏）
+    window.addEventListener("pointercancel", onUp, { once: true });
   };
 
   useEffect(() => {
@@ -306,7 +310,8 @@ export function MarketView({
         if (!cancelled) setResults(r);
       } catch (e) {
         if ((e as DOMException)?.name === "AbortError") return;
-        if (!cancelled) setResults([]);
+        // v1.6.3（E）：服务错误与无结果区分（旧实现统一清空 → 用户误以为"查无此股"）
+        if (!cancelled) setResults("service-error" as unknown as never);
       } finally {
         if (!cancelled) setSearching(false);
       }
@@ -396,7 +401,8 @@ export function MarketView({
             <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{results ? `全市场结果 ${list.length} 条` : "常用标的"}</p>
           </div>
           <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
-            {list.length === 0 && results && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
+            {list.length === 0 && results === ("service-error" as unknown as never) && <div className="text-center text-[11px] text-destructive/80 py-8">搜索服务暂时不可用，请稍后重试</div>}
+            {list.length === 0 && Array.isArray(results) && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
             {list.map((s) => (
               <button key={s.code} onClick={() => onSelect(s.code)} className={`w-full flex items-center justify-between px-2 py-2 rounded-lg transition-colors ${s.code === display.code ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"}`}>
                 <div className="text-left leading-tight min-w-0">
