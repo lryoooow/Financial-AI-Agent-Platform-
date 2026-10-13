@@ -1,14 +1,14 @@
 <div align="center">
 
-<img src="assets/logo-256.png" width="112" alt="JingYuan logo">
+<img src="assets/logo-256.png" width="120" alt="JingYuan">
 
 # 景渊 JingYuan
 
-**A local-first A-share research copilot for serious individual investors.**
+**你的私人A股研究助手，运行在你自己的电脑上。**
 
-[![Release](https://img.shields.io/badge/release-v2.7.0-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64-0B1220)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
-[![License](https://img.shields.io/badge/license-Personal%20use%20only-8B5CF6)](LICENSE)
+它记得你聊过什么、学过什么、研究过什么。
+
+[![Download](https://img.shields.io/badge/下载-v2.7.0-blue?style=for-the-badge&logo=github)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -16,139 +16,91 @@
 
 ---
 
-## What it is
+## 它能做什么
 
-JingYuan runs entirely on your own machine. It pulls real A-share market data, financial statements and news, computes every number locally, and asks a large language model to *write about* those numbers — never to invent them.
+### 💬 问它任何A股问题
 
-It remembers what you asked before, learns which stocks you watch, and builds a personal knowledge base from your own research reports — all stored locally, never uploaded.
+> "茅台现在多少钱？" → 秒回，数据带时点
+>
+> "茅台和五粮液比一下" → 拉数据、列表对比
+>
+> "白酒行业估值高吗？" → 行业PE/PB/股息率
+>
+> "我之前跟你说过我看好什么？" → 检索你的历史对话来回答
 
-It is a research tool, not a trading tool. It has no broker integration and never will.
+它不会编造数字。每个数字来自真实行情接口，取不到就直说取不到。
 
-> **景渊** — *jǐng* (vista, prospect) + *yuān* (a deep pool). Look far, look deep.
+### 🧠 它记得你
 
-## Three rules the code enforces
+你告诉它"我看好白酒板块"，下次问"我之前说过什么"它能答上来。
 
-These are not slogans in a doc. Each one has an execution point and a test behind it.
+你生成的研究报告自动进入你的个人知识库。上传自己的研报、笔记（PDF / Word / Markdown / TXT），对话中它会检索引用。
 
-| Rule | What it means in practice |
-| --- | --- |
-| **Zero fabricated numbers** | Every figure in a report comes from a structured fact block computed by local tools. If a data source fails, the field renders as `—（未获取）` — never as `0.0`. |
-| **Traceable** | Each report states which data source served it, which paragraphs the model wrote, and which fell back to rule-based templates. Quoted headlines are reproduced verbatim. |
-| **Advisory only** | The model is forbidden from using directive verbs (buy / sell / add / reduce / stop-loss …). Output is checked and sanitized; violations trigger rewrites or template fallbacks. Every report carries a disclaimer. |
+所有记忆只存在你的电脑里，永不上传。
 
-## Features
+### 📊 看盘
 
-### Professional chat with memory
+打开就是五大指数实时行情。点击进入指数走势，或搜索任何A股看分时、K线、五档盘口、技术指标。
 
-Ask about a company by nickname ("茅台", "宁德时代") and the agent resolves the ticker and calls tools on demand — live quotes, financials, news, technical indicators, industry valuation — citing each with an explicit timestamp.
+### 📝 生成研究报告
 
-The agent **remembers your past conversations and reports**. Ask "我之前跟你说过我看好什么板块？" and it searches its local memory to answer. Uploaded documents (txt / md / pdf / docx) become part of your personal knowledge base, searchable by the agent during conversations.
+选一个标的和模板（个股深度 / 行业研究 / 财报点评 / 风险评估），智能体自动取数、逐字写出完整报告。
 
-### Market analysis with A-share overview
+报告从摘要到结尾连续流式输出——像看人在写一样，不会中间卡住等半天。
 
-The market page opens with a **live 5-index strip** (上证指数 / 深证成指 / 创业板指 / 科创50 / 沪深300). Click any index card to switch to its chart view. Search the full A-share universe, inspect 1-minute intraday, daily candles, volume, order book and MACD/RSI/KDJ/BOLL indicators.
+报告可导出 Word / PDF / Markdown。
 
-### Research tasks — continuous streaming
+### 📂 知识库
 
-An agent orchestrates a structured report, driving real tool calls you can watch live. The whole report — **from summary to conclusion** — is written in a **single LLM call and streams continuously**, character by character, with no pauses between sections.
+上传你自己的研究文档，成为智能体的知识来源。它能在对话中检索你上传的内容，结合实时行情回答问题。
 
-Templates cover *equity deep-dive*, *industry*, *earnings review* and *risk assessment*. Length follows the selected **thinking level** (low / medium / high / max).
+---
 
-### Reports auto-enter your knowledge base
+## 快速开始
 
-Every generated report is automatically chunked and embedded into the local vector database (rag.db). The model can retrieve past reports during conversations via two-level search: `search_memory` returns index cards with references, `read_memory` deep-reads the full original text.
+1. 下载安装包（上方按钮）
+2. 安装后打开，进入**模型配置**
+3. 选一家厂商（DeepSeek / 通义 / 智谱 / Kimi 等 15+ 家），粘贴你的 API Key
+4. 开始提问
 
-### Report library
+> 没有 API Key 也能用——行情、图表、知识库照常工作，只是模型写作的段落由规则模板代替。
 
-Reports persist in local SQLite and export to Word, PDF, TXT and Markdown. Reports can be permanently deleted — content, task, checkpoints **and vector chunks** are removed together.
+**Windows 10/11 x64** · 无需安装 Python 或 Node · [SmartScreen 拦截？点"仍要运行"](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 
-### Knowledge base (user documents)
+---
 
-Upload your own research documents (txt / md / pdf / docx, ≤20 MB). They are parsed, chunked, embedded and made searchable by the agent. Your documents never leave the machine.
+## 为什么本地运行
 
-### Model configuration — 15+ providers
+你的对话记录、上传的文档、生成的报告、API Key——全部只存在你自己的 `%APPDATA%\FinResearch\` 文件夹里。
 
-15 OpenAI-compatible providers preset (8 domestic, 7 international). Bring your own API key. Model lists pull live from `/v1/models`. Keys are **encrypted at rest** (machine-bound).
+没有云端数据库，没有账号系统，没有数据上报。唯一的外发请求是你自己配置的 LLM 厂商 API。
 
-### Optional semantic embeddings
+备份 = 复制文件夹。重置 = 删除文件夹。
 
-Five providers offer vector embedding models (通义千问 / 智谱 / 豆包 / OpenAI / Gemini). Configure one in Settings to upgrade memory retrieval from keyword matching to true semantic search. Without it, a local offline embedder works out of the box.
+---
 
-## Architecture
+## 三条铁律
 
-```
-┌──────────────────────── Your PC (Windows) ─────────────────────────┐
-│                                                                    │
-│  Electron shell — frameless window, in-app title bar               │
-│        │  loads http://127.0.0.1:<port>/                           │
-│        ▼                                                           │
-│  FastAPI backend (PyInstaller sidecar, serves the frontend)        │
-│    • Parent agent (orchestration) → scenario sub-agents            │
-│      (market-analysis, fundamentals-synthesis)                      │
-│    • deepagents / LangChain / LangGraph, SQLite checkpoints        │
-│    • Market sources: tencent → sina → eastmoney → akshare          │
-│    • SQLite: finresearch.db (conversations, reports, settings)     │
-│    • Vector store: rag.db (sqlite-vec, local RAG)                  │
-│    • Memory lifecycle: auto-archive at 90 days, vector cleanup      │
-│        │                                                           │
-│        │  HTTPS — the only outbound hop                            │
-│        ▼                                                           │  Cloud LLM API — your key, your chosen vendor                      │
-└────────────────────────────────────────────────────────────────────┘
-```
+| 铁律 | 意味着什么 |
+|------|-----------|
+| **数字零幻觉** | 报告里每个数字来自真实接口。取不到就显示"—（未获取）"，绝不编 0.0 |
+| **可溯源** | 每份报告标明数据来自哪个源、哪段是模型写的、哪段是模板兜底 |
+| **仅供参考** | 不出现"买入/卖出/加仓"等指令词，每份报告带免责声明 |
 
-Your questions, documents and reports never leave the machine. Market data comes from public endpoints. The only request that carries your API key goes to the LLM vendor you chose.
+---
 
-## Install
+## 技术栈（给开发者）
 
-Download from the [**latest release**](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest):
+Electron + FastAPI + LangChain/LangGraph + deepagents + SQLite + sqlite-vec
 
-| File | Use |
-| --- | --- |
-| `JingYuan-Setup-2.7.0.exe` | Installer. Creates Start-menu and desktop shortcuts. |
-| `JingYuan-Portable-2.7.0.exe` | Portable. Runs without installing. |
-
-Windows 10/11, x64. No Python or Node runtime required.
-
-The binaries are unsigned, so SmartScreen will warn on first launch. Choose **More info → Run anyway**.
-
-## First run
-
-1. Launch JingYuan. The backend starts automatically.
-2. Go to **模型配置** (Providers), pick a vendor, paste your API key, select a model.
-3. Click **设为当前推理模型**.
-4. Ask a question in Chat, or generate a research report.
-
-Without a key, market data, charts, knowledge base and diagnostics still work — only model-written prose falls back to rule-based templates.
-
-## Where your data lives
-
-Everything sits in `%APPDATA%\FinResearch\`:
-
-| File / folder | What it holds |
-| --- | --- |
-| `finresearch.db` | Conversations, reports, tasks, settings, encrypted API keys, user profile |
-| `rag.db` | Vector database (sqlite-vec): memory chunks, report chunks, knowledge-base chunks |
-| `kb/` | Original copies of your uploaded documents |
-| `archive/conversations/` | Compressed transcripts of auto-archived conversations (>90 days) |
-| `context/` | Conversation media (images) |
-| `assets/images/` | Image assets (server-side downsampled) |
-
-**Data lifecycle**: conversations idle for 90 days are auto-summarized (LLM-generated ≤300-char summary), the original text is compressed to `archive/`, and row-level messages are deleted. Report and knowledge-base chunks are kept permanently. Chat vector chunks are cleaned at 180 days. Deleting a report removes its DB row, task, checkpoints **and** vector chunks.
-
-To reset completely, close the app and delete that folder. To back up, copy it.
-
-API keys are stored **encrypted** (machine-bound XOR cipher). They are transmitted only to the LLM vendor you selected.
-
-## Disclaimer
-
-JingYuan is a research aid. It does not provide investment advice, does not connect to any broker, and cannot place orders. Model output may be wrong or incomplete. Market data comes from free public sources and may be delayed, revised, or unavailable. **Every investment decision, and every consequence of it, is yours.** Markets carry risk.
-
-## License
-
-Free for **personal, non-commercial use**. Commercial use, redistribution and reverse engineering are prohibited. See [LICENSE](LICENSE).
+详见 [CHANGELOG](CHANGELOG.md) · [数据结构](backend/DATA_LAYOUT.md)
 
 ---
 
 <div align="center">
-<sub>景渊 JingYuan · Built for research, not for trading.</sub>
+
+**景渊** —— 景，远望；渊，深潭。看得远，也看得深。
+
+*研究工具，不构成投资建议。市场有风险，投资需谨慎。*
+
 </div>
