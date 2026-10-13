@@ -2,13 +2,9 @@
 
 <img src="assets/logo-256.png" width="120" alt="JingYuan">
 
-# 景渊 JingYuan
+# JingYuan
 
-**你的私人A股研究助手，运行在你自己的电脑上。**
-
-它记得你聊过什么、学过什么、研究过什么。
-
-[![Download](https://img.shields.io/badge/下载-v2.7.0-blue?style=for-the-badge&logo=github)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+[![Download](https://img.shields.io/badge/Download-v2.7.0-blue?style=for-the-badge&logo=github)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -16,91 +12,82 @@
 
 ---
 
-## 它能做什么
+**JingYuan is a privacy-first AI research assistant for A-share investors.** It runs entirely on your own computer, pulls real market data, writes research reports with zero fabricated numbers, and remembers your conversations — all without uploading a single byte to anyone else's server.
 
-### 💬 问它任何A股问题
+It is a research tool, not a trading tool. No broker integration, no order placement, ever.
 
-> "茅台现在多少钱？" → 秒回，数据带时点
+---
+
+## What you can do
+
+### 💬 Ask anything
+
+> "What's Moutai trading at?" → Instant answer, timestamped
 >
-> "茅台和五粮液比一下" → 拉数据、列表对比
+> "Compare Moutai vs Wuliangye" → Real data, side by side
 >
-> "白酒行业估值高吗？" → 行业PE/PB/股息率
+> "Is baijiu overvalued?" → Industry PE / PB / dividend yield
 >
-> "我之前跟你说过我看好什么？" → 检索你的历史对话来回答
+> "What was I bullish on?" → It searches your past conversations
 
-它不会编造数字。每个数字来自真实行情接口，取不到就直说取不到。
+### 🧠 It remembers
 
-### 🧠 它记得你
+Tell it once — it remembers. Your research reports, uploaded documents, and conversation history become a personal knowledge base it draws from in future chats.
 
-你告诉它"我看好白酒板块"，下次问"我之前说过什么"它能答上来。
+### 📊 Watch the market
 
-你生成的研究报告自动进入你的个人知识库。上传自己的研报、笔记（PDF / Word / Markdown / TXT），对话中它会检索引用。
+Five major indices live on the homepage. Click into any stock for intraday, candles, order book, and indicators.
 
-所有记忆只存在你的电脑里，永不上传。
+### 📝 Generate research reports
 
-### 📊 看盘
+Pick a stock, pick a template. The agent pulls data, writes a full report streaming live from first word to last. Export to Word / PDF / Markdown.
 
-打开就是五大指数实时行情。点击进入指数走势，或搜索任何A股看分时、K线、五档盘口、技术指标。
+### 📂 Build your knowledge base
 
-### 📝 生成研究报告
-
-选一个标的和模板（个股深度 / 行业研究 / 财报点评 / 风险评估），智能体自动取数、逐字写出完整报告。
-
-报告从摘要到结尾连续流式输出——像看人在写一样，不会中间卡住等半天。
-
-报告可导出 Word / PDF / Markdown。
-
-### 📂 知识库
-
-上传你自己的研究文档，成为智能体的知识来源。它能在对话中检索你上传的内容，结合实时行情回答问题。
+Upload your own research (PDF / Word / Markdown / TXT). The agent searches it alongside live data.
 
 ---
 
-## 快速开始
+## Quick start
 
-1. 下载安装包（上方按钮）
-2. 安装后打开，进入**模型配置**
-3. 选一家厂商（DeepSeek / 通义 / 智谱 / Kimi 等 15+ 家），粘贴你的 API Key
-4. 开始提问
+1. Download and install
+2. Go to **Model Configuration** → pick a provider → paste your API key
+3. Start asking
 
-> 没有 API Key 也能用——行情、图表、知识库照常工作，只是模型写作的段落由规则模板代替。
-
-**Windows 10/11 x64** · 无需安装 Python 或 Node · [SmartScreen 拦截？点"仍要运行"](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+**Windows 10/11 x64** · No Python/Node needed · SmartScreen → "Run anyway"
 
 ---
 
-## 为什么本地运行
+## Why local matters
 
-你的对话记录、上传的文档、生成的报告、API Key——全部只存在你自己的 `%APPDATA%\FinResearch\` 文件夹里。
+Your data — conversations, documents, reports, API keys — never leaves `%APPDATA%\FinResearch\`.
 
-没有云端数据库，没有账号系统，没有数据上报。唯一的外发请求是你自己配置的 LLM 厂商 API。
-
-备份 = 复制文件夹。重置 = 删除文件夹。
+No cloud. No accounts. No tracking. The only outbound request goes to your chosen LLM provider.
 
 ---
 
-## 三条铁律
+## Three rules, enforced in code
 
-| 铁律 | 意味着什么 |
-|------|-----------|
-| **数字零幻觉** | 报告里每个数字来自真实接口。取不到就显示"—（未获取）"，绝不编 0.0 |
-| **可溯源** | 每份报告标明数据来自哪个源、哪段是模型写的、哪段是模板兜底 |
-| **仅供参考** | 不出现"买入/卖出/加仓"等指令词，每份报告带免责声明 |
+| Rule | Meaning |
+|------|---------|
+| **Zero fabricated numbers** | Real APIs only. Missing data = "—", never 0.0 |
+| **Traceable** | Sources cited. AI vs template paragraphs labeled |
+| **Advisory only** | No buy/sell directives. Disclaimers enforced |
 
 ---
 
-## 技术栈（给开发者）
+## Tech stack
 
-Electron + FastAPI + LangChain/LangGraph + deepagents + SQLite + sqlite-vec
+Electron · FastAPI · LangChain / LangGraph · deepagents · SQLite · sqlite-vec
 
-详见 [CHANGELOG](CHANGELOG.md) · [数据结构](backend/DATA_LAYOUT.md)
+[CHANGELOG](CHANGELOG.md) · [Data layout](backend/DATA_LAYOUT.md)
 
 ---
 
 <div align="center">
 
-**景渊** —— 景，远望；渊，深潭。看得远，也看得深。
+*JingYuan — look far, look deep.*
 
-*研究工具，不构成投资建议。市场有风险，投资需谨慎。*
+*A research tool, not investment advice.*
 
 </div>
