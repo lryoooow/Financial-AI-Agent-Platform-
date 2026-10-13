@@ -38,7 +38,8 @@ _record = market_provider.record
 
 
 def _today() -> str:
-    return dt.datetime.now().date().isoformat()
+    # 交易日以北京时间为准（与 _requires_today_* 同口径；非东八区机器上本地日期会错一天）
+    return _now_cst().date().isoformat()
 
 
 def _parse_date(value: str) -> Optional[dt.date]:
@@ -86,7 +87,7 @@ def _ensure_fresh(result: dict, *, kind: str) -> None:
     got = _parse_date(trading_date)
     if not got:
         return
-    today = dt.datetime.now().date()
+    today = _now_cst().date()
     if kind == "intraday" and _requires_today_intraday() and got < today:
         raise ValueError(f"分时数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
     if kind == "kline" and _requires_today_kline() and got < today:
@@ -193,13 +194,11 @@ def get_realtime_quote(code: str) -> dict:
         return result
 
     # 1) Sina 直连（最快；但 hq 接口无 PE/PB/总市值/行业）
+    # v1.7.1（审计 A03）：取数、补数与新鲜度校验（finish 内 _ensure_fresh）放进同一个
+    # try —— 旧实现在 try/else 的 else 里调 finish，过期校验抛出的异常没人接，
+    # 新浪返回上一交易日报价时整个 /api/quote 直接 500，腾讯备用源一次都不会被尝试。
     try:
         result = market_provider.sina_realtime(raw)
-    except Exception as e:  # noqa: BLE001
-        attempts.append({"source": "sina", "ok": False, "error": str(e)})
-        _record("quote", "sina", False, str(e))
-        logger.debug("sina 实时失败，尝试 Tencent：%s", e)
-    else:
         # v1.6.3（B1）：字段补全 —— sina 成功但缺估值字段时向 Tencent 借，
         # 不整源降级（旧实现 sina 必胜 → PE/PB/总市值/行业在行情事实块系统性缺失，
         # 报告估值段恒「未获取」，而 Tencent 同刻有全量数据）。
@@ -219,6 +218,10 @@ def get_realtime_quote(code: str) -> dict:
             except Exception as e:  # noqa: BLE001
                 _record("quote", "tencent-merge", False, str(e))
         return finish(result, "sina")
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "sina", "ok": False, "error": str(e)})
+        _record("quote", "sina", False, str(e))
+        logger.debug("sina 实时失败或数据过期，尝试 Tencent：%s", e)
 
     # 2) Tencent 直连
     try:
@@ -263,7 +266,7 @@ def get_realtime_quote(code: str) -> dict:
         }
         # v1.6.0（审计 E2）：akshare 全市场快照无逐行数据时点，盘前/盘后取到的是上一交易
         # 日的旧快照却被盖上今日戳（_ensure_fresh 因此失去判旧能力）。如实标注，不伪造时点。
-        _now_hm = dt.datetime.now().strftime("%H:%M")
+        _now_hm = _now_cst().strftime("%H:%M")
         if not ("09:15" <= _now_hm <= "15:05"):
             result["provenance"]["note"] = "盘前/盘后获取的全市场快照，实际数据时点可能为上一交易日"
         return finish(result, "akshare")
@@ -384,9 +387,9 @@ def get_intraday(code: str) -> dict:
             latest_trade_date = df.index.max().date()
             df = df[df.index.date == latest_trade_date]
             trading_date = str(latest_trade_date)
-            today = dt.datetime.now().date()
+            today = _now_cst().date()
             if latest_trade_date == today:
-                now = dt.datetime.now()
+                now = _now_cst()
                 df = df[df.index <= now]
         bucket = df.resample("5min", label="left", closed="left")
         agg = bucket.agg(close=("close", "last"), volume=("volume", "sum")).dropna()

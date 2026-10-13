@@ -22,13 +22,14 @@ v1.7.0 起各段经 _llm_section 真流式**并行撰写**（并发闸 _LLM_GATE
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...config import settings
-from ...llm import build_llm, is_reasoning_model, reasoning_effort_of
+from ...llm import ThinkTagSplitter, build_llm, is_reasoning_model, reasoning_effort_of, strip_think
 from ...tools import facts, report as report_tool
 from ...tools.context import build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
@@ -103,15 +104,30 @@ def _extract_token(chunk) -> str:
 # ────────────────────────────────────────────────────────────
 # 合规自检：只检测，不盲替换（替代旧 _sanitize）
 # ────────────────────────────────────────────────────────────
-def _stream_push(msg) -> None:
-    """推送进度到 SSE 流（节点内 langgraph get_stream_writer 写 custom 事件；非流式上下文 noop）。
+# v1.7.1：研究确定性编排（agents/deep/research_runner.py）不经 LangGraph 运行工具，
+# 没有 get_stream_writer 可用 —— 由调用方在 contextvar 里挂一个事件槽（asyncio 任务与
+# gather 子任务会复制当前 context，并行分段同样可达）。未挂槽时走 LangGraph custom 流。
+PUSH_SINK: contextvars.ContextVar[Optional[Callable[[dict], None]]] = contextvars.ContextVar(
+    "report_push_sink", default=None
+)
 
-    routes.py 的 astream 用 stream_mode=["updates","custom"] 消费，转为 SSE tool 事件发给前端。
+
+def _stream_push(msg) -> None:
+    """推送进度到 SSE 流（优先 PUSH_SINK；否则 langgraph get_stream_writer 写 custom 事件；
+    两者都没有时 noop）。
+
     解决根因：report 节点 4 段 LLM 并行撰写（30-120s）期间前端零事件只能转圈。
     """
+    payload = msg if isinstance(msg, dict) else {"type": "report_progress", "text": str(msg)}
+    sink = PUSH_SINK.get()
+    if sink is not None:
+        try:
+            sink(payload)
+        except Exception:  # noqa: BLE001  推送失败不能拖垮撰写
+            pass
+        return
     try:
         from langgraph.config import get_stream_writer
-        payload = msg if isinstance(msg, dict) else {"type": "report_progress", "text": str(msg)}
         get_stream_writer()(payload)
     except Exception:
         pass
@@ -347,10 +363,11 @@ def _section_fundamentals(fv: dict) -> str:
     # v1.6.0：同比优先读上游增速行真值（"营收同比"/"净利润同比"），缺失再从绝对值序列推
     def _yoy_or_series(series: list, row_names: list) -> Optional[float]:
         direct = facts.to_float(facts.val_str(facts.row_vals(fins, row_names)))
-        return direct if direct is not None else facts.yoy_pct(series)
+        # 审计 A01：绝对值序列推算同比必须口径感知（中期列 vs 上年年报不可比 → None）
+        return direct if direct is not None else facts.yoy_pct_latest(fins, series)
 
-    rev_yoy = _yoy_or_series(rev, ["营收同比", "营业收入同比"])
-    net_yoy = _yoy_or_series(net, ["净利润同比", "归母净利润同比"])
+    rev_yoy = _yoy_or_series("营业收入", ["营收同比", "营业收入同比"])
+    net_yoy = _yoy_or_series(["净利润", "扣非净利润"], ["净利润同比", "归母净利润同比"])
     rev_l, net_l = facts.val_str(rev), facts.val_str(net)
     if rev_yoy is not None or net_yoy is not None:
         line = (
@@ -369,16 +386,17 @@ def _section_fundamentals(fv: dict) -> str:
     else:
         blocks.append("【成长性】营收/净利润同比数据不足，无法量化增速趋势。")
 
-    roe_l = facts.val_str(roe)
+    roe_l = facts.latest_labeled(fins, "ROE")
     gm_l = facts.val_str(gm)
-    roe_pp = facts.delta_pp(roe)
-    gm_pp = facts.delta_pp(gm)
+    roe_pp = facts.delta_pp_latest(fins, "ROE")
+    gm_pp = facts.delta_pp_latest(fins, "毛利率")
     quality = (
         f"【盈利质量】ROE 最新 {roe_l}"
         f"（{_sign_pp(roe_pp) or '同比变动数据不足'}），"
         f"毛利率 {gm_l}（{_sign_pp(gm_pp) or '同比变动数据不足'}）。"
     )
-    roe_f = facts.to_float(roe_l)
+    # 审计 A01：中期口径的 ROE 只覆盖部分年度，不能套全年水平阈值评判高低
+    roe_f = None if facts.latest_is_interim(fins) else facts.to_float(roe_l)
     if roe_f is not None:
         if roe_f >= 15:
             quality += "ROE 处于较高水平，盈利能力较强；"
@@ -386,11 +404,11 @@ def _section_fundamentals(fv: dict) -> str:
             quality += "ROE 处于行业中枢附近，盈利能力稳健；"
         else:
             quality += "ROE 偏低，盈利能力有待改善；"
-    quality += "毛利率近五年" + _trend(gm) + "，反映产品定价权与成本端的边际变化。"
+    quality += "毛利率近五年" + _trend(facts.annual_series(fins, gm)) + "，反映产品定价权与成本端的边际变化。"
     blocks.append(quality)
 
     debt_l = facts.val_str(debt)
-    debt_pp = facts.delta_pp(debt)
+    debt_pp = facts.delta_pp_latest(fins, "资产负债率")
     debt_f = facts.to_float(debt_l)
     lev = f"【资本结构】资产负债率 {debt_l}（{_sign_pp(debt_pp) or '同比变动数据不足'}），"
     if debt_f is not None:
@@ -425,7 +443,7 @@ def _section_valuation(fv: dict) -> str:
         f"【相对估值】当前股价对应动态 PE {m['pe']}、PB {m['pb']}"
         f"（数据时点：{as_of or '行情快照不可用'}）。"
     )
-    roe_l = facts.val_str(facts.row_vals(fins, "ROE"))
+    roe_l = facts.latest_labeled(fins, "ROE")
     body += f"公司 ROE 最新 {roe_l}，可作为 PB 估值的盈利支撑参考。"
     body += (
         "【数据局限】受限于当前可得的行业可比公司样本与历史分位数数据，"
@@ -586,7 +604,7 @@ def _facts_fundamentals(fv: dict) -> str:
 
 
 def _facts_valuation(fv: dict) -> str:
-    roe = facts.val_str(facts.row_vals(fv.get("fins", {}), "ROE"))
+    roe = facts.latest_labeled(fv.get("fins", {}), "ROE")
     return facts.compose_facts(
         facts.render_quote_facts(fv.get("quote", {})),
         f"【盈利支撑】公司 ROE 最新 {roe}。",
@@ -797,33 +815,69 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
 
     # 真流式（方案A）：逐 token 从模型流出，每个安全 token 立即经 section_token 推给前端，
     # 同时累积成整段正文。相较旧的一次性 _invoke，前端能一字字看到板块生成过程。
+    # v1.7.1：思维链（delta.reasoning_content 或正文开头内联的 <think>）不再静默吞掉 ——
+    # 节流后以 section_thinking 快照推给前端（替换语义、只带尾部预览），思考型模型
+    # 几十秒的 CoT 期间该段显示「思考中」而不是一动不动；<think> 内容绝不计入正文。
     cap = min(spec.max_chars, max(120, int(getattr(settings, "report_section_max_chars", 420))))
     parts: list[str] = []
     acc = ""
     forbidden = False
+    splitter = ThinkTagSplitter()
+    thinking = ""
+    last_think_push = 0.0
+
+    def _push_thinking(force: bool = False) -> None:
+        nonlocal last_think_push
+        now = time.perf_counter()
+        if thinking and (force or now - last_think_push >= 0.5):
+            last_think_push = now
+            _stream_push({
+                "type": "section_thinking", "title": spec.title,
+                "text": thinking[-120:], "chars": len(thinking),
+            })
+
+    def _accept(tok: str) -> bool:
+        """并入一段正文增量；返回 False 表示应停止流式（禁用词 / 到达字符上限）。"""
+        nonlocal acc, forbidden
+        if not tok:
+            return True
+        if not acc and not tok.strip():
+            return True  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
+        # 实时禁用词闸：并入这段 token 会命中禁用词，就不外发它、停止流式，
+        # 转下方回退模板（最终 report_section 事件会以模板 body 覆盖已流出的片段）。
+        if check_generated(acc + tok):
+            forbidden = True
+            return False
+        acc += tok
+        parts.append(tok)
+        _stream_push({"type": "section_token", "title": spec.title, "text": tok})
+        return len(acc) < cap  # 到确定性字符上限即停，省 token
+
     try:
         # v1.7.0：闸在 timeout 外——并行下排队等闸的时间不得消耗该段撰写预算
         #（旧"timeout 包 gate"嵌套在串行下无感，并行时后两段会在"未轮到调 LLM"
         # 时就超时回退模板；已由 test_report_parallel 的"排队不耗预算"用例锁定）。
         # v1.6.5：思考型模型按倍率放宽（见 _REASONING_TIMEOUT_FACTOR 注释）。
         async with _LLM_GATE:
+            # v1.7.1：真正轮到调模型才发 section_start（此前四段一次性全亮「撰写中」，
+            # 排队的两段其实在等闸，用户看到的是两段长时间不动 —— 分段等待感的来源之一）
+            _stream_push({"type": "section_start", "title": spec.title})
             async with asyncio.timeout(section_timeout):
                 async for chunk in llm.astream(lc):
-                    tok = _extract_token(chunk)
-                    if not tok:
-                        continue
-                    if not acc and not tok.strip():
-                        continue  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
-                    # 实时禁用词闸：并入这段 token 会命中禁用词，就不外发它、停止流式，
-                    # 转下方回退模板（最终 report_section 事件会以模板 body 覆盖已流出的片段）。
-                    if check_generated(acc + tok):
-                        forbidden = True
+                    rc = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
+                    if isinstance(rc, str) and rc:
+                        thinking += rc
+                        _push_thinking()
+                    content, inline_rc = splitter.feed(_extract_token(chunk))
+                    if inline_rc:
+                        thinking += inline_rc
+                        _push_thinking()
+                    if not _accept(content):
                         break
-                    acc += tok
-                    parts.append(tok)
-                    _stream_push({"type": "section_token", "title": spec.title, "text": tok})
-                    if len(acc) >= cap:
-                        break  # 到确定性字符上限即停，省 token
+                else:
+                    tail, inline_rc = splitter.flush()
+                    thinking += inline_rc
+                    _accept(tail)
         if forbidden:
             finalize_diag(diag, _elapsed(), error="forbidden_verbs")
             return spec.fallback(fv) + "（模型输出含禁用表述，已使用事实模板。）", "template"
@@ -885,7 +939,7 @@ def _quote_measures(quote: dict) -> dict:
 def _latest_pct(fins: dict, direct_name: str, base_name: str) -> Optional[float]:
     """优先使用数据源直接提供的同比，旧数据再由绝对值序列计算。"""
     direct = facts.to_float(facts.val_str(facts.row_vals(fins, direct_name)))
-    return direct if direct is not None else facts.yoy_pct(facts.row_vals(fins, base_name))
+    return direct if direct is not None else facts.yoy_pct_latest(fins, base_name)
 
 
 def _compose_summary_block(state: ResearchState, fv: dict) -> str:
@@ -897,7 +951,7 @@ def _compose_summary_block(state: ResearchState, fv: dict) -> str:
     industry = quote.get("industry") or profile.get("industry", "")
     template = (state.get("template") or "equity_deep").strip()
     m = _quote_measures(quote)
-    roe_l = facts.val_str(facts.row_vals(fins, "ROE"))
+    roe_l = facts.latest_labeled(fins, "ROE")
     gross_l = facts.val_str(facts.row_vals(fins, "毛利率"))
     debt_l = facts.val_str(facts.row_vals(fins, "资产负债率"))
     im = _indicator_map(fv.get("indicators", []))
@@ -973,11 +1027,11 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
         "industry": quote.get("industry") or profile.get("industry", ""),
         **m,
         "as_of": quote.get("as_of") or state.get("data_as_of", "") or facts.MISSING,
-        "roe": facts.val_str(facts.row_vals(fins, "ROE")),
+        "roe": facts.latest_labeled(fins, "ROE"),
         "revenue": facts.val_str(rev),
-        "rev_yoy": facts.val_str(rev_yoy_row) if rev_yoy_row else facts.pct(facts.yoy_pct(rev), 1),
+        "rev_yoy": facts.val_str(rev_yoy_row) if rev_yoy_row else facts.pct(facts.yoy_pct_latest(fins, "营业收入"), 1),
         "net_profit": facts.val_str(net),
-        "net_yoy": facts.val_str(net_yoy_row) if net_yoy_row else facts.pct(facts.yoy_pct(net), 1),
+        "net_yoy": facts.val_str(net_yoy_row) if net_yoy_row else facts.pct(facts.yoy_pct_latest(fins, ["净利润", "扣非净利润"]), 1),
         "gross_margin": facts.val_str(facts.row_vals(fins, "毛利率")),
         "debt_ratio": facts.val_str(facts.row_vals(fins, "资产负债率")),
         "tech_direction": direction,
@@ -1004,10 +1058,10 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
 
     try:
         # v1.6.5：摘要与分段同分档 —— 思考型模型摘要 20-30s 必超时回退模板
-        text = await _invoke(
+        text = strip_think(await _invoke(
             llm, lc,
             timeout=_SECTION_TIMEOUT * (_REASONING_TIMEOUT_FACTOR if _thinks(state) else 1.0),
-        )
+        ))
         # 空返回兜底（同 _llm_section 的理由）：摘要空返回会让报告顶部的投资摘要一片空白。
         if not (text or "").strip():
             logger.warning("LLM 摘要返回空内容，回退模板")
@@ -1132,8 +1186,10 @@ async def report_node(state: ResearchState) -> dict:
     # 成片 429，现以并发 2 + 闸（gate 在 timeout 外，排队不耗单段预算）折中。
     gate_n = max(1, int(getattr(settings, "report_llm_concurrency", 2)))
     _stream_push(f"开始撰写 {len(specs)} 段分析（{min(len(specs), gate_n)} 段并行）…")
+    # v1.7.1：先统一发 section_queued（前端点亮全部段落为「排队中」），各段真正拿到
+    # 并发闸时由 _llm_section 发 section_start（「撰写中/思考中」）—— 排队与撰写如实区分。
     for spec in specs:
-        _stream_push({"type": "section_start", "title": spec.title})
+        _stream_push({"type": "section_queued", "title": spec.title})
 
     async def _write_one(spec):
         try:

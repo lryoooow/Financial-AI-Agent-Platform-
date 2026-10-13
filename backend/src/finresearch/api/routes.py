@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
 from ..agents.deep.research_agent import build_research_agent
+from ..agents.deep.research_runner import is_direct_target, run_research_direct
 from ..agents.deep.research_tools import clear_task as research_clear_task, get_stored as research_get_stored
 from ..agents.deep.stream import stream_agent_sse
 from ..agents.graph import get_checkpointer
@@ -49,7 +50,9 @@ from ..llm import (
     build_chart_llm,
     build_llm,
     llm_available,
+    reasoning_effort_of,
     resolved_chart_model,
+    strip_think,
 )
 from ..tools.entity import resolve_entity
 from ..tools.market import (
@@ -82,13 +85,73 @@ _TASK_LLM_CAP = 500
 
 @dataclass
 class _ResearchRuntime:
-    """研究计算与任意一个 SSE 客户端解耦的进程内事件总线。"""
+    """研究计算与任意一个 SSE 客户端解耦的进程内事件总线。
+
+    history 是给**新连接**回放用的压缩历史（v1.7.1，审计 A06）：
+    - section_token 按段合并成一帧（文本累加，位置保持在该段首个 token 处）；
+    - section_thinking 是快照，每段只留最新一帧。
+    于是回放帧数 ≈ 进度事件数，不再随 token 数线性增长 —— 旧实现逐 token 存 3000 帧，
+    长报告会把摘要/段落开头挤出回放窗口；且每个新连接都从头回放，前端在已有内容上
+    再追加一遍，正文与工具轨迹成倍重复。现在每个连接以 replay 帧开头，前端据此清空
+    本轮展示状态后按压缩历史重建（幂等），实时订阅者仍逐 token 收帧。
+    """
 
     task_id: str
     history: list[str] = field(default_factory=list)
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     task: Optional[asyncio.Task] = None
     terminal: bool = False
+    _merge_idx: dict = field(default_factory=dict)   # (type, title) → history 下标
+    _merge_text: dict = field(default_factory=dict)  # title → 已累计正文
+
+    def record(self, frame: str) -> None:
+        """把一帧写入回放历史（必要时与同段已有帧合并）。"""
+        ev = _peek_event(frame)
+        kind = ev.get("type") if ev else None
+        if kind == "section_token":
+            title = str(ev.get("title") or "")
+            text = self._merge_text.get(title, "") + str(ev.get("text") or "")
+            self._merge_text[title] = text
+            merged = sse.sse({"type": "section_token", "title": title, "text": text})
+            idx = self._merge_idx.get(("section_token", title))
+            if idx is not None and idx < len(self.history):
+                self.history[idx] = merged
+                return
+            self._merge_idx[("section_token", title)] = len(self.history)
+            self.history.append(merged)
+            return
+        if kind == "section_thinking":
+            title = str(ev.get("title") or "")
+            idx = self._merge_idx.get(("section_thinking", title))
+            if idx is not None and idx < len(self.history):
+                self.history[idx] = frame
+                return
+            self._merge_idx[("section_thinking", title)] = len(self.history)
+            self.history.append(frame)
+            return
+        self.history.append(frame)
+        # 安全上限：压缩后正常远低于此（进度事件数十帧）。超限只截掉最早的非关键帧
+        # 之外的部分 —— 截断会让合并下标失效，故整体重建下标。
+        if len(self.history) > 3000:
+            del self.history[: len(self.history) - 3000]
+            self._merge_idx.clear()
+            self._merge_text.clear()
+
+
+def _peek_event(frame: str) -> Optional[dict]:
+    """解析单帧 SSE（`data: {json}\n\n`）；非 JSON 帧返回 None。"""
+    if not frame.startswith("data: {"):
+        return None
+    try:
+        ev = json.loads(frame[6:].strip())
+    except (ValueError, TypeError):
+        return None
+    return ev if isinstance(ev, dict) else None
+
+
+# 每个研究 SSE 连接的首帧：告诉前端「接下来是完整回放」，先清空本轮展示状态再重建，
+# 自动重连/切页重连都不会把同一段正文、同一条工具轨迹追加两遍（审计 A06）。
+_REPLAY_FRAME = sse.sse({"type": "replay"})
 
 
 _RESEARCH_RUNS: dict[str, _ResearchRuntime] = {}
@@ -159,15 +222,22 @@ def _task_age_seconds(updated) -> float:
 
 
 async def _mark_research_interrupted(task_id: str, message: str) -> None:
-    async with session_scope() as s:
-        if s is None:
-            return
-        row = await s.get(ResearchTask, task_id)
-        if row and row.status in {"pending", "running"}:
-            row.status = "error"
-            row.stage = "error"
-            row.error = message
-            await s.commit()
+    """把仍处于 pending/running 的任务终结为 error（已 done/error 的行不动）。
+
+    兜底落库路径：数据库异常只记日志，绝不让收尾逻辑本身抛错打断 runtime 的 finally。
+    """
+    try:
+        async with session_scope() as s:
+            if s is None:
+                return
+            row = await s.get(ResearchTask, task_id)
+            if row and row.status in {"pending", "running"}:
+                row.status = "error"
+                row.stage = "error"
+                row.error = message
+                await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("研究任务终态兜底落库失败 task=%s：%s", task_id, e)
 
 
 def _start_research_runtime(
@@ -180,13 +250,15 @@ def _start_research_runtime(
     _RESEARCH_RUNS[task_id] = runtime
 
     async def pump() -> None:
+        last_error = ""
         try:
             async for frame in factory():
-                runtime.history.append(frame)
-                # v1.6.0（审计 B11）：600→3000。真流式下四段 × ~300 token ≈ 1200-1700 帧
-                # section_token，旧上限会把摘要帧与早期段落挤出重连回放窗口（切页回来只见残卷）。
-                if len(runtime.history) > 3000:
-                    del runtime.history[: len(runtime.history) - 3000]
+                # v1.7.1（A06）：回放历史压缩存储（见 _ResearchRuntime docstring）；
+                # 实时订阅者照旧逐帧收。
+                runtime.record(frame)
+                ev = _peek_event(frame)
+                if ev and ev.get("type") == "error":
+                    last_error = str(ev.get("message") or "")
                 for queue in tuple(runtime.subscribers):
                     queue.put_nowait(frame)
         except asyncio.CancelledError:
@@ -196,9 +268,14 @@ def _start_research_runtime(
             logger.exception("research runtime failed: %s", task_id)
             await _mark_research_interrupted(task_id, str(exc))
             frame = sse.ev_error(str(exc))
-            runtime.history.append(frame)
+            runtime.record(frame)
             for queue in tuple(runtime.subscribers):
                 queue.put_nowait(frame)
+        else:
+            # v1.7.1（审计 A05）：管线正常结束但没有落终态（任何未来新增的提前 return
+            # 路径）时兜底 —— 任务行绝不能停在 running，失败原因取最后一个 error 帧。
+            # 已是 done/error 的行不受影响（_mark_research_interrupted 只改 pending/running）。
+            await _mark_research_interrupted(task_id, last_error or "研究任务异常结束（未生成报告）。")
         finally:
             runtime.terminal = True
             for queue in tuple(runtime.subscribers):
@@ -1233,6 +1310,21 @@ async def get_research_task(task_id: str) -> dict:
         return meta
 
 
+def _norm_query(q: Optional[str]) -> str:
+    return " ".join(str(q or "").split())
+
+
+def _llm_fingerprint(cfg: Optional[dict]) -> tuple:
+    """影响研究输出的模型参数指纹（不含 api_key：同一供应商换 key 不改变任务语义）。"""
+    if not cfg:
+        return ()
+    return (
+        str(cfg.get("base_url") or "").strip().rstrip("/"),
+        str(cfg.get("model") or "").strip(),
+        reasoning_effort_of(cfg),
+    )
+
+
 @router.post("/research")
 async def create_research(req: ResearchRequest) -> dict:
     if req.template not in VALID_TEMPLATES:
@@ -1249,20 +1341,35 @@ async def create_research(req: ResearchRequest) -> dict:
                     ResearchTask.status.in_(["pending", "running"]),
                 )
                 .order_by(ResearchTask.created_at.desc())
-                .limit(1)
+                .limit(50)
             )
-            existing = (await s.execute(stmt)).scalar_one_or_none()
-            if existing is not None:
+            candidates = list((await s.execute(stmt)).scalars().all())
+            stale = False
+            for existing in candidates:
                 runtime = _RESEARCH_RUNS.get(existing.id)
                 is_active = bool(runtime and runtime.task and not runtime.task.done())
                 # v1.6.0（审计 B5）：统一 aware-UTC 计算（详见 _task_age_seconds docstring）
                 age_s = _task_age_seconds(existing.updated_at or existing.created_at)
-                if is_active or (existing.status == "pending" and age_s <= 30):
-                    _remember_task_llm(existing.id, req.llm or decrypt_config(existing.llm_config))
+                if not (is_active or (existing.status == "pending" and age_s <= 30)):
+                    existing.status = "error"
+                    existing.stage = "error"
+                    existing.error = "检测到上次进程遗留任务，已终止并重新创建。"
+                    stale = True
+                    continue
+                # v1.7.1（审计 A04）：只有**同一个请求**（同问题、同模型参数）才复用 ——
+                # 旧判定只比股票+模板，换个问题或换个模型再提交会被静默并进第一个任务，
+                # 新意图丢失、执行的仍是旧模型。不同请求各自建任务。
+                # 旧实现只看「最新一条」：同秒创建的多条任务 created_at 相同、排序不定，
+                # 真正重复的请求可能匹配不到 —— 现在逐条比对所有仍存活的候选。
+                same_request = (
+                    _norm_query(existing.query) == _norm_query(req.query)
+                    and _llm_fingerprint(decrypt_config(existing.llm_config)) == _llm_fingerprint(req.llm)
+                )
+                if same_request:
+                    if stale:
+                        await s.commit()
                     return {"task_id": existing.id, "reused": True}
-                existing.status = "error"
-                existing.stage = "error"
-                existing.error = "检测到上次进程遗留任务，已终止并重新创建。"
+            if stale:
                 await s.commit()
     task_id = uuid.uuid4().hex
     _remember_task_llm(task_id, req.llm)
@@ -1319,6 +1426,7 @@ async def research_stream(
 
     if terminal_frame is not None:
         async def terminal_gen():
+            yield _REPLAY_FRAME
             yield terminal_frame
         return StreamingResponse(
             terminal_gen(), media_type="text/event-stream",
@@ -1342,6 +1450,21 @@ async def research_stream(
             t.stage = stage
             t.timings = dict(merged)
             await s.commit()
+
+    async def _fail(message: str) -> str:
+        """落库 error 终态并返回 error 帧（v1.7.1 审计 A05：所有失败出口统一走这里，
+        SSE、runtime 与数据库状态三者一致，失败原因如实保留）。"""
+        async with session_scope() as s:
+            if s is not None:
+                t = await s.get(ResearchTask, task_id)
+                if t and t.status != "done":
+                    t.status = "error"
+                    t.stage = "error"
+                    t.error = message
+                    await s.commit()
+        research_clear_task(task_id)
+        _TASK_LLM.pop(task_id, None)
+        return sse.ev_error(message)
 
     async def pipeline():
         # 解析任务参数 + LLM 配置（DB 行优先，回退内存）
@@ -1371,59 +1494,80 @@ async def research_stream(
         # v1.6.2 缓存防腐：同供应商 DB 当前 key 覆盖（与对话链路同口径）
         llm_cfg = await _overlay_current_key(llm_cfg)
         if not code_:
-            yield sse.ev_error("缺少 code（DB 无此任务且未传 code 查询参数）")
+            yield await _fail("缺少 code（DB 无此任务且未传 code 查询参数）")
+            return
+        tpl_ = tpl_ or "equity_deep"
+        if not llm_available(llm_cfg):
+            yield await _fail("模型未配置：请在「模型配置」中保存 API Key 与模型后重试。")
             return
 
         yield sse.ev_tool(f"开始研究 {code_}")
         await asyncio.sleep(0)
-        agent = build_research_agent(
-            task_id=task_id,
-            template=tpl_ or "equity_deep",
-            llm_config=llm_cfg,
-            profile=user_profile,
-            checkpointer=get_checkpointer()[0],
-        )
-        if agent is None:
-            yield sse.ev_error("模型未配置：请在「模型配置」中保存 API Key 与模型后重试。")
-            return
-
-        ask = f"请研究 {code_}，模板 {tpl_ or 'equity_deep'}。"
-        if q_:
-            ask += f"用户额外关注：{q_}"
 
         graph_t0 = time.perf_counter()
         last_stage_done = graph_t0
         summary_streamed = False
+        # v1.7.1：模板化研究走确定性编排（零模型规划往返，见 research_runner docstring）；
+        # 标的不是规范代码或显式开启 research_agent_loop 时才交给 agent 主循环。
+        direct = (not settings.research_agent_loop) and is_direct_target(code_, tpl_)
+        if direct:
+            source = run_research_direct(
+                task_id=task_id, code=code_, template=tpl_,
+                llm_config=llm_cfg, profile=user_profile,
+            )
+        else:
+            agent = build_research_agent(
+                task_id=task_id,
+                template=tpl_,
+                llm_config=llm_cfg,
+                profile=user_profile,
+                checkpointer=get_checkpointer()[0],
+            )
+            if agent is None:
+                yield await _fail("模型未配置：请在「模型配置」中保存 API Key 与模型后重试。")
+                return
+            ask = f"请研究 {code_}，模板 {tpl_}。"
+            if q_:
+                ask += f"用户额外关注：{q_}"
+
+            async def _agent_lines():
+                # emit_tokens=False：agent 的正文是"好的，开始研究"这类过程话术，不是报告内容；
+                # 报告正文由 compose_report 经 custom 事件（section/summary）另行送达。
+                async with contextlib.aclosing(stream_agent_sse(
+                    agent,
+                    {"messages": [{"role": "user", "content": ask}]},
+                    {
+                        "configurable": {"thread_id": task_id},
+                        "recursion_limit": int(settings.agent_recursion_limit),
+                    },
+                    emit_tokens=False,
+                )) as agen:
+                    async for _line, _piece in agen:
+                        yield _line
+
+            source = _agent_lines()
         try:
-            # emit_tokens=False：agent 的正文是"好的，开始研究"这类过程话术，不是报告内容；
-            # 报告正文由 compose_report 经 custom 事件（section/summary）另行送达。
-            async for _line, _piece in stream_agent_sse(
-                agent,
-                {"messages": [{"role": "user", "content": ask}]},
-                {
-                    "configurable": {"thread_id": task_id},
-                    "recursion_limit": int(settings.agent_recursion_limit),
-                },
-                emit_tokens=False,
-            ):
-                _ev = json.loads(_line[6:].strip())
-                if _ev.get("type") == "summary":
-                    summary_streamed = True
-                elif _ev.get("type") == "tool_call" and _ev.get("status") in ("ok", "error"):
-                    # progress_events 落库的新事件源：旧图是"节点完成"，现在是"工具调用完成"。
-                    # 这条链路必须接上，否则 /research/{task_id} 的 progress_events 永远是空的，
-                    # 切页回来就看不到已完成的阶段了（ResearchTask.progress_events 的唯一写入者）。
-                    _now = time.perf_counter()
-                    _elapsed = int((_now - last_stage_done) * 1000)
-                    last_stage_done = _now
-                    await _persist_event(
-                        _ev["name"], _ev.get("label", _ev["name"]), _elapsed, {}, _ev["name"], merged_timings
-                    )
-                yield _line
-                await asyncio.sleep(0)
+            async with contextlib.aclosing(source) as lines:
+                async for _line in lines:
+                    _ev = _peek_event(_line) or {}
+                    if _ev.get("type") == "summary":
+                        summary_streamed = True
+                    elif _ev.get("type") == "tool_call" and _ev.get("status") in ("ok", "error"):
+                        # progress_events 落库的新事件源：旧图是"节点完成"，现在是"工具调用完成"。
+                        # 这条链路必须接上，否则 /research/{task_id} 的 progress_events 永远是空的，
+                        # 切页回来就看不到已完成的阶段了（ResearchTask.progress_events 的唯一写入者）。
+                        _now = time.perf_counter()
+                        _elapsed = int((_now - last_stage_done) * 1000)
+                        last_stage_done = _now
+                        await _persist_event(
+                            _ev["name"], _ev.get("label", _ev["name"]), _elapsed, {}, _ev["name"], merged_timings
+                        )
+                    yield _line
+                    await asyncio.sleep(0)
 
             # 报告不经模型上下文，直接从工具层存储取回（见 research_tools 的设计说明）
             draft = research_get_stored(task_id, "draft_report")
+            failure = research_get_stored(task_id, "failure")
             merged_timings.update(research_get_stored(task_id, "timings", {}) or {})
             # v1.6.0（审计 E2）：draft 已取回即确定性释放 _STORE 槽位（配合 LRU，
             # 不再依赖上限挤出；运行中任务不会被后续任务挤出）
@@ -1432,15 +1576,7 @@ async def research_stream(
             _TASK_LLM.pop(task_id, None)
 
             if not draft:
-                async with session_scope() as s:
-                    if s is not None:
-                        t = await s.get(ResearchTask, task_id)
-                        if t:
-                            t.status = "error"
-                            t.stage = "error"
-                            t.error = "未生成报告草稿（数据源可能不可用）"
-                            await s.commit()
-                yield sse.ev_error("未生成报告草稿（数据源可能不可用）")
+                yield await _fail(failure or "未生成报告草稿（数据源可能不可用）")
                 return
 
             # 1) 先落库报告 + 任务 done/report_id（done 必须在落库后发送）
@@ -1453,7 +1589,7 @@ async def research_stream(
                             task_id=task_id,
                             ticker=draft.get("ticker", code_),
                             name=draft.get("name", ""),
-                            template=tpl_ or "equity_deep",
+                            template=tpl_,
                             summary=draft.get("summary", ""),
                             payload=draft,
                             html=draft.get("html", ""),
@@ -1485,25 +1621,23 @@ async def research_stream(
             yield sse.sse({"type": "done", "report_id": report_id, "report": draft})
         except Exception as e:  # noqa: BLE001
             logger.exception("research_stream 失败")
-            async with session_scope() as s:
-                if s is not None:
-                    t = await s.get(ResearchTask, task_id)
-                    if t:
-                        t.status = "error"
-                        t.stage = "error"
-                        t.error = str(e)
-                    await s.commit()
-            yield sse.ev_error(str(e))
+            yield await _fail(str(e))
 
     async def connection():
         runtime = _start_research_runtime(task_id, pipeline)
         queue: asyncio.Queue = asyncio.Queue()
+        # 订阅与历史快照必须在同一个同步片段里完成（中间不能有 yield/await）：
+        # 否则首帧发送挂起期间 pump 新记录的帧会同时出现在快照与队列里，被前端收两遍。
         runtime.subscribers.add(queue)
+        snapshot = list(runtime.history)
+        was_terminal = runtime.terminal
         try:
             # 新订阅者先回放本进程内已经产生的事件，切页回来不会只剩一个转圈。
-            for frame in list(runtime.history):
+            # v1.7.1（A06）：以 replay 帧开头 —— 前端清空本轮展示后按压缩历史重建（幂等）。
+            yield _REPLAY_FRAME
+            for frame in snapshot:
                 yield frame
-            if runtime.terminal:
+            if was_terminal:
                 return
             while True:
                 if await request.is_disconnected():
@@ -1762,6 +1896,11 @@ async def chart_analyze(req: ChartAnalyzeRequest) -> dict:
             )
         )
         text = resp.content if hasattr(resp, "content") else str(resp)
+        # content-block 列表形态（部分兼容端点）直接 .strip() 会 AttributeError → 被下方
+        # except 吞成「速读失败」；推理端点内联的 <think> 也不能当速读结论展示（v1.7.1）
+        if isinstance(text, list):
+            text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in text)
+        text = strip_think(str(text or ""))
         return {
             "text": text.strip() or "(速读为空)",
             "provenance": {**base_prov, "host": target_host, "model": used_model},

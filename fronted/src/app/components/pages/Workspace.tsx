@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Search, Sparkles, Check, Loader2, Circle, FileText, ShieldAlert, Link2, ArrowRight, Waypoints, Globe2 } from "lucide-react";
+import { Search, Sparkles, Check, Loader2, Circle, FileText, ShieldAlert, Link2, ArrowRight, Waypoints, Globe2, Clock3, BrainCircuit } from "lucide-react";
 import { WATCHLIST } from "../../data/market";
 import { TEMPLATES, type TemplateId, type ReportDoc } from "../../data/report";
 import { fmt, signed, trendClass } from "../../lib/format";
@@ -41,6 +41,17 @@ interface ToolCall {
  * 开放式研究落地后会有内容，届时无需改前端。 */
 interface Todo { content: string; status: string; }
 
+/** 报告章节的流式中间态（v1.7.1）。
+ * queued：已排上、等并发闸；writing：已开始（可能仍在思考，thinking 为思维链尾部预览）；
+ * done：权威正文已收口。 */
+interface PartialSection {
+  title: string;
+  body: string;
+  status?: "queued" | "writing" | "done";
+  thinking?: string;
+  thinkingChars?: number;
+}
+
 const SECTION_ORDER: Record<TemplateId, string[]> = {
   equity_deep: ["技术面分析", "基本面分析", "估值分析", "行业与公司分析"],
   industry: ["行业景气与竞争格局"],
@@ -55,6 +66,28 @@ const SUMMARY_LABEL: Record<TemplateId, string> = {
   risk: "风险评估摘要",
 };
 
+/** 按标题插入/更新章节，并按模板章节序排序（未知标题排末尾）。 */
+function upsertSection(
+  items: PartialSection[],
+  title: string,
+  template: TemplateId,
+  update: (cur: PartialSection) => PartialSection,
+): PartialSection[] {
+  const idx = items.findIndex((item) => item.title === title);
+  const next = items.slice();
+  if (idx === -1) {
+    next.push(update({ title, body: "" }));
+  } else {
+    next[idx] = update(items[idx]);
+  }
+  const order = SECTION_ORDER[template] ?? [];
+  return next.sort((a, b) => {
+    const ai = order.indexOf(a.title);
+    const bi = order.indexOf(b.title);
+    return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+  });
+}
+
 export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings, onReportGenerated }: Props) {
   const [query, setQuery] = useState(selectedCode ?? "");
   const [template, setTemplate] = useState<TemplateId>("equity_deep");
@@ -65,7 +98,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   const [doc, setDoc] = useState<ReportDoc | null>(null);
   const [stock, setStock] = useState<CurrentStock>({ code: "600519.SH", name: "600519.SH" });
   const [typed, setTyped] = useState("");
-  const [partialSections, setPartialSections] = useState<{ title: string; body: string }[]>([]);
+  const [partialSections, setPartialSections] = useState<PartialSection[]>([]);
   const [error, setError] = useState("");
   const [evidence, setEvidence] = useState<EvidenceStatus | null>(null);
   const [evidenceError, setEvidenceError] = useState("");
@@ -137,9 +170,14 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
         if (!live) return;
         const id = ++runId.current;
         activeRunRef.current = id;
+        const liveTemplate = ((live.template as TemplateId) || "equity_deep");
         setPhase("running");
         setReconnectedCode(live.code);
-        stream.connect(live.id, live.code, live.template || "equity_deep", (ev) => {
+        // v1.7.1：重连时同步展示模板与标的 —— 此前沿用组件默认 equity_deep，重连到行业/
+        // 财报任务会画出四个永远「等待中」的个股章节占位
+        setDisplayTemplate(liveTemplate);
+        setStock({ code: live.code, name: live.code });
+        stream.connect(live.id, live.code, liveTemplate, (ev) => {
           if (cancelled()) return;
           if (ev.type === "done" || ev.type === "error" || ev.type === "__disconnected__") {
             setReconnectedCode(null);
@@ -148,7 +186,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
           handleResearchEvent(ev, {
             id,
             resolved: { code: live.code, name: live.code },
-            runTemplate: (live.template as TemplateId) || "equity_deep",
+            runTemplate: liveTemplate,
             // 终态必须主动关连接（与 runBackend 一致）—— 服务端终帧后断流会触发
             // EventSource onerror→__disconnected__，把刚设置的完成态覆盖成「连接中断」错误
             finish: () => {
@@ -276,42 +314,42 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     } else if (ev.type === "token") {
       // 兼容旧后端；新后端使用 summary 快照，重连时不会重复 append。
       setTyped((t) => t + (ev.text ?? ""));
-    } else if (ev.type === "section_start") {
-      // 真流式：某板块开始撰写，建一个空 body 的段并按模板序插入（不重复建段）
+    } else if (ev.type === "section_queued" || ev.type === "section_start") {
+      // v1.7.1：queued = 已排上等并发闸（不再虚报「撰写中」）；start = 真正开始调模型
       const title = ev.title ?? "分析章节";
-      setPartialSections((items) =>
-        items.some((item) => item.title === title)
-          ? items
-          : [...items, { title, body: "" }].sort((a, b) => {
-              const order = SECTION_ORDER[runTemplate];
-              const ai = order.indexOf(a.title);
-              const bi = order.indexOf(b.title);
-              return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-            })
-      );
+      const status = ev.type === "section_start" ? "writing" : "queued";
+      setPartialSections((items) => upsertSection(items, title, runTemplate, (cur) => ({
+        ...cur,
+        status: cur.status === "done" ? "done" : cur.status === "writing" ? "writing" : status,
+      })));
+    } else if (ev.type === "section_thinking") {
+      // 思维链快照（替换语义）：思考型模型 CoT 期间展示「思考中」+ 尾部预览
+      const title = ev.title ?? "分析章节";
+      setPartialSections((items) => upsertSection(items, title, runTemplate, (cur) => (
+        cur.status === "done" ? cur : { ...cur, status: "writing", thinking: ev.text ?? "", thinkingChars: ev.chars ?? 0 }
+      )));
     } else if (ev.type === "section_token") {
       // 真流式：逐 token 追加到对应板块 body（打字机效果）
       const title = ev.title ?? "分析章节";
       const token = ev.text ?? "";
-      setPartialSections((items) => {
-        const idx = items.findIndex((item) => item.title === title);
-        if (idx === -1) return [...items, { title, body: token }];
-        const next = items.slice();
-        next[idx] = { title, body: next[idx].body + token };
-        return next;
-      });
+      setPartialSections((items) => upsertSection(items, title, runTemplate, (cur) => (
+        cur.status === "done" ? cur : { ...cur, status: "writing", body: cur.body + token }
+      )));
     } else if (ev.type === "section") {
       // 权威收口：用最终 body 覆盖流式累积（截断/禁用词回退后以此为准）
-      const section = { title: ev.title ?? "分析章节", body: ev.body ?? "" };
-      setPartialSections((items) => [
-        ...items.filter((item) => item.title !== section.title),
-        section,
-      ].sort((a, b) => {
-        const order = SECTION_ORDER[runTemplate];
-        const ai = order.indexOf(a.title);
-        const bi = order.indexOf(b.title);
-        return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-      }));
+      const title = ev.title ?? "分析章节";
+      setPartialSections((items) => upsertSection(items, title, runTemplate, () => (
+        { title, body: ev.body ?? "", status: "done" }
+      )));
+    } else if (ev.type === "replay") {
+      // v1.7.1（审计 A06）：每个 SSE 连接以 replay 开头，随后是该任务的完整（压缩）历史。
+      // 先清空本轮展示状态再重建 —— 自动重连/切页重连不再把正文与工具轨迹追加第二遍。
+      setToolCalls([]);
+      setTodos([]);
+      setTyped("");
+      setPartialSections([]);
+      setDoc(null);
+      setError("");
     } else if (ev.type === "done") {
       const rep = ev.report;
       const reportId = ev.report_id || `${resolved.code}-${Date.now()}`;
@@ -610,15 +648,18 @@ function ResearchReportView({ doc, stock, summary, sections, template, running }
   doc: ReportDoc | null;
   stock: CurrentStock;
   summary: string;
-  sections: { title: string; body: string }[];
+  sections: PartialSection[];
   template: TemplateId;
   running: boolean;
 }) {
   const stagger = (i: number) => ({ initial: { opacity: 0, y: 14 }, animate: { opacity: 1, y: 0 }, transition: { delay: 0.08 * i, duration: 0.5, ease: [0.16, 1, 0.3, 1] as any } });
   const expected = SECTION_ORDER[template];
-  const visibleSections = running
+  const visibleSections: (PartialSection & { pending: boolean })[] = running
     ? [
-        ...expected.map((title) => ({ title, body: sections.find((item) => item.title === title)?.body || "", pending: !sections.some((item) => item.title === title) })),
+        ...expected.map((title) => {
+          const hit = sections.find((item) => item.title === title);
+          return hit ? { ...hit, pending: false } : { title, body: "", pending: true };
+        }),
         ...sections.filter((item) => !expected.includes(item.title)).map((item) => ({ ...item, pending: false })),
       ]
     : sections.map((item) => ({ ...item, pending: false }));
@@ -678,10 +719,27 @@ function ResearchReportView({ doc, stock, summary, sections, template, running }
           <h2 className="font-display border-l-[3px] border-gold pl-2.5 mb-2" style={{ fontSize: 16, fontWeight: 600 }}>{sec.title}</h2>
           {sec.pending ? (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin text-gold" /> 正在生成本章节…
+              <Loader2 className="size-3.5 animate-spin text-gold" /> 等待开始撰写…
+            </div>
+          ) : running && sec.status === "queued" && !sec.body.trim() ? (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Clock3 className="size-3.5 text-muted-foreground/70" /> 排队中 · 前序章节写完后自动开始
             </div>
           ) : sec.body.trim() ? (
-            <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">{sec.body}</p>
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">
+              {sec.body}
+              {running && sec.status === "writing" && (
+                <span className="inline-block w-[2px] h-[1em] align-[-0.15em] ml-0.5 bg-gold animate-pulse" />
+              )}
+            </p>
+          ) : running && sec.thinking ? (
+            <div className="text-xs text-muted-foreground">
+              <div className="flex items-center gap-2">
+                <BrainCircuit className="size-3.5 text-gold animate-pulse" />
+                模型思考中{sec.thinkingChars ? `（已思考 ${sec.thinkingChars} 字）` : ""}…
+              </div>
+              <p className="mt-1.5 pl-5 italic text-muted-foreground/60 line-clamp-2 break-all">…{sec.thinking}</p>
+            </div>
           ) : (
             // 双保险：段已到达但正文为空（后端理应已兜底回退模板，这里防任何空 body 泄漏到 UI，
             // 不让用户面对一片空白的标题）。running 时当作仍在生成，done 后如实说明本段无内容。

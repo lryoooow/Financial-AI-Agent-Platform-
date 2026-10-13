@@ -159,14 +159,40 @@ def get_company_profile(code: str) -> dict:
         }
 
 
+_PERIOD_LABELS = {"03": "一季报", "06": "中报", "09": "三季报"}
+
+
+def _norm_period(value) -> str:
+    """把各数据源的报告期统一成 YYYY-MM-DD（"20251231" / "2025-12-31" / Timestamp 均可）。
+
+    无法识别时返回空串 —— 调用方必须把空串当「报告期不明」，绝不拿公告日期顶替。
+    """
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) < 8:
+        return ""
+    y, m, d = digits[:4], digits[4:6], digits[6:8]
+    if not ("01" <= m <= "12" and "01" <= d <= "31"):
+        return ""
+    return f"{y}-{m}-{d}"
+
+
+def period_label(period: str, year: str = "") -> str:
+    """表头标签：年报 → "2025"；中期 → "2026中报" / "2026一季报" / "2026三季报"。"""
+    p = _norm_period(period)
+    if not p:
+        return str(year or "")
+    y, m = p[:4], p[5:7]
+    return y if m == "12" else f"{y}{_PERIOD_LABELS.get(m, p[5:])}"
+
+
 def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
     """取最近 n 年财务指标（带缓存）。返回 list[dict]。
 
-    v1.6.3（P1 修复）：同年**优先取年报**（报告期 12-31）。旧实现 keep="last" 在
-    年报发布前的月份会把"最新年"行换成中报/三季报值，与其它年份的年报行混排成
-    一张表 —— 同比全错（茅台实测 ROE 同比 -15.9pct，真实约 -1.3pct；资产负债率
-    同比符号翻转）。当年尚无年报时回落最新报告期，并在行上标记 `_interim=True`
-    供调用方在 provenance 如实标注（零幻觉：口径不撒谎）。
+    v1.6.3（P1 修复）：同年**优先取年报**（报告期 12-31）。当年尚无年报时回落最新
+    报告期，并在行上标记 `_interim=True`。
+    v1.7.1（审计 A01）：中期行额外挂 `_prior_same_period` —— 上一年**同一报告期**
+    的原始行（如 2026-06-30 ↔ 2025-06-30）。上一年那一行在表里已被年报替换，
+    不挂出来的话，消费方只能拿「中报 vs 上年年报」相减，冒充同比。
     """
     cache_key = f"fin_indicator:{raw}:{n}"
     cached = slow_cache.get(cache_key)
@@ -178,14 +204,18 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
     df = ak.stock_financial_analysis_indicator(symbol=raw, start_year=start_year)
     if df is None or df.empty:
         return None
-    # 第一列通常是日期
+    # 第一列通常是日期（"日期"）；按名字优先，避免上游列序变化
     df = df.copy()
-    date_col = df.columns[0]
-    df["_date"] = df[date_col].astype(str)
+    date_col = next((c for c in df.columns if str(c).strip() in ("日期", "报告期", "报告日")), df.columns[0])
+    df["_date"] = df[date_col].map(_norm_period)
+    df = df[df["_date"] != ""]
+    if df.empty:
+        return None
     df["_year"] = df["_date"].str[:4]
     df = df.sort_values("_date")
+    by_date = {str(r["_date"]): r for r in df.to_dict("records")}
     picked_rows = []
-    for year, group in df.groupby("_year", sort=True):
+    for _year, group in df.groupby("_year", sort=True):
         annual = group[group["_date"].str.slice(5, 7) == "12"]
         if not annual.empty:
             rec = annual.iloc[-1].to_dict()
@@ -193,6 +223,10 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
         else:
             rec = group.iloc[-1].to_dict()
             rec["_interim"] = True  # 当年尚无年报：中期报告口径，调用方须标注
+            d = str(rec["_date"])
+            prior = by_date.get(f"{int(d[:4]) - 1}{d[4:]}")
+            if prior is not None:
+                rec["_prior_same_period"] = dict(prior)
         picked_rows.append(rec)
     rows = picked_rows
     slow_cache.set(cache_key, rows, ttl=6 * 3600)
@@ -202,10 +236,13 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
 def _income_statement_annual(raw: str, years: list) -> dict:
     """新浪利润表取营收绝对值与毛利率（v1.6.3 B2）。
 
-    财务指标接口无营收绝对值列（实测 86 列），营收/毛利率行恒「—」。本函数从
-    ak.stock_financial_report_sina(symbol="利润表") 按年取**年报**行（12-31），
-    返回 {year: {"revenue": 元, "gross_margin_pct": float}}；任何失败返回空 dict
-    （调用方保持现状如实「—」，绝不编造）。北交所（bj 前缀）该源同样可取。
+    返回 {报告期 "YYYY-MM-DD": {"revenue": 元, "gross_margin_pct": float}}，
+    每个报告期一条；任何失败返回空 dict（调用方保持现状如实「—」，绝不编造）。
+
+    v1.7.1（审计 A02）：报告期只认「报告日/报告期/截止日期」列。旧实现找第一个名字含
+    「日期」的列，命中的是「公告日期」—— 2024 年报在 2025-03 公告，于是被当成 2025
+    年的数据补进 2025 列，营收/毛利率与同列 ROE、利润错一年。报告期列找不到时宁可
+    不补（返回空），也不拿公告日期顶替。
     """
     cache_key = f"income_sina:{raw}"
     cached = slow_cache.get(cache_key)
@@ -233,39 +270,41 @@ def _income_statement_annual(raw: str, years: list) -> dict:
         except Exception:  # noqa: BLE001
             return None
 
-    date_col = next((c for c in df.columns if "日期" in str(c)), df.columns[0])
+    cols = {str(c).strip(): c for c in df.columns}
 
     def _pref_col(candidates):
         """按候选优先级选列（显式偏好序；旧实现按 DataFrame 列序撞大运，
         抓到「营业总成本」（含税金及三费）冒充营业成本，毛利率语义全错——
         茅台实测 68.7% vs 真实 ~91%）。"""
-        cols = {str(c).strip(): c for c in df.columns}
         for name in candidates:
             if name in cols:
                 return cols[name]
         return None
 
+    period_col = _pref_col(("报告日", "报告期", "截止日期", "报表日期"))
+    if period_col is None:
+        logger.info("利润表缺少报告期列（仅有公告日期等），不做补全：%s", list(cols)[:8])
+        slow_cache.set(cache_key, {}, ttl=600)
+        return {}
     # 营业收入口径：优先「营业收入」（与利润表毛利率口径一致）；「营业总收入」次之
     rev_col = _pref_col(("营业收入", "营业总收入"))
     # 营业成本口径：仅「营业成本」——绝不用「营业总成本」（前者是毛利率分子口径）
     cost_col = _pref_col(("营业成本",))
     out: dict = {}
-    if rev_col:
-        df = df.copy()
-        df["_d"] = df[date_col].astype(str)
-        df["_y"] = df["_d"].str[:4]
-        for y, g in df.groupby("_y", sort=True):
-            annual = g[g["_d"].str.slice(5, 7) == "12"]
-            rec = (annual if not annual.empty else g).iloc[-1]
+    if rev_col is not None:
+        for rec in df.to_dict("records"):
+            period = _norm_period(rec.get(period_col))
+            if not period or period in out:
+                continue  # 报告期不明不补；同期重复行取首条（上游按期唯一）
             rev = _num(rec.get(rev_col))
             if rev is None or rev <= 0:
                 continue
             entry: dict = {"revenue": rev}
-            if cost_col:
+            if cost_col is not None:
                 cost = _num(rec.get(cost_col))
-                if cost is not None and rev > 0:
+                if cost is not None:
                     entry["gross_margin_pct"] = (rev - cost) / rev * 100.0
-            out[str(y)] = entry
+            out[period] = entry
     slow_cache.set(cache_key, out, ttl=6 * 3600)
     return out
 
@@ -282,7 +321,10 @@ def get_financial_indicators(code: str) -> dict:
         if not rows:
             raise ValueError("无财务指标数据")
         rows = rows[-5:]
-        years = [str(r.get("_year", "")) for r in rows]
+        periods = [_norm_period(r.get("_date")) for r in rows]
+        # 表头按报告期如实标注：年报列 "2025"，中期列 "2026中报"（审计 A01：页面表头、
+        # 事实块与正文对报告期的表达一致，不让中期列伪装成整年）
+        years = [period_label(p, str(r.get("_year", ""))) for p, r in zip(periods, rows)]
 
         def pick(r, *keys):
             for k in keys:
@@ -328,7 +370,15 @@ def get_financial_indicators(code: str) -> dict:
                 logger.info("营收/毛利率换源补全失败：%s", e)
         income_filled = []
         for i, y in enumerate(years):
-            entry = income.get(str(y)) or {}
+            # 按完整报告期精确匹配（A02）；行无报告期信息（旧缓存/测试夹具）时才按年份
+            # 匹配，且仅限年报列 —— 中期列绝不拿整年数补
+            period = periods[i]
+            if period:
+                entry = income.get(period) or {}
+            else:
+                entry = income.get(str(rows[i].get("_year", y))) or {}
+            if not period and rows[i].get("_interim"):
+                entry = {}
             if revenue_vals[i] == "—" and entry.get("revenue"):
                 v = entry["revenue"]
                 revenue_vals[i] = f"{v/1e8:.2f}亿" if abs(v) > 1e6 else f"{v:.2f}"
@@ -359,7 +409,7 @@ def get_financial_indicators(code: str) -> dict:
             if interim_years else ""
         )
         income_note = (
-            f"；营收/毛利率部分年份由新浪利润表（年报口径）补全：{','.join(income_filled)}"
+            f"；营收/毛利率部分报告期由新浪利润表（按报告期对齐）补全：{','.join(income_filled)}"
             if income_filled else ""
         )
         prov["note"] = (
@@ -367,9 +417,29 @@ def get_financial_indicators(code: str) -> dict:
             f"（净利润行含扣非口径候选，实际命中列以本注为准）{interim_note}{income_note}"
         )
 
+        # 审计 A01：最新列是中期口径时，给出上一年同一报告期的比率类指标作为同比基准
+        #（ROE/毛利率/资产负债率的「同比变动」只能同期相减；营收/净利润的同比本就读
+        # 上游增速行，上游按同期口径计算）。拿不到同期行就不给基准 —— 消费方据此
+        # 不展示同比，绝不退回「中报 − 上年年报」。
+        yoy_base: dict = {}
+        latest = rows[-1] if rows else {}
+        prior = latest.get("_prior_same_period") if latest.get("_interim") else None
+        if isinstance(prior, dict):
+            yoy_base = {
+                "period": _norm_period(prior.get("_date")),
+                "ROE": fmt_pct(pick(prior, "净资产收益率(%)", "加权净资产收益率(%)", "净资产收益率", "ROE")),
+                "毛利率": fmt_pct(pick(prior, "销售毛利率(%)", "销售毛利率", "毛利率")),
+                "资产负债率": fmt_pct(pick(prior, "资产负债率(%)", "资产负债率")),
+            }
+            p_entry = income.get(yoy_base["period"]) or {}
+            if yoy_base["毛利率"] == "—" and p_entry.get("gross_margin_pct") is not None:
+                yoy_base["毛利率"] = fmt_pct(p_entry["gross_margin_pct"])
+
         return {
             "financials": {
                 "years": years,
+                "periods": periods,
+                "yoy_base": yoy_base,
                 "rows": [
                     {"name": "营业收入", "values": revenue_vals},
                     {"name": "净利润", "values": net_vals},

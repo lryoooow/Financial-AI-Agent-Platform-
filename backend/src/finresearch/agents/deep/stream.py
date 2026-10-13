@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 from ...api import sse
+from ...llm import ThinkTagSplitter
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,55 @@ def _tool_failed(content: Any) -> bool:
     return isinstance(data, dict) and bool(data.get("error"))
 
 
+def custom_event_to_sse(data: Any) -> Optional[str]:
+    """report.py 推送的 custom 事件 → SSE 行（研究链路两种编排共用：LangGraph custom 流 /
+    确定性编排的 PUSH_SINK）。不认识的事件返回 None。"""
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("type")
+    if kind == "report_progress":
+        text = data.get("text", "")
+        return sse.sse({"type": "tool", "text": text, "report_stage": True}) if text else None
+    if kind in ("section_queued", "section_start"):
+        # section_queued：段落已排上（等并发闸）；section_start：真正开始撰写
+        return sse.sse({"type": kind, "title": data.get("title", "")})
+    if kind == "section_thinking":
+        # 思维链快照（替换语义，尾部预览 + 累计字数），重连回放不会重复累加
+        return sse.sse({
+            "type": "section_thinking",
+            "title": data.get("title", ""),
+            "text": data.get("text", ""),
+            "chars": data.get("chars", 0),
+        })
+    if kind == "section_token":
+        # 真流式：板块逐 token 吐字，前端追加到该板块 body（打字机）
+        return sse.sse({
+            "type": "section_token",
+            "title": data.get("title", ""),
+            "text": data.get("text", ""),
+        })
+    if kind == "report_section":
+        return sse.sse({
+            "type": "section",
+            "title": data.get("title", ""),
+            "body": data.get("body", ""),
+            "source": data.get("source", ""),
+        })
+    if kind == "research_summary":
+        # 摘要是完整事实快照，不伪装成模型 token：前端用替换语义渲染，
+        # 重连/回放时不会被再次 append 成重复内容。
+        return sse.sse({
+            "type": "summary",
+            "text": data.get("text", ""),
+            "name": data.get("name", ""),
+            "ticker": data.get("ticker", ""),
+            "price": data.get("price"),
+            "change": data.get("change"),
+            "changePct": data.get("changePct"),
+        })
+    return None
+
+
 async def stream_agent_sse(
     agent: Any,
     inputs: dict,
@@ -105,50 +155,18 @@ async def stream_agent_sse(
     emit_tokens=False 用于研究链路：那里 agent 的正文是"好的，开始研究"这类过程话术，
     报告正文另有来路（compose_report 的 custom 事件），把它当 token 流给前端会污染报告区。
 
-    custom 事件（report.py 里 get_stream_writer 推的分段进度/摘要快照）转成 tool/section/
-    summary 三种 SSE，字段与旧固定管线路由发的逐字段一致——实测 get_stream_writer 在 agent
-    的工具里照常工作，所以分段进度 UI 不用改。
+    custom 事件（report.py 里 get_stream_writer 推的分段进度/摘要快照）经
+    custom_event_to_sse 转成 SSE —— 实测 get_stream_writer 在 agent 的工具里照常工作。
     """
+    # v1.7.1：正文开头内联 <think> 的端点（按单次模型调用的消息 id 分别拆分）
+    splitters: dict[str, ThinkTagSplitter] = {}
     async for mode, data in agent.astream(
         inputs, config=config, stream_mode=["updates", "messages", "custom"]
     ):
         if mode == "custom":
-            if not isinstance(data, dict):
-                continue
-            kind = data.get("type")
-            if kind == "report_progress":
-                text = data.get("text", "")
-                if text:
-                    yield sse.sse({"type": "tool", "text": text, "report_stage": True}), ""
-            elif kind == "section_start":
-                # 真流式：某板块开始撰写，前端把它置为 streaming、清空 body
-                yield sse.sse({"type": "section_start", "title": data.get("title", "")}), ""
-            elif kind == "section_token":
-                # 真流式：板块逐 token 吐字，前端追加到该板块 body（打字机）
-                yield sse.sse({
-                    "type": "section_token",
-                    "title": data.get("title", ""),
-                    "text": data.get("text", ""),
-                }), ""
-            elif kind == "report_section":
-                yield sse.sse({
-                    "type": "section",
-                    "title": data.get("title", ""),
-                    "body": data.get("body", ""),
-                    "source": data.get("source", ""),
-                }), ""
-            elif kind == "research_summary":
-                # 摘要是完整事实快照，不伪装成模型 token：前端用替换语义渲染，
-                # 重连/回放时不会被再次 append 成重复内容。
-                yield sse.sse({
-                    "type": "summary",
-                    "text": data.get("text", ""),
-                    "name": data.get("name", ""),
-                    "ticker": data.get("ticker", ""),
-                    "price": data.get("price"),
-                    "change": data.get("change"),
-                    "changePct": data.get("changePct"),
-                }), ""
+            line = custom_event_to_sse(data)
+            if line:
+                yield line, ""
             continue
 
         if mode == "messages":
@@ -156,6 +174,10 @@ async def stream_agent_sse(
             node = (meta or {}).get("langgraph_node")
 
             if node == "tools":
+                # 只认 ToolMessage（工具结果）。研究工具内部的分段撰写 LLM 也会以
+                # node=="tools" 的 AIMessageChunk 出现在 messages 流里，必须忽略。
+                if getattr(msg, "type", "") != "tool":
+                    continue
                 name = getattr(msg, "name", "") or ""
                 if name:
                     status = "error" if _tool_failed(getattr(msg, "content", None)) else "ok"
@@ -179,7 +201,14 @@ async def stream_agent_sse(
             if isinstance(rc, str) and rc and emit_tokens:
                 yield sse.ev_reasoning(rc), ""
 
-            piece = _extract_text(msg)
+            raw = _extract_text(msg)
+            if not raw:
+                continue
+            key = str(getattr(msg, "id", "") or "")
+            sp = splitters.setdefault(key, ThinkTagSplitter())
+            piece, inline_rc = sp.feed(raw)
+            if inline_rc and emit_tokens:
+                yield sse.ev_reasoning(inline_rc), ""
             if piece and emit_tokens:
                 yield sse.ev_token(piece), piece
             continue
@@ -192,6 +221,14 @@ async def stream_agent_sse(
                 todos = payload.get("todos")
                 if todos:
                     yield sse.ev_todo(_render_todos(todos)), ""
+
+    # 流结束：把仍在缓冲里的尾巴吐出（只有「疑似 <think> 前缀」或未闭合 think 会留缓冲）
+    for sp in splitters.values():
+        piece, inline_rc = sp.flush()
+        if inline_rc and emit_tokens:
+            yield sse.ev_reasoning(inline_rc), ""
+        if piece and emit_tokens:
+            yield sse.ev_token(piece), piece
 
 
 def _render_todos(todos: Any) -> list:

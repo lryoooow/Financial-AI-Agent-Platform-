@@ -125,14 +125,19 @@ async def t_parallel_all_llm_and_event_order():
     # 只判 4 个 LLM 段（"证据分层与数据来源"是规则生成，本就不含 LLM 文本）
     ok_bodies = {s.title: "事实分析。" in sections[s.title]["body"] for s in rep._section_specs("equity_deep")}
     check(all(ok_bodies.values()), f"四段全部走 LLM 路径（实际 {ok_bodies}）")
+    queued = [e for e in events if e[0] == "section_queued"]
     starts = [e for e in events if e[0] == "section_start"]
     finished = [e for e in events if e[0] == "report_section"]
+    check(len(queued) == 4, f"section_queued 每段一条（实际 {len(queued)}）")
     check(len(starts) == 4, f"section_start 每段一条（实际 {len(starts)}）")
     check(len(finished) == 4, f"report_section 每段一条（实际 {len(finished)}）")
-    # 占位前置：最后一个 section_start 的位置先于第一个 report_section
-    idx_last_start = max(events.index(e) for e in starts)
+    # 占位前置（v1.7.1）：四段排队占位齐发先于任何段落收口；section_start 改为
+    # 真正拿到并发闸时才发 —— 第 3/4 段的 start 必须晚于前两段之一收口（闸=2）
+    idx_last_queued = max(events.index(e) for e in queued)
     idx_first_finish = min(events.index(e) for e in finished)
-    check(idx_last_start < idx_first_finish, "section_start 齐发先于任何段落收口")
+    check(idx_last_queued < idx_first_finish, "section_queued 齐发先于任何段落收口")
+    idx_start_sorted = sorted(events.index(e) for e in starts)
+    check(idx_start_sorted[2] > idx_first_finish, "第 3 段 section_start 发生在拿到闸之后（不再虚报撰写中）")
     check(_peak["max"] >= 2, f"确实并行（在飞峰值 {_peak['max']}）")
     check(_peak["max"] <= 2, f"闸限流生效：在飞峰值 ≤2（实际 {_peak['max']}）")
 

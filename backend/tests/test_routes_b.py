@@ -72,12 +72,27 @@ def test_llm_default_timeout_and_retries(monkeypatch):
 
 
 def test_replay_window_covers_full_section_stream():
-    """600→3000：四段真流式 ≈1200-1700 帧 section_token，旧窗口把摘要/早期段落挤出回放。"""
-    import inspect
+    """v1.7.1（A06）：回放历史按段压缩 —— 数千个 token 帧也不会把摘要/段落开头挤出窗口，
+    且合并后的正文与逐 token 拼接完全一致（回放即重建，不丢不重）。"""
+    from finresearch.api import sse as sse_mod
 
-    src = inspect.getsource(routes)
-    assert "len(runtime.history) > 3000" in src
-    assert "len(runtime.history) - 3000" in src
+    rt = routes._ResearchRuntime(task_id="replay-window")
+    rt.record(sse_mod.sse({"type": "summary", "text": "摘要"}))
+    for title in ("技术面分析", "基本面分析"):
+        rt.record(sse_mod.sse({"type": "section_queued", "title": title}))
+    expected = {"技术面分析": "", "基本面分析": ""}
+    for i in range(4000):  # 两段交错吐字
+        title = "技术面分析" if i % 2 else "基本面分析"
+        rt.record(sse_mod.sse({"type": "section_token", "title": title, "text": f"{i};"}))
+        rt.record(sse_mod.sse({"type": "section_thinking", "title": title, "text": f"t{i}", "chars": i}))
+        expected[title] += f"{i};"
+    events = [routes._peek_event(f) for f in rt.history]
+    assert len(rt.history) < 20, f"压缩后回放帧数应与进度事件同量级，实际 {len(rt.history)}"
+    assert events[0] == {"type": "summary", "text": "摘要"}, "摘要帧不得被挤出回放窗口"
+    merged = {e["title"]: e["text"] for e in events if e["type"] == "section_token"}
+    assert merged == expected
+    thinking = [e for e in events if e["type"] == "section_thinking"]
+    assert len(thinking) == 2 and {e["chars"] for e in thinking} == {3998, 3999}
 
 
 def test_industry_ticker_passthrough(monkeypatch):

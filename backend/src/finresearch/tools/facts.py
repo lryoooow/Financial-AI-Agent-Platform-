@@ -182,6 +182,85 @@ def delta_pp(vals: list) -> Optional[float]:
     return cur - prev
 
 
+def _period_tail(fins: dict) -> tuple[str, str]:
+    """(最新列报告期, 前一列报告期)；无报告期信息返回空串。"""
+    periods = [str(p or "") for p in ((fins or {}).get("periods") or [])]
+    cur = periods[-1] if periods else ""
+    prev = periods[-2] if len(periods) >= 2 else ""
+    return cur, prev
+
+
+def latest_pair_comparable(fins: dict) -> bool:
+    """最新两列是否同一报告期口径（审计 A01）。
+
+    年报 vs 年报、中报 vs 上年中报才可比；「2026 中报 vs 2025 年报」不可比 ——
+    相邻两列直接相减会把半年数与全年数的差值冒充同比。无报告期信息的旧数据
+    （历史缓存/旧报告）按原语义视为可比，不改变既有行为。
+    """
+    cur, prev = _period_tail(fins)
+    if not cur:
+        return True
+    if not prev:
+        return cur.endswith("-12-31")
+    return cur[5:] == prev[5:]
+
+
+def latest_is_interim(fins: dict) -> bool:
+    cur, _ = _period_tail(fins)
+    return bool(cur) and not cur.endswith("-12-31")
+
+
+def delta_pp_latest(fins: dict, name) -> Optional[float]:
+    """比率类指标（ROE/毛利率/资产负债率）最新一期的同比变动（百分点），口径感知。
+
+    可比 → 相邻两列相减；最新列是中期口径 → 只与 yoy_base（上年同期）相减；
+    拿不到同期基准 → None（不展示同比，绝不跨口径相减）。
+    """
+    vals = row_vals(fins, name)
+    if latest_pair_comparable(fins):
+        return delta_pp(vals)
+    names = [name] if isinstance(name, str) else list(name or [])
+    base = (fins or {}).get("yoy_base") or {}
+    base_v = next((to_float(base.get(n)) for n in names if to_float(base.get(n)) is not None), None)
+    cur = to_float(vals[-1]) if vals else None
+    if cur is None or base_v is None:
+        return None
+    return cur - base_v
+
+
+def yoy_pct_latest(fins: dict, name) -> Optional[float]:
+    """绝对值序列（营收/净利润）推算的同比，口径感知：不可比时返回 None。"""
+    if not latest_pair_comparable(fins):
+        return None
+    return yoy_pct(row_vals(fins, name))
+
+
+def pp_str_latest(fins: dict, name) -> str:
+    p = delta_pp_latest(fins, name)
+    return f"{p:+.1f}pct" if p is not None else MISSING
+
+
+def annual_series(fins: dict, vals: list) -> list:
+    """趋势判断用的同口径序列：最新列是中期口径时去掉它（只看年报列的首末）。"""
+    if vals and latest_is_interim(fins) and not latest_pair_comparable(fins):
+        return list(vals[:-1])
+    return list(vals)
+
+
+def latest_labeled(fins: dict, name) -> str:
+    """最新一期取值；最新列是中期口径时附报告期标注（如「8.6%（2026一季报，非全年口径）」）。
+
+    审计 A01 补全：ROE 等流量型比率在一季报/中报口径下只有全年的几分之一，不标注就交给
+    估值段/摘要，会被读成全年水平（PB 与季度 ROE 错配）。
+    """
+    v = val_str(row_vals(fins, name))
+    if v != MISSING and latest_is_interim(fins):
+        years = (fins or {}).get("years") or []
+        label = years[-1] if years else "中期"
+        return f"{v}（{label}，非全年口径）"
+    return v
+
+
 def yoy_str(vals: list) -> str:
     """同比增速（%）的渲染，缺失 → MISSING。"""
     y = yoy_pct(vals)
@@ -249,10 +328,16 @@ def render_financial_facts(fins: dict) -> str:
     lines = [
         f"【财务指标】最新一期（{latest_year}）",
         f"营业收入 {val_str(rev)}（同比 {val_str(rev_yoy)}）；净利润 {val_str(net)}（同比 {val_str(net_yoy)}）。",
-        f"ROE {val_str(roe)}（同比变动 {pp_str(roe)}）；毛利率 {val_str(gm)}（同比变动 {pp_str(gm)}）；"
-        f"资产负债率 {val_str(debt)}（同比变动 {pp_str(debt)}）。",
+        f"ROE {val_str(roe)}（同比变动 {pp_str_latest(f, 'ROE')}）；毛利率 {val_str(gm)}（同比变动 {pp_str_latest(f, '毛利率')}）；"
+        f"资产负债率 {val_str(debt)}（同比变动 {pp_str_latest(f, '资产负债率')}）。",
         "注：营收/净利润括注为上游增速行的同比（%）；ROE/毛利率/资产负债率括注为同比变动（pct=百分点）。",
     ]
+    if latest_is_interim(f):
+        base = (f.get("yoy_base") or {}).get("period") or ""
+        lines.append(
+            f"口径：最新一期为中期报告（非全年），与其余年报列不可直接比较；"
+            + (f"同比变动的基准为上年同期（{base}）。" if base else "上年同期数据缺失，比率类同比变动不展示。")
+        )
     return "\n".join(lines)
 
 

@@ -163,6 +163,76 @@ class ReasoningChatOpenAI(ChatOpenAI):
         return gen
 
 
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+
+
+class ThinkTagSplitter:
+    """把正文里内联的 <think>…</think> 拆成思维链（v1.7.1）。
+
+    部分中转站 / 自部署推理端（DeepSeek-R1、QwQ、Qwen3 经 vLLM 等）不走
+    delta.reasoning_content，而是把思维链直接塞进 content 开头的 <think> 标签里。
+    不拆的话：研究分段的 420 字上限被思维链吃满（整段正文变成一截思考过程），
+    对话里思考过程被当成答案流给用户并落库。
+
+    只认**正文开头**（忽略前导空白）的 <think>，正文中间出现的同名字符串按原文处理，
+    避免误伤。标签可能被拆在相邻两个 chunk 里，按尾部缓冲处理。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._mode = "detect"  # detect → think → content
+
+    def feed(self, text: str) -> tuple[str, str]:
+        """喂入一段增量，返回 (正文增量, 思维链增量)。"""
+        if not text:
+            return "", ""
+        if self._mode == "content":
+            return text, ""
+        self._buf += text
+        content, reasoning = "", ""
+        if self._mode == "detect":
+            head = self._buf.lstrip()
+            if head.startswith(_THINK_OPEN):
+                self._mode = "think"
+                self._buf = head[len(_THINK_OPEN):]
+            elif head and _THINK_OPEN.startswith(head):
+                return "", ""  # 可能是被拆开的 "<thi" —— 先攒着
+            elif not head:
+                return "", ""  # 纯前导空白：等下一块再判定
+            else:
+                self._mode = "content"
+                out, self._buf = self._buf, ""
+                return out, ""
+        if self._mode == "think":
+            idx = self._buf.find(_THINK_CLOSE)
+            if idx >= 0:
+                reasoning = self._buf[:idx]
+                rest = self._buf[idx + len(_THINK_CLOSE):].lstrip()
+                self._buf = ""
+                self._mode = "content"
+                content = rest
+            else:
+                keep = len(_THINK_CLOSE) - 1  # 尾部可能是被拆开的 "</thi"
+                if len(self._buf) > keep:
+                    reasoning, self._buf = self._buf[:-keep], self._buf[-keep:]
+        return content, reasoning
+
+    def flush(self) -> tuple[str, str]:
+        """流结束：把缓冲按当前模式吐出（未闭合的 <think> 整段算思维链）。"""
+        buf, self._buf = self._buf, ""
+        if self._mode == "think":
+            return "", buf
+        return buf, ""
+
+
+def strip_think(text: str) -> str:
+    """非流式结果的同口径清洗：去掉开头的 <think>…</think>。"""
+    sp = ThinkTagSplitter()
+    content, _ = sp.feed(text or "")
+    tail, _ = sp.flush()
+    return content + tail
+
+
 def build_llm(
     *,
     model: Optional[str] = None,

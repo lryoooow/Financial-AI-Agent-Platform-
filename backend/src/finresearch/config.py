@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     report_section_max_tokens: int = Field(default=480)
     report_section_max_chars: int = Field(default=420)
     report_use_llm_summary: bool = Field(default=False)
+    # v1.7.1：研究编排方式。False（默认）= 确定性编排（取数 → 撰写，零模型规划往返，
+    # 见 agents/deep/research_runner.py）；True = 交给 agent 主循环决定调用顺序
+    #（多 3 次非流式模型往返，接思考模型时每次 30–120s 静默）。标的不是规范代码时
+    # 无论此项如何都走 agent（需要 resolve_entity 理解意图）。
+    research_agent_loop: bool = Field(default=False)
     # v1.7.0 清理：context_summary_timeout_s 已删 —— 旧手写上下文摘要链路的遗留死配置，
     # 全仓零引用（对话上下文治理已移交 deepagents SummarizationMiddleware，无超时参数可配）。
 
