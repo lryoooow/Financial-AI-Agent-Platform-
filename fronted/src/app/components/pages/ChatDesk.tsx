@@ -3,6 +3,8 @@ import {
   Archive,
   ArchiveRestore,
   Bot,
+  Brain,
+  ChevronDown,
   Image as ImageIcon,
   Loader2,
   MessageSquare,
@@ -14,7 +16,7 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { api, type ChatConversation, type ChatMessage, type LlmConfig } from "../../api/client";
+import { api, isReasoningModelLike, type ChatConversation, type ChatMessage, type LlmConfig } from "../../api/client";
 import { ModelPicker } from "../ModelPicker";
 import { StructuredText } from "../../lib/markdown";
 
@@ -69,6 +71,33 @@ function Typewriter({ text, className }: { text: string; className?: string }) {
   );
 }
 
+/** v1.7.0：思维链折叠面板（仅流式期间的瞬态展示——不进 messages、不落库）。
+ *  端点不流式思维链（o 系风格）时无 reasoning 文本，此面板不出现，退回打字机动效。 */
+function ThinkingPanel({ text, secs, live }: { text: string; secs: number; live: boolean }) {
+  const [open, setOpen] = useState(false);
+  const preview = text.length > 80 ? "…" + text.slice(-80) : text;
+  return (
+    <div className="mb-2 rounded-lg border border-border/60 bg-secondary/30">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground"
+        title={open ? "收起思考过程" : "展开思考过程"}
+      >
+        <Brain className={`size-3 shrink-0 ${live ? "text-gold animate-pulse" : ""}`} />
+        <span className="shrink-0">{live ? "思考中" : "已思考"} {secs}s</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground/60">{preview}</span>
+        <ChevronDown className={`size-3 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-border/40 px-2.5 pb-2 pt-1.5 text-[11px] leading-relaxed text-muted-foreground/80">
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface ActiveModel { provider: string; model: string; accent: string; }
 
 export function ChatDesk({
@@ -88,6 +117,10 @@ export function ChatDesk({
   const [showArchived, setShowArchived] = useState(false);
   const [stage, setStage] = useState("");
   const [streamingId, setStreamingId] = useState<string | null>(null);
+  // v1.7.0：思维链瞬态展示（reasoning SSE）——不进 messages、不落库，流结束即清。
+  const [reasoning, setReasoning] = useState("");          // CoT 文本（尾部 6000 字截断，防长 CoT 撑爆渲染）
+  const [thinkSecs, setThinkSecs] = useState(0);           // 已等待秒数
+  const [reasoningLive, setReasoningLive] = useState(false); // CoT 仍在更新（多轮工具调用间复现面板）
   const scrollRef = useRef<HTMLDivElement>(null);
   // v1.6.0（审计 C1）：会话守卫与流控制。
   // activeConvIdRef —— 流回调据此判断"用户是否已切走"，防止旧流 onDone 覆盖新会话；
@@ -218,8 +251,20 @@ export function ChatDesk({
       { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
     ]);
     setStreamingId(assistantId);
+    // v1.7.0：思维链面板三态复位（新一轮发送）
+    setReasoning("");
+    setThinkSecs(0);
+    setReasoningLive(false);
     // v1.6.3（D2）：真「无输出」看门狗（活动刷新），且仅在本会话前台可见时才计时 ——
     // 页面隐藏/用户切到其他会话时暂停计时（后台流不应被误杀），回前台重置基准。
+    // v1.6.5：超时按模型档位缩放。思考型模型（显式档位或名字命中推理模式）在思维链
+    // 期间 agent 流无任何事件（stage/token 都在模型调用边界才发），90s 会把合法的
+    // 深度思考流拦腰杀掉。普通模型 120s 与后端读超时对齐（真挂死时后端报错先到），
+    // 思考模型 330s 略高于后端 300s 读超时，只兜完全静默的死连接。
+    // 已知边界：llm 为 null（仅环境变量配模型、Settings 未配的部署）时按普通档
+    // 120s 处理——该形态前端无从感知模型名，可接受（1.6.4 前统一 90s，仍是改善）。
+    const deepThink = !!llm?.reasoning_effort || isReasoningModelLike(llm?.model || "");
+    const watchdogMs = deepThink ? 330_000 : 120_000;
     const ac = new AbortController();
     stopRef.current = ac;
     let lastAct = Date.now();
@@ -227,13 +272,15 @@ export function ChatDesk({
     const isStale = () => convId !== "" && activeConvIdRef.current !== convId;
     const watchdog = window.setInterval(() => {
       if (document.hidden || isStale()) return; // 后台/切走：暂停看门狗
-      if (Date.now() - lastAct > 90_000) {
+      if (Date.now() - lastAct > watchdogMs) {
         window.clearInterval(watchdog);
         ac.abort(new Error("模型长时间无输出"));
       }
     }, 5_000);
     const onVisible = () => { if (!document.hidden) lastAct = Date.now(); };
     document.addEventListener("visibilitychange", onVisible);
+    // v1.7.0：已等待秒数计时（与看门狗同生命周期，finally 统一清理）
+    const thinkTimer = window.setInterval(() => setThinkSecs((s) => s + 1), 1_000);
     try {
       let conv = current;
       if (!conv) {
@@ -250,9 +297,17 @@ export function ChatDesk({
           lastAct = Date.now();
           setStage(label);
         },
+        onReasoning: (piece) => {
+          if (isStale()) return;
+          // 思维链活跃 = 真实的看门狗续命信号（比 stage 心跳更强的证据），且面板置 live
+          lastAct = Date.now();
+          setReasoningLive(true);
+          setReasoning((r) => (r + piece).slice(-6000));
+        },
         onToken: (piece) => {
           if (isStale()) return;
           lastAct = Date.now();
+          setReasoningLive(false); // 正文开始流：折叠思考面板（下一轮工具调用的 CoT 会再点亮）
           setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
         },
         onDone: (payload) => {
@@ -283,10 +338,15 @@ export function ChatDesk({
       setStreamingId(null);
     } finally {
       window.clearInterval(watchdog);
+      window.clearInterval(thinkTimer);
       document.removeEventListener("visibilitychange", onVisible);
       if (stopRef.current === ac) stopRef.current = null;
       setLoading(false);
       setStage("");
+      // 思维链面板随流结束清空（done/error/中止/看门狗统一走这里）
+      setReasoning("");
+      setThinkSecs(0);
+      setReasoningLive(false);
     }
   }
 
@@ -423,7 +483,12 @@ export function ChatDesk({
                   m.role === "user" ? "bg-gold text-[#17140a]" : "bg-secondary/50 text-foreground/90"
                 }`}>
                   {m.role === "assistant" ? (
-                    showThinking ? (
+                    <>
+                      {/* v1.7.0：思维链面板——正文未出或新一轮 CoT 进行中时显示（带已等待秒数） */}
+                      {isStreaming && reasoning && (showThinking || reasoningLive) && (
+                        <ThinkingPanel text={reasoning} secs={thinkSecs} live={reasoningLive} />
+                      )}
+                      {showThinking ? (
                       <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
                         <Sparkles className="size-3.5 text-gold animate-pulse" />
                         <Typewriter text={stage || "正在思考"} className="text-foreground/80" />
@@ -440,7 +505,8 @@ export function ChatDesk({
                           <span className="inline-block w-1.5 h-4 -mb-0.5 ml-0.5 bg-gold animate-pulse rounded-sm align-middle" />
                         )}
                       </>
-                    )
+                    )}
+                    </>
                   ) : (
                     <>
                       {m.content && <span className="whitespace-pre-wrap">{m.content}</span>}

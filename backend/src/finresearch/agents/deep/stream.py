@@ -171,6 +171,14 @@ async def stream_agent_sse(
                     yield sse.ev_tool_call(name, tool_label(name), "start"), ""
                     yield sse.ev_chat_stage("tool", tool_label(name)), ""
 
+            # v1.7.0：思维链增量透出（ReasoningChatOpenAI 补回的 delta.reasoning_content）。
+            # 受 emit_tokens 约束（研究链路不发，避免污染研究 SSE）；二元组第二位恒空 →
+            # 不累计落库、不过合规闸（reasoning 不是交付答案）。工具调用轮的 CoT 同样透出
+            # ——用户能看到"为什么去调工具"。
+            rc = (getattr(msg, "additional_kwargs", {}) or {}).get("reasoning_content")
+            if isinstance(rc, str) and rc and emit_tokens:
+                yield sse.ev_reasoning(rc), ""
+
             piece = _extract_text(msg)
             if piece and emit_tokens:
                 yield sse.ev_token(piece), piece

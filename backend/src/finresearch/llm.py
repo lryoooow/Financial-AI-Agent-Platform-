@@ -21,6 +21,7 @@ import logging
 import re
 from typing import Optional
 
+from langchain_core.messages import AIMessageChunk
 from langchain_openai import ChatOpenAI
 
 from .config import settings
@@ -29,9 +30,11 @@ logger = logging.getLogger(__name__)
 
 # ── temperature 三层智能解析 ──────────────────────────────────────────
 # 第一层：推理模型（拒绝非默认 temperature，必须 1.0）
-# o1/o3/o4-mini、QwQ、DeepSeek-R1、reasoning、rt 系等
+# o1/o3/o4-mini、QwQ、DeepSeek-R1、reasoning、rt 系等；
+# v1.6.5 补 thinking —— 中转站常以 *-thinking 后缀暴露思考模型（gemini-3-pro-thinking、
+# qwen3-thinking），且这类名字几乎从不命中其余模式（自定义模型名不受厂商命名约束）。
 _REASONING_PATTERNS = re.compile(
-    r"(?:\bo[134](?:-|\b)|qwq|deepseek-r|reasoning|\brt\b)", re.IGNORECASE
+    r"(?:\bo[134](?:-|\b)|qwq|deepseek-r|reasoning|\brt\b|thinking)", re.IGNORECASE
 )
 
 # 第二层：Kimi / Moonshot —— API 强制 temperature=1，传 0.7 会 400
@@ -82,6 +85,20 @@ def is_reasoning_model(model: str) -> bool:
     return bool(_REASONING_PATTERNS.search(model or ""))
 
 
+# ── 思考深度档位（v1.6.5）──────────────────────────────────────────────
+# OpenAI 兼容的 reasoning_effort 参数（one-api/new-api 等中转站普遍透传，各家端点
+# 自行映射：OpenAI o 系/gpt-5 原生、Gemini 端映射 thinkingBudget、Anthropic 端映射
+# thinking.budget_tokens）。仅当用户在 Settings 显式选择档位时才下发——乱值/未设置
+# 一律不发（部分严格端点会对未知参数 400，宁可不生效也不能发错）。
+REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+
+
+def reasoning_effort_of(override: Optional[dict]) -> str:
+    """从 override（前端所选配置）提取合法思考深度；未设置/非法值返回空串。"""
+    effort = str(((override or {}).get("reasoning_effort") or "")).strip().lower()
+    return effort if effort in REASONING_EFFORTS else ""
+
+
 def _resolve(override: Optional[dict]):
     """返回 (api_key, base_url, model) 或 None（无可用于认证的 key）。override 优先。"""
     if override and (override.get("api_key") or "").strip():
@@ -109,6 +126,43 @@ def llm_available(override: Optional[dict] = None) -> bool:
     return _resolve(override) is not None
 
 
+class ReasoningChatOpenAI(ChatOpenAI):
+    """流式时保留 OpenAI 兼容端点的思维链增量（delta.reasoning_content）。
+
+    langchain-openai（1.6.0 与 1.3.3，两版该函数签名与逻辑同形）的
+    _convert_delta_to_message_chunk 只提 function_call/tool_calls 进
+    additional_kwargs，reasoning_content 在 delta→chunk 转换时被静默丢弃
+    ——字段本身还在（openai SDK 层 model_config extra="allow"，model_dump()
+    里有），只是转换层不开门。此处补进 gen.message.additional_kwargs：
+    - langchain_core 一等支持该键（_extract_reasoning_from_additional_kwargs，
+      注释点名 DeepSeek/Ollama/XAI/Groq），AIMessageChunk 合并时字符串拼接；
+    - _convert_message_to_dict 回传白名单不含它 → 历史/checkpointer 里带着
+      CoT 也不会被发回 API（回传安全，有测试锁定）。
+    仅供流式（streaming=True）；非流式走 _create_chat_result，本重写是 no-op。
+    """
+
+    def _convert_chunk_to_generation_chunk(  # noqa: D102（签名与 1.6.0/1.3.3 逐参一致）
+        self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
+    ):
+        gen = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        try:
+            choices = chunk.get("choices") or []
+            delta = choices[0].get("delta") if choices else None
+            rc = (delta or {}).get("reasoning_content")
+        except Exception:  # noqa: BLE001  chunk 形状异常：宁丢思维链不炸流
+            rc = None
+        if not isinstance(rc, str) or not rc:
+            return gen  # 无思维链：原样返回（含 gen=None 的 beta 流 / usage-only 尾 chunk）
+        msg = getattr(gen, "message", None)
+        if isinstance(msg, AIMessageChunk):
+            # chunk 内新建的 message 对象，原地写安全；分段到达时拼接
+            prev = msg.additional_kwargs.get("reasoning_content") or ""
+            msg.additional_kwargs["reasoning_content"] = prev + rc
+        return gen
+
+
 def build_llm(
     *,
     model: Optional[str] = None,
@@ -126,6 +180,13 @@ def build_llm(
     v1.6.0（审计 B11）：默认 timeout=120s / max_retries=1。此前不传时 openai 客户端
     默认 600s 总超时 + 2 次重试 —— 厂商挂起时对话流可卡 10 分钟且 SSE 无任何产出。
     120s 是 read 超时（两次字节之间的间隔上限），长回复流式不受影响。
+
+    v1.6.5（思考深度档位）：override 带合法 reasoning_effort 时 ——
+    - extra_body 透传该参数（显式选择才发，默认不传）；
+    - temperature 强制 1.0（思考型 API 拒绝非默认温度，白名单不得再命中 0.7）；
+    - 读超时放宽到 ≥300s：思维链不流式的端点首字节可能数分钟不出，
+      120s 会错杀 + max_retries 重试一遍 = 双倍等待后失败。名字命中思考模型
+      （is_reasoning_model，含 *-thinking）同样放宽超时，即使没选档位。
     """
     resolved = _resolve(override)
     if resolved is None:
@@ -133,22 +194,38 @@ def build_llm(
         return None
     api_key, base_url, fallback_model = resolved
     used_model = model or fallback_model
+    effort = reasoning_effort_of(override)
     if temperature is None:
-        temperature = _resolve_temperature(used_model)
-    return ChatOpenAI(
-        model=used_model,
-        temperature=temperature,
-        streaming=streaming,
-        max_tokens=max_tokens,
-        base_url=base_url,
-        api_key=api_key,
-        timeout=timeout,
-        max_retries=max_retries,
-    )
+        temperature = 1.0 if effort else _resolve_temperature(used_model)
+    if effort or is_reasoning_model(used_model):
+        timeout = max(float(timeout), 300.0)
+    kwargs: dict = {
+        "model": used_model,
+        "temperature": temperature,
+        "streaming": streaming,
+        "max_tokens": max_tokens,
+        "base_url": base_url,
+        "api_key": api_key,
+        "timeout": timeout,
+        "max_retries": max_retries,
+    }
+    if effort:
+        kwargs["extra_body"] = {"reasoning_effort": effort}
+    # v1.7.0：换 ReasoningChatOpenAI —— 流式补回 delta.reasoning_content（思维链透出）。
+    # 非流式调用（streaming=False）该子类与 ChatOpenAI 行为完全一致（重写是 no-op）。
+    return ReasoningChatOpenAI(**kwargs)
 
 
 def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
-    """图表速读 LLM（便宜/快速档）；override 优先（含其 model）；无配置返回 None。"""
+    """图表速读 LLM（便宜/快速档）；override 优先（含其 model）；无配置返回 None。
+
+    v1.6.5：思考型模型（显式档位或名字命中推理模式）读超时同样放宽到 ≥300s。
+    根因：该构造器还承担研究链路主循环的轻量档（research_agent.loop_model——
+    未单独配轻量档时即用户所选模型），120s 会在思维链静默期杀掉规划调用并让整个
+    研究任务失败，而同一模型的分段撰写（build_llm 路径）已是 300s。速读场景前端
+    按悬停点随时 abort（useChartAI），放宽不会拖住 UI；reasoning_effort 参数本身
+    仍不下发——速读要快，不主动要思考。
+    """
     resolved = _resolve(override)
     if resolved is None:
         return None
@@ -157,6 +234,9 @@ def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
     # 旧实现先取全局 chart_model（其默认值永远是 deepseek-chat），会把 Moonshot 的
     # URL/Key 与 DeepSeek 模型拼在一起，稳定触发 404。
     model = ((override or {}).get("model") or "").strip() or settings.chart_model or fallback
+    timeout = 120.0
+    if reasoning_effort_of(override) or is_reasoning_model(model):
+        timeout = max(timeout, 300.0)
     return ChatOpenAI(
         model=model,
         temperature=_resolve_temperature(model),
@@ -164,7 +244,7 @@ def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
         base_url=base_url,
         api_key=api_key,
         # v1.6.3（D3）：与 build_llm 同款加固（此前 chart 速读仍是 openai 默认 600s+2 重试）
-        timeout=120.0,
+        timeout=timeout,
         max_retries=1,
     )
 

@@ -60,6 +60,8 @@ def test_llm_default_timeout_and_retries(monkeypatch):
             captured.update(kwargs)
 
     monkeypatch.setattr(llm_mod, "ChatOpenAI", _FakeChatOpenAI)
+    # v1.7.0：build_llm 改构造 ReasoningChatOpenAI（思维链透出子类），一并替换捕获
+    monkeypatch.setattr(llm_mod, "ReasoningChatOpenAI", _FakeChatOpenAI)
     llm_mod.build_llm(override={"api_key": "k", "model": "m", "base_url": "http://x"})
     assert captured["timeout"] == 120.0, "此前 openai 客户端默认 600s 总超时"
     assert captured["max_retries"] == 1

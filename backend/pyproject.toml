@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finresearch"
-version = "1.6.3"
+version = "1.7.0"
 description = "景渊 JingYuan · 家用本地金融研究助手后端（akshare + LangGraph 固定管线）"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -11,6 +11,7 @@
 5. create_research 的 30s pending 复用窗口（时区修复后东八区生效）
 6. 对话合规闸：禁用词命中即截断 + 落库带提示
 7. 同会话并发守卫 409
+8. _active_llm_cfg：自定义端点空 baseUrl 视为未配置（v1.6.4）
 """
 import asyncio
 import os
@@ -267,6 +268,54 @@ async def t_active_llm_cfg_none_when_unconfigured():
     check(cfg is None, "无激活配置时 _active_llm_cfg 返回 None")
 
 
+async def t_active_llm_cfg_empty_base_url_is_none():
+    """v1.6.4：自定义/中转站漏填 Base URL 时 _active_llm_cfg 返回 None。
+
+    否则空 base_url 经 llm._resolve 回退到官方 DeepSeek 端点，拼成
+    「官方 URL + 中转 key」的必 401 组合（前端 ModelPicker 有同款守卫，此处后端兜底）。
+    """
+    await put_local_setting("active-model", LocalSettingRequest(payload={
+        "providerId": "custom", "modelId": "gpt-4o",
+        "provider": "自定义 / 中转站", "model": "gpt-4o", "accent": "#2dd4bf",
+    }))
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "custom": {"baseUrl": "", "apiKey": "sk-relay-key-123456",
+                   "selectedModel": "gpt-4o",
+                   "models": [{"id": "gpt-4o", "label": "gpt-4o", "context": "", "tag": "手动"}]},
+    }))
+    cfg = await routes._active_llm_cfg()
+    check(cfg is None, "baseUrl 为空时 _active_llm_cfg 返回 None（不拼官方端点+中转 key）")
+
+    # 填上 URL 后恢复正常三元组（验证不是误伤自定义供应商本身）；
+    # 顺带锁 v1.6.5：model-configs 的 reasoningEffort（camelCase）→ 输出 reasoning_effort
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "custom": {"baseUrl": "https://relay.example.com/v1",
+                   "apiKey": "sk-relay-key-123456", "selectedModel": "gpt-4o",
+                   "reasoningEffort": "high"},
+    }))
+    cfg = await routes._active_llm_cfg()
+    check(cfg == {"base_url": "https://relay.example.com/v1",
+                  "api_key": "sk-relay-key-123456", "model": "gpt-4o",
+                  "reasoning_effort": "high"},
+          f"填 URL 后自定义端点返回精确三元组+档位（实际 {cfg}）")
+
+    # 乱档位不透出（严格端点对未知参数 400，宁可不发）
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "custom": {"baseUrl": "https://relay.example.com/v1",
+                   "apiKey": "sk-relay-key-123456", "selectedModel": "gpt-4o",
+                   "reasoningEffort": "ultra"},
+    }))
+    cfg = await routes._active_llm_cfg()
+    check("reasoning_effort" not in (cfg or {}),
+          f"非法档位不得透出 reasoning_effort（实际 {cfg}）")
+
+    # 清场：后续用例会自己写入这两行，但显式清理对用例顺序变化更稳
+    async with session_scope() as s:
+        await s.execute(delete(LocalSetting).where(
+            LocalSetting.key.in_(["active-model", "model-configs"])))
+        await s.commit()
+
+
 async def t_overlay_current_key_wins_over_stale_cache():
     """v1.6.2 用户实测场景：应用开着换 key，前端 req.llm 带的是挂载时缓存的旧 key
     （…ebf8, 401）而 Settings 已是新 key（…8f9f, 有效）——同供应商必须 DB 优先。"""
@@ -425,6 +474,7 @@ async def main() -> None:
         await t_chat_compliance_gate_and_guard()
         await t_active_llm_fallback_overrides_stale_conv_config()
         await t_active_llm_cfg_none_when_unconfigured()
+        await t_active_llm_cfg_empty_base_url_is_none()
         await t_overlay_current_key_wins_over_stale_cache()
         await t_overlay_no_active_model_full_table_fallback()
         await t_cancel_persist_real_cancellation_semantics()

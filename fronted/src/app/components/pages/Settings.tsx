@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag } from "lucide-react";
+import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag, Plus, X, Gauge } from "lucide-react";
 import { PROVIDERS, type Provider, type ModelInfo, type Region } from "../../data/providers";
 import { api, type UserProfile } from "../../api/client";
 
 type Status = "idle" | "testing" | "connected" | "error";
-interface Cfg { baseUrl: string; apiKey: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
+interface Cfg { baseUrl: string; apiKey: string; reasoningEffort: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
 
 interface Props {
   active: { providerId: string; modelId: string } | null;
@@ -18,16 +18,19 @@ export function Settings({ active, onActivate }: Props) {
     const saved: Record<string, any> = (() => { try { return JSON.parse(localStorage.getItem("finresearch_keys") || "{}"); } catch { return {}; } })();
     return Object.fromEntries(PROVIDERS.map((p) => {
       const s = saved[p.id] || {};
-      const savedModels = Array.isArray(s.models) ? s.models : [];
+      // v1.6.4：区分「从未保存过清单」（回退预置）与「保存过但被删空」（尊重空清单，
+      // 否则预设厂商删光模型后静态清单立即"复活"，删除形同虚设）
+      const models = Array.isArray(s.models) ? s.models : p.models;
       const selectedModel = s.selectedModel || "";
       const hasUsableConfig = Boolean((s.apiKey || "").trim() && selectedModel);
       return [p.id, {
         baseUrl: s.baseUrl || p.baseUrl,
         apiKey: s.apiKey || "",
+        reasoningEffort: s.reasoningEffort || "",
         status: hasUsableConfig ? "connected" as Status : "idle" as Status,
         latency: 0,
         message: hasUsableConfig ? "已保存配置" : "",
-        models: savedModels.length ? savedModels : p.models,
+        models,
         fetching: false,
         selectedModel,
       }];
@@ -43,16 +46,18 @@ export function Settings({ active, onActivate }: Props) {
         const saved = r.payload as Record<string, any>;
         setConfigs(Object.fromEntries(PROVIDERS.map((p) => {
           const s = saved[p.id] || {};
-          const savedModels = Array.isArray(s.models) ? s.models : [];
+          // v1.6.4：同上 —— 保存过的空清单不被预置清单复活
+          const models = Array.isArray(s.models) ? s.models : p.models;
           const selectedModel = s.selectedModel || "";
           const hasUsableConfig = Boolean((s.apiKey || "").trim() && selectedModel);
           return [p.id, {
             baseUrl: s.baseUrl || p.baseUrl,
             apiKey: s.apiKey || "",
+            reasoningEffort: s.reasoningEffort || "",
             status: hasUsableConfig ? "connected" as Status : "idle" as Status,
             latency: 0,
             message: hasUsableConfig ? "已从本地恢复配置" : "",
-            models: savedModels.length ? savedModels : p.models,
+            models,
             fetching: false,
             selectedModel,
           }];
@@ -68,6 +73,7 @@ export function Settings({ active, onActivate }: Props) {
     const toSave = Object.fromEntries(Object.entries(configs).map(([id, c]) => [id, {
       baseUrl: c.baseUrl,
       apiKey: c.apiKey,
+      reasoningEffort: c.reasoningEffort,
       selectedModel: c.selectedModel,
       models: c.models,
     }]));
@@ -88,6 +94,37 @@ export function Settings({ active, onActivate }: Props) {
   }, [configs]);
   // v1.6.3（C1）：保存失败横幅（用户再编辑任一配置时清除）
   const [saveError, setSaveError] = useState("");
+  // v1.7.0：合并 ModelPicker 快捷切档的外部写入。评审实证：App 的四个页面**常驻挂载**
+  //（hidden 切页，非互斥卸载）——聊天页下拉切了思考深度后，本组件内存里的
+  // reasoningEffort 仍是挂载时的旧值，用户再到设置页编辑任一字段就会整份回写、
+  // 把档位静默覆盖回去。监听 configs-updated 只合并 reasoningEffort 字段；
+  // 等值时返回原引用防广播回环（自己的保存也会触发本监听）。
+  useEffect(() => {
+    const mergeExternalEffort = () => {
+      let saved: Record<string, any>;
+      try {
+        saved = JSON.parse(localStorage.getItem("finresearch_keys") || "{}");
+      } catch {
+        return;
+      }
+      setConfigs((c) => {
+        let changed = false;
+        const next: Record<string, Cfg> = { ...c };
+        for (const [id, rec] of Object.entries(saved)) {
+          const cur = next[id];
+          if (!cur) continue;
+          const eff = (rec as any)?.reasoningEffort ?? "";
+          if (cur.reasoningEffort !== eff) {
+            next[id] = { ...cur, reasoningEffort: eff };
+            changed = true;
+          }
+        }
+        return changed ? next : c;
+      });
+    };
+    window.addEventListener("finresearch:configs-updated", mergeExternalEffort);
+    return () => window.removeEventListener("finresearch:configs-updated", mergeExternalEffort);
+  }, []);
   // v1.6.0（审计 C4）：selectedId 兜底 —— 存量记录里的 providerId 不在清单时回落首个，
   // 否则 configs[selectedId] 为 undefined，下方 value={cfg.baseUrl} 直接 TypeError 白屏
   const [selectedId, setSelectedId] = useState(
@@ -141,6 +178,8 @@ export function Settings({ active, onActivate }: Props) {
     // v1.6.0（审计 C3）：真连通测试 —— 此前是 sleep(1100) + 长度≥8 判成功、
     // 延迟用 Math.random() 伪造的假测试，乱码 key 也显示「连接成功 · 347ms」。
     // 现在走后端 /api/models 真拉厂商模型列表，延迟为实测。
+    // v1.6.4：自定义/中转站无预置 URL —— 空地址直接前置拦截（否则后端拼出 "/models" 相对地址必失败）。
+    if (!cfg.baseUrl.trim()) { patch(selectedId, { status: "error", message: "请先填入 Base URL" }); return; }
     if (!cfg.apiKey.trim()) { patch(selectedId, { status: "error", message: "请先填入 API Key" }); return; }
     patch(selectedId, { status: "testing", message: "" });
     const t0 = performance.now();
@@ -157,6 +196,7 @@ export function Settings({ active, onActivate }: Props) {
   }
 
   async function fetchModels() {
+    if (!cfg.baseUrl.trim()) { patch(selectedId, { status: "error", message: "请先填入 Base URL" }); return; }
     if (!cfg.apiKey.trim()) { patch(selectedId, { status: "error", message: "请先填入 API Key" }); return; }
     patch(selectedId, { fetching: true });
     try {
@@ -166,20 +206,53 @@ export function Settings({ active, onActivate }: Props) {
       patch(selectedId, {
         fetching: false,
         models,
-        selectedModel: cfg.selectedModel || models[0]?.id || "",
+        // v1.6.4：实拉会整体替换清单 —— 旧 selectedModel（如手动加的模型）不在新清单时
+        // 回退首选，否则「设为当前推理模型」按钮踩 find() undefined
+        selectedModel: cfg.selectedModel && models.some((m) => m.id === cfg.selectedModel)
+          ? cfg.selectedModel
+          : models[0]?.id || "",
         status: "connected",
-        message: live.length ? "已拉取最新模型" : "使用内置模型清单",
+        // v1.6.4：自定义端点无内置清单可兜底 —— 提示改为引导手动添加
+        message: live.length ? "已拉取最新模型" : provider.models.length ? "使用内置模型清单" : "该端点未返回模型，可在下方手动添加",
       });
     } catch {
       // 厂商 /models 拉取失败 → 回退静态清单（已是 2026-07 当前线）
+      const models = cfg.models.length ? cfg.models : provider.models;
       patch(selectedId, {
         fetching: false,
-        models: cfg.models.length ? cfg.models : provider.models,
-        selectedModel: cfg.selectedModel || provider.models[0]?.id || "",
+        models,
+        selectedModel: cfg.selectedModel && models.some((m) => m.id === cfg.selectedModel)
+          ? cfg.selectedModel
+          : models[0]?.id || "",
         status: "connected",
-        message: "模型接口不可用，使用已保存/内置清单",
+        message: cfg.models.length || provider.models.length
+          ? "模型接口不可用，使用已保存/内置清单"
+          : "模型接口不可用，可在下方手动添加模型",
       });
     }
+  }
+
+  // v1.6.4：手动模型管理（中转站主路径 —— 模型名千奇百怪，/v1/models 也不一定开）
+  const [newModelId, setNewModelId] = useState("");
+  function addManualModel() {
+    const id = newModelId.trim();
+    if (!id) return;
+    if (cfg.models.some((m) => m.id === id)) {
+      // 已存在：不重复添加，只补选中（可能是实拉过但没点选的）
+      patch(selectedId, { selectedModel: cfg.selectedModel || id });
+      setNewModelId("");
+      return;
+    }
+    const models = [...cfg.models, { id, label: id, context: "", tag: "手动" }];
+    // 首个手动添加的模型直接选中（「设为当前推理模型」按钮依赖 selectedModel 非空）
+    patch(selectedId, { models, selectedModel: cfg.selectedModel || id });
+    setNewModelId("");
+  }
+  function removeModel(id: string) {
+    patch(selectedId, {
+      models: cfg.models.filter((m) => m.id !== id),
+      selectedModel: cfg.selectedModel === id ? "" : cfg.selectedModel,
+    });
   }
 
   const list = useMemo(() => PROVIDERS.filter((p) => regionFilter === "all" || p.region === regionFilter), [regionFilter]);
@@ -233,7 +306,7 @@ export function Settings({ active, onActivate }: Props) {
               <div>
                 <div className="flex items-center gap-2">
                   <h1 className="font-display" style={{ fontSize: 20, fontWeight: 600 }}>{provider.name}</h1>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">{provider.region === "domestic" ? "国内" : "国外"} · OpenAI 兼容</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">{provider.region === "custom" ? "自定义" : provider.region === "domestic" ? "国内" : "国外"} · OpenAI 兼容</span>
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">{provider.docsHint}</p>
               </div>
@@ -241,8 +314,43 @@ export function Settings({ active, onActivate }: Props) {
 
             {/* Base URL */}
             <div className="mt-6">
-              <label className="text-xs text-muted-foreground flex items-center gap-1.5 mb-1.5"><Link2 className="size-3.5" /> Base URL（已预置，可修改）</label>
-              <input value={cfg.baseUrl} onChange={(e) => patch(selectedId, { baseUrl: e.target.value })} className="w-full rounded-lg bg-input border border-border px-3 py-2.5 text-sm font-mono outline-none focus:border-gold/40 transition-colors" spellCheck={false} />
+              <label className="text-xs text-muted-foreground flex items-center gap-1.5 mb-1.5">
+                <Link2 className="size-3.5" />
+                {provider.baseUrl ? "Base URL（已预置，可修改）" : "Base URL（必填 · 中转站/自建网关端点，一般以 /v1 结尾）"}
+              </label>
+              <input
+                value={cfg.baseUrl}
+                onChange={(e) => patch(selectedId, { baseUrl: e.target.value })}
+                placeholder={provider.baseUrl ? "" : "https://your-relay.example.com/v1"}
+                className="w-full rounded-lg bg-input border border-border px-3 py-2.5 text-sm font-mono outline-none focus:border-gold/40 transition-colors placeholder:text-muted-foreground/70"
+                spellCheck={false}
+              />
+            </div>
+
+            {/* 思考深度（v1.6.5）：中转站在服务端配了不同思考深度时，这里选档位下发 */}
+            <div className="mt-4">
+              <label className="text-xs text-muted-foreground flex items-center gap-1.5 mb-1.5">
+                <Gauge className="size-3.5" /> 思考深度（推理模型；默认不发参数）
+              </label>
+              <div className="flex gap-1.5">
+                {([["", "默认"], ["low", "低"], ["medium", "中"], ["high", "高"]] as const).map(([v, label]) => {
+                  const chosen = (cfg.reasoningEffort || "") === v;
+                  return (
+                    <button
+                      key={v || "default"}
+                      type="button"
+                      onClick={() => patch(selectedId, { reasoningEffort: v })}
+                      className={`flex-1 rounded-lg border py-1.5 text-xs transition-all ${chosen ? "border-gold bg-accent text-gold" : "border-border bg-secondary/30 text-foreground/85 hover:border-border/70"}`}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10.5px] text-muted-foreground/70 mt-1.5">
+                低 = 回复更快，高 = 复杂问题更准。以 reasoning_effort 参数下发（端点需支持/透传）；
+                选了档位或模型名含 thinking 等推理标识时，本软件会同步放宽超时与 token 上限，避免思考被误判超时。
+              </p>
             </div>
 
             {/* API Key */}
@@ -334,7 +442,7 @@ export function Settings({ active, onActivate }: Props) {
 
               {cfg.models.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border py-8 text-center text-xs text-muted-foreground">
-                  {cfg.apiKey.trim() ? "点击「拉取最新模型」获取列表，或使用内置模型清单" : "请先填入 API Key"}
+                  {cfg.apiKey.trim() ? "点击「拉取最新模型」获取列表，或在下方手动添加模型" : "请先填入 API Key"}
                 </div>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -347,11 +455,21 @@ export function Settings({ active, onActivate }: Props) {
                         animate={{ opacity: 1, y: 0 }}
                         transition={{ delay: i * 0.05 }}
                         onClick={() => patch(selectedId, { selectedModel: m.id })}
-                        className={`text-left p-3 rounded-lg border transition-all ${chosen ? "border-gold bg-accent" : "border-border hover:border-border/70 bg-secondary/30"}`}
+                        className={`group relative text-left p-3 rounded-lg border transition-all ${chosen ? "border-gold bg-accent" : "border-border hover:border-border/70 bg-secondary/30"}`}
                       >
                         <div className="flex items-center justify-between">
                           <span className={`text-sm ${chosen ? "text-gold" : "text-foreground/90"}`}>{m.label}</span>
                           {chosen && <Check className="size-4 text-gold" />}
+                          {/* v1.6.4：悬停移除（span 而非 button —— 不在 button 里嵌 button） */}
+                          {!chosen && (
+                            <span
+                              title="移除该模型"
+                              onClick={(e) => { e.stopPropagation(); removeModel(m.id); }}
+                              className="grid place-items-center size-6 -my-1 -mr-1 rounded text-muted-foreground/60 hover:text-up hover:bg-secondary opacity-0 group-hover:opacity-100 transition-all"
+                            >
+                              <X className="size-3.5" />
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-1.5 mt-1.5">
                           <span className="text-[10px] font-mono text-muted-foreground">{m.context}</span>
@@ -363,17 +481,47 @@ export function Settings({ active, onActivate }: Props) {
                 </div>
               )}
 
+              {/* v1.6.4：手动添加模型 —— 中转站主路径（模型名不规律、/v1/models 未必开放）；
+                  预设厂商同样可用（新模型未进静态清单、或 URL 已改指向中转时） */}
+              <div className="mt-3 flex items-center gap-2">
+                <input
+                  value={newModelId}
+                  onChange={(e) => setNewModelId(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") addManualModel(); }}
+                  placeholder="手动添加模型 ID，如 gpt-4o / claude-sonnet-5（按中转站的模型名填）"
+                  className="flex-1 rounded-lg bg-input border border-border px-3 py-2 text-xs font-mono outline-none focus:border-gold/40 transition-colors"
+                  spellCheck={false}
+                />
+                <button
+                  onClick={addManualModel}
+                  disabled={!newModelId.trim()}
+                  className="flex items-center gap-1 rounded-lg bg-secondary hover:bg-secondary/70 px-3 py-2 text-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Plus className="size-3.5" /> 添加
+                </button>
+              </div>
+
               <AnimatePresence>
                 {cfg.selectedModel && (
                   <motion.button
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
+                    // v1.6.4：漏填 Base URL 时禁用 —— 空地址经后端 _resolve 会拼成
+                    // 「官方 DeepSeek URL + 中转 key」的必 401 组合，不如在源头拦下
+                    disabled={!cfg.baseUrl.trim()}
+                    title={cfg.baseUrl.trim() ? undefined : "请先填入 Base URL"}
                     onClick={() => {
-                      const m = cfg.models.find((x) => x.id === cfg.selectedModel)!;
+                      // v1.6.4：去 ! 断言 —— 清单被「拉取最新模型」整体替换等场景下
+                      // selectedModel 可能已不在清单，find 回 undefined 直接崩整个应用
+                      const m = cfg.models.find((x) => x.id === cfg.selectedModel);
+                      if (!m) {
+                        patch(selectedId, { selectedModel: cfg.models[0]?.id || "" });
+                        return;
+                      }
                       onActivate({ providerId: provider.id, modelId: m.id, provider: provider.name, model: m.label, accent: provider.accent });
                     }}
-                    className="mt-4 w-full flex items-center justify-center gap-2 rounded-lg border border-gold/40 bg-accent/60 py-2.5 text-sm text-gold hover:bg-accent transition-colors overflow-hidden"
+                    className="mt-4 w-full flex items-center justify-center gap-2 rounded-lg border border-gold/40 bg-accent/60 py-2.5 text-sm text-gold hover:bg-accent transition-colors overflow-hidden disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <Star className="size-4" /> 设为当前推理模型
                   </motion.button>

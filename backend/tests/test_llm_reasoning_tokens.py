@@ -40,7 +40,7 @@ _FINS = {
 }
 
 
-def _run_section_with_model(monkeypatch, model: str) -> dict:
+def _run_section_with_model(monkeypatch, model: str, extra_cfg: dict | None = None) -> dict:
     captured = {}
 
     def fake_build_llm(**kwargs):
@@ -50,7 +50,7 @@ def _run_section_with_model(monkeypatch, model: str) -> dict:
     monkeypatch.setattr(rep, "build_llm", fake_build_llm)
     asyncio.run(rep._llm_section(
         {"template": "equity_deep", "normalized_ticker": "600519.SH",
-         "llm_config": {"base_url": "https://x", "api_key": "k", "model": model}},
+         "llm_config": {"base_url": "https://x", "api_key": "k", "model": model, **(extra_cfg or {})}},
         rep._SPEC_VALUATION,
         {"quote": _QUOTE, "fins": _FINS, "profile": {}},
     ))
@@ -73,10 +73,46 @@ def test_is_reasoning_model_patterns():
     assert is_reasoning_model("qwq-32b")
     assert is_reasoning_model("o3-mini")
     assert is_reasoning_model("QwQ-Plus")
+    # v1.6.5：中转站思考模型常见后缀
+    assert is_reasoning_model("gemini-3-pro-thinking")
+    assert is_reasoning_model("qwen3-thinking")
     assert not is_reasoning_model("deepseek-chat")
     assert not is_reasoning_model("deepseek-v4-pro")
     assert not is_reasoning_model("")
     assert not is_reasoning_model(None)
+
+
+def test_explicit_effort_enlarges_budget_even_when_name_unmatched(monkeypatch):
+    """v1.6.5：中转站模型名不命中推理模式，但用户显式选了思考档位 → 同样放宽
+    max_tokens（旧实现只认名字，480 仍被 CoT 吃满成空段回退模板）。"""
+    captured = _run_section_with_model(
+        monkeypatch, "relay-custom-model", extra_cfg={"reasoning_effort": "low"},
+    )
+    assert captured["max_tokens"] >= 4096, "显式思考档位必须与名字命中同等放宽 token 上限"
+
+
+def test_thinks_helper_covers_name_and_effort():
+    """_thinks 是超时/token 分档的唯一判据：名字命中 or 显式档位，二者其一即真。"""
+    assert rep._thinks({"llm_config": {"model": "gemini-3-pro-thinking"}})
+    assert rep._thinks({"llm_config": {"model": "relay-x", "reasoning_effort": "low"}})
+    assert not rep._thinks({"llm_config": {"model": "deepseek-chat"}})
+    assert not rep._thinks({"llm_config": {"model": "relay-x", "reasoning_effort": "ultra"}})
+
+
+def test_section_timeout_scaled_for_thinking_model(monkeypatch):
+    """锁住 v1.6.5 分段超时分档：思考型 30s×6，普通 30s（防将来改回定值回归）。"""
+    real_timeout = rep.asyncio.timeout
+    captured: dict = {}
+
+    def fake_timeout(t):
+        captured["t"] = t
+        return real_timeout(t)
+
+    monkeypatch.setattr(rep.asyncio, "timeout", fake_timeout)
+    _run_section_with_model(monkeypatch, "gemini-3-pro-thinking")
+    assert captured["t"] == rep._SECTION_TIMEOUT * rep._REASONING_TIMEOUT_FACTOR
+    _run_section_with_model(monkeypatch, "deepseek-chat")
+    assert captured["t"] == rep._SECTION_TIMEOUT
 
 
 def test_env_configured_reasoning_model_also_gets_enlarged_budget(monkeypatch):

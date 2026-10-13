@@ -115,6 +115,15 @@ export interface LlmConfig {
   base_url: string;
   api_key: string;
   model: string;
+  /** 思考深度档位（low/medium/high）：仅用户在 Settings 显式选择时携带；空则不下发。 */
+  reasoning_effort?: string;
+}
+
+/** 与后端 llm.py _REASONING_PATTERNS 口径一致的客户端镜像。
+ *  仅供前端"看门狗档位"这类粗判使用（o 系/qwq/deepseek-r/reasoning/rt/thinking）；
+ *  真正的 temperature/超时/参数下发决策一律在后端，勿在此扩展业务逻辑。 */
+export function isReasoningModelLike(model: string): boolean {
+  return /(?:\bo[134](?:-|\b)|qwq|deepseek-r|reasoning|\brt\b|thinking)/i.test(model || "");
 }
 
 export interface ChatMessage {
@@ -417,6 +426,8 @@ export const api = {
     images: string[] | undefined,
     handlers: {
       onStage?: (stage: string, label: string) => void;
+      /** v1.7.0：思维链增量（reasoning_content 透出）；纯瞬态展示，不计入对话内容 */
+      onReasoning?: (text: string) => void;
       onToken?: (text: string) => void;
       onDone?: (payload: ChatPayload) => void;
       onError?: (message: string) => void;
@@ -454,6 +465,7 @@ export const api = {
         let ev: any;
         try { ev = JSON.parse(line.slice(6)); } catch { continue; }
         if (ev.type === "stage") handlers.onStage?.(ev.stage, ev.label);
+        else if (ev.type === "reasoning") handlers.onReasoning?.(ev.text);
         else if (ev.type === "token") handlers.onToken?.(ev.text);
         else if (ev.type === "done") handlers.onDone?.(ev as ChatPayload);
         else if (ev.type === "error") handlers.onError?.(ev.message);

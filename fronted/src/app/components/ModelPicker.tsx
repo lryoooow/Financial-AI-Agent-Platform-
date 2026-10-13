@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Cpu, Settings2 } from "lucide-react";
+import { Check, ChevronDown, Cpu, Gauge, Settings2 } from "lucide-react";
 import { PROVIDERS } from "../data/providers";
 import { api, type LlmConfig } from "../api/client";
 
@@ -30,13 +30,37 @@ function readSaved(): Record<string, any> {
   }
 }
 
+// v1.7.0：思考深度档位快捷切换（低 = 回复更快的直控开关）。
+const EFFORT_LEVELS: [string, string][] = [["", "默认"], ["low", "低"], ["medium", "中"], ["high", "高"]];
+const EFFORT_LABELS: Record<string, string> = { low: "低", medium: "中", high: "高" };
+
+/** 读-改-写【整份】finresearch_keys 的该 provider 记录（保留 baseUrl/apiKey/models/
+ *  selectedModel 等既有字段），写 localStorage + 广播 + PUT 后端。
+ *  广播即刷新：本实例经 configs-updated → loadPickerOptions → options 新引用 →
+ *  既有 effect 自动用带新 reasoning_effort 的 llm 重发 onChange（下一条消息生效）。 */
+function persistReasoningEffort(providerId: string, effort: string): Promise<unknown> {
+  const saved = readSaved();
+  const rec = saved[providerId] || {};
+  saved[providerId] = { ...rec, reasoningEffort: effort };
+  try {
+    localStorage.setItem("finresearch_keys", JSON.stringify(saved));
+  } catch { /* 存不进就只走后端 */ }
+  window.dispatchEvent(new CustomEvent("finresearch:configs-updated"));
+  return api.saveLocalSetting("model-configs", saved);
+}
+
 export function loadPickerOptions(): PickerOption[] {
   const saved = readSaved();
   const opts: PickerOption[] = [];
   for (const p of PROVIDERS) {
     const s = saved[p.id] || {};
-    if (!(s.apiKey || "").trim()) continue;
-    const rawModels: string[] = Array.isArray(s.models) && s.models.length
+    const baseUrl = (s.baseUrl || p.baseUrl || "").trim();
+    // baseUrl 必须非空（自定义/中转站无预置值）：空 base_url 一旦放行，
+    // 后端 llm._resolve 会回退到官方 DeepSeek 端点，拼成「官方 URL + 中转 key」的必 401 组合。
+    if (!(s.apiKey || "").trim() || !baseUrl) continue;
+    // v1.6.4：只认「数组」不认「非空」—— 用户删空清单（含预设厂商删光静态模型）必须被尊重，
+    // 否则保存的空数组被 p.models 静态清单"复活"，删除形同虚设。无数组 = 从未保存过，才回退预置。
+    const rawModels: string[] = Array.isArray(s.models)
       ? s.models.map((m: any) => (typeof m === "string" ? m : m?.id || "")).filter(Boolean)
       : p.models.map((m) => m.id);
     // 去重 + selectedModel 排首位（v1.6.3 E：无 active-model 时默认选中用户在 Settings
@@ -52,9 +76,11 @@ export function loadPickerOptions(): PickerOption[] {
         model,
         accent: p.accent,
         llm: {
-          base_url: (s.baseUrl || p.baseUrl || "").trim(),
+          base_url: baseUrl,
           api_key: (s.apiKey || "").trim(),
           model,
+          // v1.6.5：思考深度档位（用户显式选择时才携带；后端 build_llm 透传 reasoning_effort）
+          ...((s.reasoningEffort || "").trim() ? { reasoning_effort: (s.reasoningEffort || "").trim() } : {}),
         },
       });
     }
@@ -145,6 +171,8 @@ export function ModelPicker({
   }, [options, active]);
   const [idx, setIdx] = useState<number>(defaultIdx);
   const [open, setOpen] = useState(false);
+  // v1.7.0：快捷切档的失败提示（下拉内一行红字；PUT 失败时本机已生效，重启后回落）
+  const [effortHint, setEffortHint] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { setIdx(defaultIdx); }, [defaultIdx]);
@@ -194,11 +222,47 @@ export function ModelPicker({
         <Cpu className="size-3 shrink-0" style={{ color: cur.accent }} />
         <span className="hidden shrink-0 text-muted-foreground sm:inline">模型</span>
         <span className="truncate font-mono text-foreground/85">{cur.model}</span>
+        {cur.llm.reasoning_effort && (
+          <span
+            className="flex shrink-0 items-center gap-0.5 rounded bg-gold/15 px-1 py-0.5 text-[9px] text-gold"
+            title="思考深度（点开下拉可切换；低 = 回复更快）"
+          >
+            <Gauge className="size-2.5" />
+            {EFFORT_LABELS[cur.llm.reasoning_effort] || cur.llm.reasoning_effort}
+          </span>
+        )}
         <ChevronDown className={`size-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
 
       {open && (
         <div className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-80 w-[280px] overflow-y-auto rounded-lg border border-border bg-card p-1.5 shadow-xl shadow-black/30">
+          {/* v1.7.0：当前供应商的思考深度快捷切换（聊天页一秒切低档提速） */}
+          <div className="mb-1 border-b border-border/60 px-1 pb-1.5 pt-1">
+            <div className="flex items-center gap-1.5">
+              <span className="shrink-0 text-[10px] text-muted-foreground">思考深度</span>
+              <div className="flex flex-1 gap-1">
+                {EFFORT_LEVELS.map(([v, label]) => {
+                  const on = (cur.llm.reasoning_effort || "") === v;
+                  return (
+                    <button
+                      key={v || "default"}
+                      type="button"
+                      onClick={() => {
+                        setEffortHint("");
+                        persistReasoningEffort(cur.providerId, v).catch((e) => {
+                          setEffortHint(`档位保存失败（${e instanceof Error ? e.message : String(e)}）——本机已生效，重启后回落，可到设置页重试`);
+                        });
+                      }}
+                      className={`flex-1 rounded px-1 py-1 text-[10px] transition-colors ${on ? "bg-accent text-gold" : "text-foreground/75 hover:bg-secondary"}`}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            {effortHint && <div className="mt-1 text-[10px] leading-snug text-destructive">{effortHint}</div>}
+          </div>
           {options.map((o, i) => {
             const selected = i === safeIdx;
             return (

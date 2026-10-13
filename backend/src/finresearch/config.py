@@ -69,10 +69,12 @@ class Settings(BaseSettings):
     # 按 token 实测管理（含历史卸载到文件系统），不再靠手写的字符数估算。
     section_facts_max_chars: int = Field(default=2400)   # 报告单段事实块预算
 
-    # 报告分段撰写：1.5.0 起四段改「逐段串行真流式」，本并发值退化为全链路闸门。
-    # v1.6.0（审计 D4）：注释与实现对齐 —— report_use_llm_summary 出厂为 False
-    # （模板摘要先快速可见），不要按旧注释「1.2.3 默认走 LLM」理解。
-    report_llm_concurrency: int = Field(default=4)
+    # 报告分段同时在飞上限。决策史：v1.2.x 曾并行(gather)；v1.5.0 因家用 key 成片 429
+    # 退回串行（当时闸退化成全链路护栏）；v1.7.0 起恢复并行·并发 2（思考模型 4×180s
+    # 串行 = 12 分钟是研究慢的最大单一因素），2 为提速与限流的折中。
+    # 遇 429 可 .env 设 REPORT_LLM_CONCURRENCY=1 退回准串行。
+    # v1.6.0（审计 D4）：report_use_llm_summary 出厂为 False（模板摘要先快速可见）。
+    report_llm_concurrency: int = Field(default=2)
     report_section_timeout_s: float = Field(default=30.0)
     # 提示词中的字数要求不是协议约束；同时限制 completion token 与最终展示字符数。
     # 480 是普通模型上限；推理模型在 report.py 按 is_reasoning_model 放宽到 4096
@@ -80,7 +82,8 @@ class Settings(BaseSettings):
     report_section_max_tokens: int = Field(default=480)
     report_section_max_chars: int = Field(default=420)
     report_use_llm_summary: bool = Field(default=False)
-    context_summary_timeout_s: float = Field(default=20.0)
+    # v1.7.0 清理：context_summary_timeout_s 已删 —— 旧手写上下文摘要链路的遗留死配置，
+    # 全仓零引用（对话上下文治理已移交 deepagents SummarizationMiddleware，无超时参数可配）。
 
     @property
     def llm_configured(self) -> bool:

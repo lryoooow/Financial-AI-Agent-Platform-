@@ -44,7 +44,13 @@ from ..tools.context_store import delete_conversation_data, media_path, offload_
 from ..config import settings
 from ..db.models import ChatContextSummary, ChatConversation, ChatDelta, LocalSetting, Report, ResearchTask
 from ..db.session import db_ping, session_scope
-from ..llm import build_chart_llm, build_llm, llm_available, resolved_chart_model
+from ..llm import (
+    REASONING_EFFORTS,
+    build_chart_llm,
+    build_llm,
+    llm_available,
+    resolved_chart_model,
+)
 from ..tools.entity import resolve_entity
 from ..tools.market import (
     get_bid_ask,
@@ -289,9 +295,20 @@ async def _active_llm_cfg() -> Optional[dict]:
         key = str(cfg.get("apiKey") or "").strip()
         if not key:
             return None
+        base_url = str(cfg.get("baseUrl") or "").strip()
+        # v1.6.4：baseUrl 为空（自定义/中转站漏填 URL）视为未配置 —— 否则 llm._resolve 会把
+        # 空地址回退到官方 DeepSeek 端点，拼成「官方 URL + 中转 key」的必 401 组合。
+        # 返回 None 让调用方回落对话冻存配置/环境变量，错误如实暴露而不是错配发出。
+        if not base_url:
+            return None
         model = str(active.get("modelId") or cfg.get("selectedModel") or "").strip()
-        return {"base_url": str(cfg.get("baseUrl") or "").strip(),
-                "api_key": key, "model": model}
+        out = {"base_url": base_url,
+               "api_key": key, "model": model}
+        # v1.6.5：思考深度档位随激活配置下发（model-configs 存 camelCase，与 baseUrl/apiKey 同风格）
+        effort = str(cfg.get("reasoningEffort") or "").strip().lower()
+        if effort in REASONING_EFFORTS:
+            out["reasoning_effort"] = effort
+        return out
     except Exception as e:  # noqa: BLE001
         # warning 级（曾为 debug）：此函数失败=聊天/研究直接退化成「没有可用模型」，
         # 必须能在 sidecar 日志里看到根因（打包环境曾出现静默失败，靠本日志定位）。
@@ -828,6 +845,79 @@ def _strip_md(text: str) -> str:
     return _MD_TRAILING.sub("", text)
 
 
+# ────────────────────────────────────────────────────────────
+# 聊天 SSE 心跳（v1.7.0）
+# ────────────────────────────────────────────────────────────
+_CHAT_HEARTBEAT_S = 10.0
+# CoT/工具静默期心跳间隔：远小于前端看门狗（普通 120s / 思考 330s）与 SSE 中间层空闲超时。
+
+
+async def _pump_with_heartbeat(
+    source: AsyncIterator,
+    *,
+    interval: float = _CHAT_HEARTBEAT_S,
+    fallback_stage: tuple[str, str] = ("thinking", "正在思考"),
+):
+    """给上游 (line, piece) 流补心跳：静默超过 interval 秒就重发最近一次 stage 事件。
+
+    为什么需要：思维链不流式的端点（OpenAI o 系风格）在 CoT 期间上游完全不产出，
+    SSE 数分钟无帧——前端看门狗只能盲等，用户也看不到"还在思考"。心跳复用 stage
+    事件类型：前端 onStage 无条件刷新 lastAct（零改动续命看门狗），label 重复时
+    setStage 同值 bail-out，无可见副作用。
+
+    实现：后台 task 消费上游（内部 contextlib.aclosing 保持"确定性关闭上游"的
+    v1.6.3 P1 承诺），主循环 wait_for(queue.get(), interval) 超时即发心跳。
+    取消语义：主循环 finally 里 cancel pump + 2s 有界等待收尾（suppress——若此时
+    正被外部取消，原 CancelledError 沿调用栈继续传播，gen() 的 except 分支与
+    shield 落库不受影响）。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    async def _pump() -> None:
+        try:
+            async with contextlib.aclosing(source) as agen:
+                async for item in agen:
+                    queue.put_nowait(item)  # 无界队列：put_nowait 永不阻塞
+            queue.put_nowait(done)
+        except BaseException as e:  # noqa: BLE001  含 CancelledError：作哨兵投递，不在 task 里裸抛
+            try:
+                queue.put_nowait(e)
+            except Exception:  # noqa: BLE001
+                pass
+
+    pump = asyncio.create_task(_pump())
+    last_stage = fallback_stage
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield sse.ev_chat_stage(*last_stage), ""  # 心跳：piece 为空，不进落库/合规闸
+                continue
+            if item is done:
+                break
+            if isinstance(item, BaseException):
+                raise item  # 上游异常原样转交调用方（走既有 except 分支：日志/failed_note/闭环）
+            line, piece = item
+            if not piece and '"stage"' in line:  # 低频行才解析（stage 行 piece 恒空）
+                try:
+                    ev = json.loads(line[6:])
+                    if ev.get("type") == "stage":
+                        last_stage = (ev.get("stage") or last_stage[0],
+                                      ev.get("label") or last_stage[1])
+                except Exception:  # noqa: BLE001
+                    pass
+            yield item
+    finally:
+        pump.cancel()
+        try:
+            async with asyncio.timeout(2.0):
+                await pump
+        except BaseException:  # noqa: BLE001  有界收尾：不拖死生成器关闭，原取消（若有）继续上传
+            pass
+
+
 @router.post("/chat/conversations/{conversation_id}/messages")
 async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     """流式对话：POST 返回 text/event-stream。
@@ -872,12 +962,8 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
         # or {}（而非 or None）：缺行或空 payload 时交给 render_profile_block 逐字段回填 DEFAULT_PROFILE
         prof_row = await s.get(LocalSetting, "user-profile")
         user_profile = (prof_row.payload if prof_row else None) or {}
-        summary_row = await s.get(ChatContextSummary, conv_id)
-        summary_snapshot = ({
-            "cutoff_count": summary_row.cutoff_count,
-            "summary": summary_row.summary,
-            "history_path": summary_row.history_path,
-        } if summary_row else None)
+        # v1.7.0 清理：原这里还读 ChatContextSummary 到 summary_snapshot，但 gen() 内
+        # 从未消费（legacy 手写上下文链路残留）——删掉省一次查询，行为零变化。
 
     # 模型配置优先级（v1.6.0 发布后修复）：
     #   ① 本次显式选择（req.llm，前端点过 ModelPicker）
@@ -897,7 +983,6 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     # 会话锁已在持久化前检查并获取（见上方 D7 注释），此处直接使用 chat_lock。
 
     async def gen():
-        nonlocal summary_snapshot
         # 统一闭环：无论是否有模型/是否出错/是否被取消，都最终持久化助手回复；正常路径再发 done。
         reply_text = ""
         violated = False
@@ -944,9 +1029,11 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
                 #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
                 try:
                     gate_acc = ""
-                    # v1.6.3（P1）：aclosing 确定性关闭上游 agent 流（break/取消/弃置都立即收尾，
-                    # 不再依赖 GC 异步终结器）。
-                    async with contextlib.aclosing(_deepagent_chat_stream(
+                    # v1.6.3（P1）：aclosing 确定性关闭上游（break/取消/弃置都立即收尾，不依赖
+                    # GC 异步终结器）。v1.7.0：心跳包一层后必须再包 aclosing——async for 的 break
+                    # 不会自动关生成器，合规闸 break 若不关心跳 wrapper，其 pump task 会活到 GC
+                    #（心跳测试逮住的缺陷）。pump 内部对真正的 agent 流同样 aclosing。
+                    async with contextlib.aclosing(_pump_with_heartbeat(_deepagent_chat_stream(
                         conv_id=conv_id,
                         text=text,
                         history=history_snapshot,
@@ -954,8 +1041,8 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
                         llm_cfg=llm_cfg,
                         images=req.images,
                         user_msg=history_snapshot[-1] if history_snapshot else None,
-                    )) as agent_stream:
-                        async for _line, _piece in agent_stream:
+                    ))) as hb_stream:
+                        async for _line, _piece in hb_stream:
                             # v1.6.0（审计 B10，用户已批准）：对话链路禁用词闸 —— 与报告同一份
                             # FORBIDDEN_VERBS 检测（此前报告有闸、聊天 token 原样直出，同一产品双标）。
                             # 命中即停流：不再外发该 token 及后续内容，落库文本同样截断。

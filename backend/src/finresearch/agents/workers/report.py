@@ -15,7 +15,8 @@
 
 模板驱动：SECTION_SPECS 按 equity_deep/industry/earnings/risk 给出不同栏目集合与顺序；
 每段只构造本段所需字段的事实块（估值段看不到新闻，行业段看不到 KDJ），
-经 _invoke 的并发闸 + 超时并发撰写；规则模板作为 LLM 不可用/超时/429/校验失败的回退。
+v1.7.0 起各段经 _llm_section 真流式**并行撰写**（并发闸 _LLM_GATE=2，段间零依赖）；
+规则模板作为 LLM 不可用/超时/429/校验失败的回退。
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...config import settings
-from ...llm import build_llm, is_reasoning_model
+from ...llm import build_llm, is_reasoning_model, reasoning_effort_of
 from ...tools import facts, report as report_tool
 from ...tools.context import build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
@@ -49,17 +50,38 @@ _SRC_LABELS = {
     "akshare": "AkShare（东方财富）",
 }
 
-# v1.6.0（审计 D4 注释对齐）：1.5.0 起报告四段改「逐段串行真流式」，本闸不再承担
-# 段间并发限流（串行天然 ≤1），仅作为全链路 LLM 并发护栏存在（对话/摘要同时跑时共用）。
-# getattr 兜底值与 config 实际默认对齐（4 并发 / 30s 超时）。
-_LLM_GATE = asyncio.Semaphore(max(1, int(getattr(settings, "report_llm_concurrency", 4))))
+# v1.7.0：四段并行·并发 2（用户决策，见 config.report_llm_concurrency 决策史）——
+# 本闸从"串行时代形同虚设的护栏"恢复为真正的分段限流器（同时在飞 ≤2，防家用 key/
+# 中转站成片 429），兼作全链路护栏（对话/摘要同时跑时共用）。
+# getattr 兜底值与 config 实际默认对齐（2 并发 / 30s 超时）。
+_LLM_GATE = asyncio.Semaphore(max(1, int(getattr(settings, "report_llm_concurrency", 2))))
 _SECTION_TIMEOUT = float(getattr(settings, "report_section_timeout_s", 30.0))
+# v1.6.5：思考型模型的超时倍率。30s 是普通模型单段预算；思维链端点首段 CoT 常态
+# 40-120s（CoT 不流式时首字节前全程静默），30s 必超时 → 四段成片回退模板，
+# 用户看到的是"又慢又全是模板"。×6（180s）为 high 档 + 慢中转的实测余量。
+_REASONING_TIMEOUT_FACTOR = 6.0
 
 
-async def _invoke(llm, messages) -> str:
+def _thinks(state: dict) -> bool:
+    """该任务的模型是否思考型：显式选了思考档位，或模型名命中推理模式。
+
+    模型名口径与 build_llm._resolve 一致（override.model 回落 settings.llm_model）——
+    中转站模型名（如 relay-gpt-high）不命中模式时，靠显式档位兜住分档。
+    """
+    cfg = state.get("llm_config") or {}
+    model_name = str(
+        (cfg.get("model") or "").strip() or getattr(settings, "llm_model", "") or ""
+    )
+    return bool(reasoning_effort_of(cfg)) or is_reasoning_model(model_name)
+
+
+async def _invoke(llm, messages, timeout: float | None = None) -> str:
     """带并发闸与超时的单次 LLM 调用；统一抽取 content（含 content-block 列表形态）。"""
     async with _LLM_GATE:
-        resp = await asyncio.wait_for(llm.ainvoke(messages), timeout=_SECTION_TIMEOUT)
+        resp = await asyncio.wait_for(
+            llm.ainvoke(messages),
+            timeout=_SECTION_TIMEOUT if timeout is None else timeout,
+        )
     text = resp.content if hasattr(resp, "content") else str(resp)
     if isinstance(text, list):  # 部分模型返回 content block 列表
         text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in text)
@@ -99,7 +121,7 @@ def check_generated(text: str) -> List[str]:
     """检测 LLM 产出是否命中禁用词，返回命中列表（不改写文本）。
 
     旧 _sanitize 盲替换会污染引文、产生"不建议建议关注（偏多）"等语义崩坏；
-    此处只检测，命中后由调用方发起重写或回退模板。
+    此处只检测，命中后由调用方截断（对话）或回退模板（报告）——无重写环节。
     """
     if not text:
         return []
@@ -716,13 +738,13 @@ def _section_specs(template: str) -> List[SectionSpec]:
 
 
 # ────────────────────────────────────────────────────────────
-# 单段 LLM 撰写（命中禁用词→重写→仍命中回退模板并标注）
+# 单段 LLM 撰写（真流式；命中禁用词即停流回退模板并标注——无「重写」环节，v1.6.0 注释对齐）
 # ────────────────────────────────────────────────────────────
 async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tuple[str, str]:
     """单段撰写，返回 (正文, 生成来源)。来源取值 llm / template / insufficient。
 
     来源要如实上报：证据分层栏据此声明哪几段是模型写的、哪几段是规则模板兜底的。
-    LLM 不可用/超时/429/命中禁用词且重写无效 → 回退规则模板。单段独立降级，互不影响。
+    LLM 不可用/超时/429/命中禁用词 → 回退规则模板。单段独立降级，互不影响。
     """
     template = state.get("template", "equity_deep")
     task_id = state.get("task_id") or state.get("normalized_ticker", "")
@@ -749,8 +771,12 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
         or getattr(settings, "llm_model", "")
         or ""
     )
+    thinks = _thinks(state)
     base_tokens = max(64, int(getattr(settings, "report_section_max_tokens", 480)))
-    section_max_tokens = 4096 if is_reasoning_model(model_name) else base_tokens
+    # v1.6.5：分档条件从"名字命中"扩为 _thinks（显式档位也算）——中转站思考模型名
+    # 不命中模式时，480 同样会被 CoT 吃满成空段
+    section_max_tokens = 4096 if thinks else base_tokens
+    section_timeout = _SECTION_TIMEOUT * (_REASONING_TIMEOUT_FACTOR if thinks else 1.0)
     llm = build_llm(
         streaming=True,
         max_tokens=section_max_tokens,
@@ -776,8 +802,12 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
     acc = ""
     forbidden = False
     try:
-        async with asyncio.timeout(_SECTION_TIMEOUT):
-            async with _LLM_GATE:
+        # v1.7.0：闸在 timeout 外——并行下排队等闸的时间不得消耗该段撰写预算
+        #（旧"timeout 包 gate"嵌套在串行下无感，并行时后两段会在"未轮到调 LLM"
+        # 时就超时回退模板；已由 test_report_parallel 的"排队不耗预算"用例锁定）。
+        # v1.6.5：思考型模型按倍率放宽（见 _REASONING_TIMEOUT_FACTOR 注释）。
+        async with _LLM_GATE:
+            async with asyncio.timeout(section_timeout):
                 async for chunk in llm.astream(lc):
                     tok = _extract_token(chunk)
                     if not tok:
@@ -973,7 +1003,11 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
         return int((time.perf_counter() - _t0) * 1000)
 
     try:
-        text = await _invoke(llm, lc)
+        # v1.6.5：摘要与分段同分档 —— 思考型模型摘要 20-30s 必超时回退模板
+        text = await _invoke(
+            llm, lc,
+            timeout=_SECTION_TIMEOUT * (_REASONING_TIMEOUT_FACTOR if _thinks(state) else 1.0),
+        )
         # 空返回兜底（同 _llm_section 的理由）：摘要空返回会让报告顶部的投资摘要一片空白。
         if not (text or "").strip():
             logger.warning("LLM 摘要返回空内容，回退模板")
@@ -1089,29 +1123,33 @@ async def report_node(state: ResearchState) -> dict:
 
     sections_t0 = time.perf_counter()
     summary = state.get("draft_summary") or _compose_summary_block(state, fv)
-    # 模板对应各段并发撰写（并发闸在 _invoke 里，避免家用 key 成片 429）。
     specs = _section_specs(template)
-    # 逐段真流式（方案A）：串行撰写，每段先发 section_start 让前端建段并置为 streaming，
-    # 段内由 _llm_section 逐 token 发 section_token，最后发权威 report_section 收口。
-    # 比旧的并行 gather 慢，但前端能一段段、一字字看到生成，而非等整段算完才闪出。
-    _stream_push(f"开始撰写 {len(specs)} 段分析（逐段真流式）…")
-
-    results: list = []
+    # v1.7.0：四段并行·并发 2（段间零依赖：各段事实块/system prompt 只来自 state+fv，
+    # 后段不引用前段输出；决策史见 config.report_llm_concurrency）。机制仍是"逐段真流式"：
+    # 先统一发 section_start 让前端把全部段落点亮为"撰写中"，段内由 _llm_section 逐 token
+    # 发 section_token（并发=2 时两段打字机交错，前端按 title 键控分栏），每段完成即发
+    # 权威 report_section 收口（乱序到达安全）。v1.5.0→v1.7.0：当年并行退串行是因家用 key
+    # 成片 429，现以并发 2 + 闸（gate 在 timeout 外，排队不耗单段预算）折中。
+    gate_n = max(1, int(getattr(settings, "report_llm_concurrency", 2)))
+    _stream_push(f"开始撰写 {len(specs)} 段分析（{min(len(specs), gate_n)} 段并行）…")
     for spec in specs:
         _stream_push({"type": "section_start", "title": spec.title})
-        _stream_push(f"正在撰写：{spec.title}…")
+
+    async def _write_one(spec):
         try:
             result = await _llm_section(state, spec, fv)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  单段独立降级的第二道网（第一道在 _llm_section 内）
             logger.warning("%s 段撰写异常：%s", spec.key, exc)
             _stream_push(f"⚠ {spec.title} 撰写异常，回退模板")
-            results.append(exc)
-            continue
+            return exc
         body, source = result
-        # 权威 body 收口：覆盖流式期间已展示的片段（截断/禁用词回退后以此为准）
+        # 权威 body 收口：覆盖流式期间已展示的片段（截断/禁用词回退后以此为准）。
+        # 按 title 键控，完成序乱序到达对前端无影响（Workspace 排序兜底）。
         _stream_push({"type": "report_section", "title": spec.title, "body": body, "source": source})
         _stream_push(f"✓ {spec.title} 完成")
-        results.append(result)
+        return result
+
+    results = await asyncio.gather(*(_write_one(s) for s in specs), return_exceptions=True)
     _stream_push("各段撰写完成，正在组装报告…")
 
     sections: list[dict] = []

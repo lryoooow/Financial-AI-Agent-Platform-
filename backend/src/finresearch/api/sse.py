@@ -7,6 +7,8 @@
 - stage：对话思考阶段 {type:'stage', stage, label}（understanding/thinking/composing）
 - tool_call：agent 真实工具调用 {type:'tool_call', name, label, status}（deepagent 链路）
 - todo：agent 待办列表快照 {type:'todo', items:[{content, status}]}（deepagent 链路）
+- reasoning：思维链增量 {type:'reasoning', text}（v1.7.0；ReasoningChatOpenAI 透出的
+  delta.reasoning_content，仅对话链路 emit_tokens=True 时发；piece 恒空 → 不落库不过合规闸）
 - done：研究 {type:'done', report}；对话用 sse({"type":"done",...}) 自定义负载
 - error：{type:'error', message}
 
@@ -46,6 +48,11 @@ def ev_chat_stage(stage: str, label: str) -> str:
 def ev_tool_call(name: str, label: str, status: str = "start") -> str:
     """agent 真实工具调用。status：start / ok / error。"""
     return sse({"type": "tool_call", "name": name, "label": label, "status": status})
+
+
+def ev_reasoning(text: str) -> str:
+    """思维链增量（ReasoningChatOpenAI 透出的 reasoning_content 片段，仅对话链路）。"""
+    return sse({"type": "reasoning", "text": text})
 
 
 def ev_todo(items: list) -> str:

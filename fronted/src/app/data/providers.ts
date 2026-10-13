@@ -2,8 +2,10 @@
 // 用户填 API Key → 测试连通性 → "拉取最新模型"会真·调厂商 /v1/models 实拉（见 api.models），
 // 不再依赖这里的静态清单。静态清单仅作默认/离线兜底。
 // 数字/推理全部走这里配置的云端端点（规划文档：唯一出网点）。
+// 末尾另有 id="custom" 的「自定义 / 中转站」条目：无预置 URL、无静态清单，
+// 供接入 one-api/new-api 等中转 —— 模型以手动添加为主、实拉为辅。
 
-export type Region = "domestic" | "foreign";
+export type Region = "domestic" | "foreign" | "custom";
 
 export interface ModelInfo {
   id: string;
@@ -263,6 +265,22 @@ export const PROVIDERS: Provider[] = [
       { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B", context: "128K", tag: "极速" },
       { id: "meta-llama/llama-4-scout-17b-16e-instruct", label: "Llama 4 Scout 17B", context: "128K", tag: "视觉" },
     ],
+  },
+
+  // ───────────── 自定义（中转站/自建网关） ─────────────
+  // 放末尾：PROVIDERS[0] 仍是 DeepSeek（Settings 默认选中/兜底都取首位，
+  // 新用户不该落到一个要手填一切的空白页）。region="custom" 不属于国内/国外
+  // 筛选 tab，只在「全部」里出现。
+  {
+    id: "custom",
+    name: "自定义 / 中转站",
+    vendor: "OpenAI 兼容自建端点",
+    region: "custom",
+    baseUrl: "",
+    docsHint: "中转站 / one-api / new-api 等：填 Base URL（含 /v1）与 Key，模型可实拉或手动添加",
+    accent: "#2dd4bf",
+    short: "CT",
+    models: [],
   },
 ];
 
