@@ -9,13 +9,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from importlib import resources
 from typing import Optional
 
-from rapidfuzz import process, fuzz
+from rapidfuzz import fuzz, process
 
-from . import make_provenance, now_iso
+from . import make_provenance
 
 logger = logging.getLogger(__name__)
 _SEED_RESOURCE = "data/a_code_name_seed.json"
@@ -28,14 +29,71 @@ _EXCHANGE_MAP = {
 }
 
 
+# ────────────────────────────────────────────────────────────
+# 市场指数目录（行情页大盘条 / 初始视图）
+#
+# 000001 与平安银行同码：只有带市场后缀的完整形式（"000001.SH"）才按指数处理，
+# 裸 6 位输入仍按股票规则（000001 → 深市平安银行）。前端指数入口必须传完整形式。
+# ────────────────────────────────────────────────────────────
+INDEX_CATALOG: dict[str, str] = {
+    "000001.SH": "上证指数",
+    "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指",
+    "000688.SH": "科创50",
+    "000300.SH": "沪深300",
+}
+# 名称/别名 → 指数（resolve 用）
+_INDEX_ALIASES: dict[str, str] = {
+    "上证指数": "000001.SH", "上证": "000001.SH", "大盘": "000001.SH", "A股大盘": "000001.SH",
+    "沪市": "000001.SH",
+    "深证成指": "399001.SZ", "深成指": "399001.SZ", "深市": "399001.SZ",
+    "创业板指": "399006.SZ", "创业板": "399006.SZ",
+    "科创50": "000688.SH", "科创板50": "000688.SH", "科创版50": "000688.SH",
+    "沪深300": "000300.SH", "沪深三百": "000300.SH",
+}
+
+
+def is_index(code: str) -> bool:
+    """完整形式的代码是否是目录内指数（如 "000001.SH"）。"""
+    if not code:
+        return False
+    c = str(code).strip().upper()
+    if c in INDEX_CATALOG:
+        return True
+    # 前缀形式 "sh000001" / "SH000001"（c 已 upper）
+    for prefix in ("SH", "SZ"):
+        if c.startswith(prefix) and f"{c[len(prefix):]}.{prefix}" in INDEX_CATALOG:
+            return True
+    return False
+
+
+# 上交所号段：60 主板 / 68 科创板 / 90 B股 / 11 可转债 /
+# 50 封闭式基金·LOF、51、52、56、58 ETF（588xxx 为科创板 ETF）。
+SH_PREFIXES = ("60", "68", "90", "11", "50", "51", "52", "56", "58")
+# 深交所号段：00 主板 / 30 创业板 / 20 B股 / 12 可转债 / 15、16、18 基金。
+SZ_PREFIXES = ("00", "30", "20", "12", "15", "16", "18")
+# 北交所号段（含新 920 段）。
+BJ_PREFIXES = ("43", "83", "87", "88", "92")
+
+
+def is_sh(code: str) -> bool:
+    """纯 6 位代码是否属于上交所。"""
+    return code.startswith(SH_PREFIXES)
+
+
+def is_bj(code: str) -> bool:
+    """纯 6 位代码是否属于北交所。"""
+    return code.startswith(BJ_PREFIXES)
+
+
 def _classify_exchange(code: str) -> str:
     """按代码前缀判断交易所（akshare 仅给 code，不给交易所）。"""
     c = code.strip()
-    if c.startswith(("60", "68", "90", "11", "51", "56")):
+    if is_sh(c):
         return _EXCHANGE_MAP["sh"]
-    if c.startswith(("00", "30", "20", "12", "15", "16")):
+    if c.startswith(SZ_PREFIXES):
         return _EXCHANGE_MAP["sz"]
-    if c.startswith(("43", "83", "87", "88")):
+    if is_bj(c):
         return _EXCHANGE_MAP["bj"]
     return "A股"
 
@@ -44,10 +102,14 @@ def normalize_ticker(code: str) -> str:
     """归一化前端传入的 ticker 到纯 6 位代码。
 
     前端用 "600519.SH"，akshare 大多数接口要纯代码 "600519"。
+    例外：目录内指数保留完整形式（"000001.SH"）——剥掉后缀会与同码股票
+    （000001 平安银行）混淆，后续 is_index/符号映射都依赖完整形式判指数。
     """
     if not code:
         return ""
     c = code.strip().upper()
+    if c in INDEX_CATALOG:
+        return c
     for sep in (".", ":"):
         if sep in c:
             c = c.split(sep)[0]
@@ -59,11 +121,13 @@ def normalize_ticker(code: str) -> str:
 
 
 def to_market_ticker(code: str) -> str:
-    """纯代码 → 前端格式（600519.SH）。"""
+    """纯代码 → 前端格式（600519.SH）；目录内指数原样返回。"""
     c = normalize_ticker(code)
-    if c.startswith(("60", "68", "90", "11", "51", "56")):
+    if c in INDEX_CATALOG:
+        return c
+    if is_sh(c):
         return f"{c}.SH"
-    if c.startswith(("43", "83", "87", "88")):
+    if is_bj(c):
         return f"{c}.BJ"
     return f"{c}.SZ"
 
@@ -102,29 +166,83 @@ def _load_code_name_from_akshare() -> list[dict]:
     return _normalize_rows(df.to_dict(orient="records"))
 
 
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_RUNNING = False
+_REFRESH_LAST_ATTEMPT = 0.0
+_REFRESH_INTERVAL = 7 * 86400
+_REFRESH_RETRY_DELAY = 3600
+_CACHE_TTL = 8 * 86400
+
+
+def _publish_code_name_rows(rows: list[dict], source: str, updated_at: float) -> None:
+    """原子更新清单与搜索索引，在线刷新失败时不会覆盖种子数据。"""
+    from ..cache import slow_cache
+
+    normalized = _normalize_rows(rows)
+    if not normalized:
+        return
+    code_map = {str(row["code"]).zfill(6): row for row in normalized}
+    candidates = [
+        f"{str(row['code']).zfill(6)} {row['name']} {_compact_text(row['name'])}"
+        for row in normalized
+    ]
+    slow_cache.set("a_code_name", normalized, ttl=_CACHE_TTL)
+    slow_cache.set("a_code_name_source", source, ttl=_CACHE_TTL)
+    slow_cache.set("a_code_name_updated_at", updated_at, ttl=_CACHE_TTL)
+    slow_cache.set(
+        "a_code_name_index",
+        {"rows": normalized, "code_map": code_map, "candidates": candidates},
+        ttl=_CACHE_TTL,
+    )
+
+
+def _refresh_code_name_in_background() -> None:
+    """后台刷新新股/更名清单；失败时继续使用内置种子。"""
+    global _REFRESH_LAST_ATTEMPT, _REFRESH_RUNNING
+    with _REFRESH_LOCK:
+        now = time.time()
+        if _REFRESH_RUNNING or now - _REFRESH_LAST_ATTEMPT < _REFRESH_RETRY_DELAY:
+            return
+        _REFRESH_RUNNING = True
+        _REFRESH_LAST_ATTEMPT = now
+
+    def run() -> None:
+        global _REFRESH_RUNNING
+        try:
+            rows = _load_code_name_from_akshare()
+            _publish_code_name_rows(rows, "akshare", time.time())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("refresh A-share code/name list failed; keep bundled seed: %s", exc)
+        finally:
+            with _REFRESH_LOCK:
+                _REFRESH_RUNNING = False
+
+    threading.Thread(target=run, name="a-share-index-refresh", daemon=True).start()
+
+
 def _load_code_name_list():
-    """加载全市场股票清单（带缓存）。"""
+    """加载全市场股票清单，并按七天周期后台刷新。"""
     from ..cache import slow_cache
 
     cached = slow_cache.get("a_code_name")
     if cached is not None:
-        # 1.2.3：种子数据过期检查（>7天则后台静默更新）
         last_update = slow_cache.get("a_code_name_updated_at")
-        if last_update and (time.time() - last_update) < 7 * 86400:
-            return cached
+        if not last_update or (time.time() - float(last_update)) >= _REFRESH_INTERVAL:
+            _refresh_code_name_in_background()
+        return cached
+
     rows = _load_code_name_seed()
-    source = "bundled-seed"
     if not rows:
         try:
             rows = _load_code_name_from_akshare()
-            source = "akshare"
-        except Exception as e:  # noqa: BLE001
+            _publish_code_name_rows(rows, "akshare", time.time())
+            return rows
+        except Exception:  # noqa: BLE001
             logger.exception("load A-share code/name list failed")
-            rows = []
-            source = f"failed:{e}"
-    slow_cache.set("a_code_name", rows, ttl=12 * 3600)
-    slow_cache.set("a_code_name_source", source, ttl=12 * 3600)
-    slow_cache.set("a_code_name_updated_at", time.time(), ttl=12 * 3600)
+            return []
+
+    _publish_code_name_rows(rows, "bundled-seed", 0.0)
+    _refresh_code_name_in_background()
     return rows
 
 
@@ -159,6 +277,12 @@ def _hit_row(r: dict) -> dict:
 
 
 def resolve_entity(query: str, limit: int = 8) -> dict:
+    # 指数别名优先：搜"上证指数/大盘/创业板"等必须命中指数而不是某只同码股票
+    # （"上证"若走模糊股票匹配会命中"上海XX"类公司）。
+    q = _compact_text(query)
+    if q in _INDEX_ALIASES:
+        code = _INDEX_ALIASES[q]
+        return {"results": [{"code": code, "name": INDEX_CATALOG[code]}]}
     q = (query or "").strip()
     if not q:
         return {"results": [], "provenance": make_provenance(source="local", endpoint="a_code_name_seed")}
@@ -242,68 +366,6 @@ def resolve_entity(query: str, limit: int = 8) -> dict:
                 error=str(e),
             ),
         }
-
-
-# ────────────────────────────────────────────────────────────
-# 自然语言里的标的检测（对话事实注入用）
-#
-# resolve_entity 拿整句话做模糊匹配会命中噪声；而"公司全称必须是问题的子串"这条守卫
-# 又太严——"茅台现在多少钱"里没有"贵州茅台"，最常见的问法反而不触发。
-# 这里改为：从问题中切出 2–6 字的候选片段，去别名索引里查"该片段是某公司名的子串"。
-# ────────────────────────────────────────────────────────────
-_CJK_RUN = re.compile(r"[一-鿿]{2,}")
-_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
-
-# 高频通用词：要么是行业通名（出现在大量公司名里），要么是日常/行情词汇，
-# 单独出现时不构成标的提及。"今天大盘怎么样"不该命中"今天国际"。
-_ALIAS_STOPWORDS = {
-    # 行业通名
-    "公司", "股份", "集团", "科技", "控股", "中国", "国际", "实业", "发展", "电子",
-    "信息", "网络", "数据", "智能", "新材", "材料", "能源", "电力", "银行", "证券",
-    "保险", "医药", "生物", "食品", "环保", "机械", "设备", "制造", "有限", "通信",
-    # 日常与行情词汇
-    "今天", "明天", "昨天", "现在", "目前", "最近", "未来", "大盘", "行情", "走势",
-    "股票", "股市", "市场", "板块", "指数", "基金", "投资", "风险", "收益", "估值",
-    "财报", "业绩", "分析", "建议", "帮我", "这家", "那家", "怎么", "什么", "如何",
-    "多少", "价格", "情况", "表现", "前景", "机会", "请问", "一下", "可以", "应该",
-}
-# 一个片段匹配到超过这么多家公司，说明它是通用词而非标的名
-_ALIAS_MAX_FANOUT = 8
-
-
-def _name_affixes(name: str) -> list[str]:
-    """公司名的前缀与后缀（长度 ≥2），不含中间子串。
-
-    "贵州茅台" → 贵州/贵州茅/贵州茅台/州茅台/茅台
-    只收前后缀是精确率的关键：中间子串（如"德时"之于"宁德时代"）不是任何人的简称。
-    """
-    out = []
-    n = len(name)
-    for size in range(2, n + 1):
-        out.append(name[:size])       # 前缀
-        if size < n:
-            out.append(name[n - size:])  # 后缀（size == n 时与前缀重复）
-    return out
-
-
-def _load_alias_index() -> dict:
-    """{片段: [row, ...]}，片段为公司名的前后缀。构建一次，缓存 12h。"""
-    from ..cache import slow_cache
-
-    cached = slow_cache.get("a_alias_index")
-    if cached is not None:
-        return cached
-    alias: dict[str, list] = {}
-    for r in _load_code_name_list():
-        name = _compact_text(str(r.get("name", "")))
-        if not name:
-            continue
-        for tok in _name_affixes(name):
-            alias.setdefault(tok, []).append(r)
-    slow_cache.set("a_alias_index", alias, ttl=12 * 3600)
-    return alias
-
-
 
 
 def get_company_name(code: str) -> Optional[str]:

@@ -4,7 +4,7 @@
 
 #define MyAppName "景渊金融研究助手"
 #define MyAppNameEn "FinResearch"
-#define MyAppVersion "1.5.0"
+#define MyAppVersion "2.0.6"
 #define MyAppPublisher "FinResearch"
 
 [Setup]

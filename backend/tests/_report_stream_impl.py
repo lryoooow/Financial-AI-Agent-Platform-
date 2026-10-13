@@ -73,10 +73,10 @@ async def main():
     check(len(toks2) == 0, f"empty → 不推空/前导空白 token (got {len(toks2)})")
 
     fw = next(iter(report.FORBIDDEN_VERBS))
-    _, source3, toks3 = await run_case(["投资", fw, "该股"], "forbidden")
-    leaked = "".join(t["text"] for t in toks3)
-    check(source3 == "template", f"forbidden → 回退模板 (got {source3})")
-    check(fw not in leaked, f"forbidden → 禁用词 {fw!r} 未流出 (leaked={leaked!r})")
+    body3, source3, toks3 = await run_case(["投资", fw, "该股"], "forbidden")
+    check(source3 == "llm", f"forbidden → 裸词收口替换不落模板 (got {source3})")
+    check(len(toks3) > 0, f"forbidden → 流不中断 (got {len(toks3)} tokens)")
+    check(fw not in body3, f"forbidden → 收口后正文无裸词 (body={body3!r})")
 
     print("\n" + ("ALL STREAMING TESTS PASS" if not fails else f"FAILURES: {fails}"))
     sys.exit(0 if not fails else 1)

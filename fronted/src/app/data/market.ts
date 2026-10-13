@@ -56,7 +56,11 @@ export interface Candle {
   high: number;
   low: number;
   volume: number;
-  ma5: number;
-  ma10: number;
-  ma20: number;
+  // 均线随区间自适应：后端只下发周期 <= 区间长度的均线，其余字段缺省
+  ma5?: number | null;
+  ma10?: number | null;
+  ma20?: number | null;
+  ma60?: number | null;
+  ma120?: number | null;
+  ma250?: number | null;
 }

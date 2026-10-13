@@ -1,21 +1,10 @@
-"""上下文装配层（1.2.0 重构）：所有 LLM 入参都经这里。
+"""上下文装配层：system prompt 公共段（画像/时间锚点/章节上下文/图表上下文）+ 诊断环形缓冲。
 
-职责：装配 + 预算 + 诊断。段序固定为
-  IDENTITY → COMPLIANCE → 输出规范 → 【用户画像】 → 【当前时间】
-           → 【更早对话要点摘记】 → 【当前事实】
-稳定前缀在前、易变内容在后，便于厂商侧 prompt cache 命中长前缀。
-
-核心修复（对应规划三类问题）：
-1. 预算花反了 → 近因优先：剩余预算从最新一条历史往回填原文，被挤出的进 recap；
-   recap 同样从最近的被挤出消息往前取（旧实现从最老取，方向反了）。
-2. 画像注入坏格式 → 中文标签 + 换行 · 前缀，消除「、」分隔符歧义；DEFAULT_PROFILE
-   逐字段回填；空画像不产生空标题块。
-3. 全程无 token 概念 → estimate_tokens 经验估算（不引入 tiktoken）。
-4. 配对保护：recent 若以 assistant 开头，向前吃一条 user 或丢弃该 assistant，
-   保证消息序列以 human 起始（部分国内 OpenAI 兼容端点强制）。
-5. 时间锚点：新增 render_time_anchor()，对话链路此前完全没有时间概念。
-6. 诊断增强：in_tokens_est / budget_used_pct / dropped_msgs / recap_from；
-   研究链路 obj_id 从 normalized_ticker 改为 task_id。
+1.5.0 起对话历史治理已整体移交 deepagents（SummarizationMiddleware + FilesystemMiddleware），
+本模块不再负责对话预算/recap/配对保护，相关常量与正则已随 legacy 链路删除。仍在服务的调用方：
+- render_profile_block / build_report_section_context：研究链路各章节 system prompt 装配
+- build_chart_context：图表速读上下文
+- record_diag / recent_diagnostics / finalize_diag：上下文诊断环形缓冲（前端诊断页）
 """
 
 from __future__ import annotations
@@ -169,34 +158,6 @@ def render_time_anchor(now: Optional[dt.datetime] = None) -> str:
 
 
 # ────────────────────────────────────────────────────────────
-# token 估算（纯函数经验估算，不引入 tiktoken）
-# ────────────────────────────────────────────────────────────
-
-
-# ────────────────────────────────────────────────────────────
-# 压缩：recap 取【核心结论】段（CHAT_OUTPUT_SPEC 强制助手回复以此开头）
-# ────────────────────────────────────────────────────────────
-_CORE_RE = re.compile(r"【核心结论】([^\n【]*)")
-
-# 单条摘记的字符上限。没有这个上限，【核心结论】后面若是一整段不换行的长文，
-# 正则会一路捕到行尾，单条就能吃光整个 recap 预算。
-_SNIPPET_CAP = 90
-
-# offload 指针措辞（诚实标注，不暗示可取回——景渊对话无 read_file 工具）
-# 文档 §3.1 的真正 offload 需要可取回机制（read_file 分页取全文）；景渊是固定管线+对话，
-# 没有该机制，故只诚实标注"非完整原文"，避免误导模型以为能取回。
-_RECAP_OFFLOAD_PTR = "\n（注：以上为更早对话的要点摘记，非完整原文。）"
-
-
-
-
-
-
-
-
-
-
-# ────────────────────────────────────────────────────────────
 # 诊断环形缓冲
 # ────────────────────────────────────────────────────────────
 def record_diag(diag: dict) -> None:
@@ -219,8 +180,6 @@ def recent_diagnostics(limit: int = 20, kind: Optional[str] = None, obj_id: Opti
 # ────────────────────────────────────────────────────────────
 # 对话上下文装配
 # ────────────────────────────────────────────────────────────
-_MSG_CHAR_CAP = 8000  # 单条消息内容硬上限（配合大预算，正常长回复不截断）
-_IMG_TOKENS = 256  # 压缩后 ~1280px JPEG 的 token 估算（OpenAI 高清图约 170-768，取中值偏保守）
 _MAX_IMAGES = 4  # 单条消息图片数量上限（多模态）
 
 
@@ -232,8 +191,6 @@ def _msg_text(msg: dict) -> str:
     if isinstance(c, list):
         return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
     return ""
-
-
 
 
 def _img_count(msg: dict) -> int:
@@ -264,12 +221,6 @@ def _to_lc_content(msg: dict) -> Union[str, list]:
             blocks.append({"type": "image_url", "image_url": {"url": url}})
         return blocks if sendable else text + note
     return text
-
-
-
-
-
-
 
 
 # ────────────────────────────────────────────────────────────
@@ -396,6 +347,33 @@ def build_report_section_context(
     }
     record_diag(diag)
     return lc, diag
+
+
+def build_report_context(
+    *,
+    system_prompt: str,
+    facts_block: str,
+    profile: Optional[dict] = None,
+    template: str = "equity_deep",
+    obj_id: str = "",
+) -> Tuple[List[Tuple[str, str]], dict]:
+    """整篇报告一次撰写的上下文：system(身份/合规/整篇提纲/格式/篇幅) → 画像 → 时间 → 全量事实块。
+
+    与 build_report_section_context 的唯一差别是事实块预算：单段版按 section_facts_max_chars
+    (2400) 截断，这里要装下所有段，用 report_facts_max_chars (7200)。截断逻辑复用同一个
+    _truncate_facts_by_segment，按【段落边界】切，不会把某个字段拦腰截断。
+    """
+    from ..config import settings
+
+    return build_report_section_context(
+        system_prompt=system_prompt,
+        facts_block=facts_block,
+        profile=profile,
+        template=template,
+        section="whole",
+        obj_id=obj_id,
+        max_chars=settings.report_facts_max_chars,
+    )
 
 
 # ────────────────────────────────────────────────────────────

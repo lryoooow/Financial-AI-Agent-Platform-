@@ -37,10 +37,14 @@ TOOL_LABELS = {
     "compose_report": "撰写报告",
     # 对话链路
     "resolve_entity": "识别标的",
+    "search_memory": "检索本地记忆",
+    "read_memory": "深读记忆原文",
+    "task": "深入分析（场景代理）",
     "search_industry": "查行业估值",
     "get_realtime_quote": "拉取实时行情",
     "get_technical_indicators": "计算技术指标",
     "get_kline": "拉取 K 线",
+    "get_intraday": "拉取分时走势",
     "get_company_profile": "查公司概况",
     "get_financial_indicators": "查财务指标",
     "search_news": "检索新闻",
@@ -109,6 +113,8 @@ async def stream_agent_sse(
     summary 三种 SSE，字段与旧固定管线路由发的逐字段一致——实测 get_stream_writer 在 agent
     的工具里照常工作，所以分段进度 UI 不用改。
     """
+    _emitted_starts: set[str] = set()  # 同一 call_id 只发一次 start（去重）
+
     async for mode, data in agent.astream(
         inputs, config=config, stream_mode=["updates", "messages", "custom"]
     ):
@@ -123,6 +129,8 @@ async def stream_agent_sse(
             elif kind == "section_start":
                 # 真流式：某板块开始撰写，前端把它置为 streaming、清空 body
                 yield sse.sse({"type": "section_start", "title": data.get("title", "")}), ""
+            elif kind == "summary_token":
+                yield sse.sse({"type": "summary_token", "text": data.get("text", "")}), ""
             elif kind == "section_token":
                 # 真流式：板块逐 token 吐字，前端追加到该板块 body（打字机）
                 yield sse.sse({
@@ -159,16 +167,38 @@ async def stream_agent_sse(
                 name = getattr(msg, "name", "") or ""
                 if name:
                     status = "error" if _tool_failed(getattr(msg, "content", None)) else "ok"
-                    yield sse.ev_tool_call(name, tool_label(name), status), ""
+                    # ok/error 必须带 call_id（= start 帧里 AIMessage.tool_calls[].id，
+                    # ToolMessage.tool_call_id 与之相等）：前端按 call_id 精确配对芯片。
+                    # 只发 name 时前端退化为按名字 FIFO 配对——一旦同一工具出现两个 start
+                    # 芯片（模型流式 chunk 重复携带 tool_calls、摘要中间件重试后重发调用），
+                    # 只有一个芯片能配上，另一个永久转圈。
+                    yield sse.sse({
+                        "type": "tool_call", "name": name,
+                        "label": tool_label(name), "status": status,
+                        "call_id": str(getattr(msg, "tool_call_id", "") or ""),
+                    }), ""
                 continue
 
             if node != "model":
                 continue
 
+            _emitted_starts.add(None)  # 哨兵：确保集合已初始化
             for call in getattr(msg, "tool_calls", None) or []:
                 name = call.get("name") or ""
-                if name:
-                    yield sse.ev_tool_call(name, tool_label(name), "start"), ""
+                call_id = str(call.get("id") or "")
+                if not name:
+                    continue
+                # 去重：同一 call_id 只发一次 start（对话链路流式 chunk 可能重复携带 tool_calls）
+                _dedup_key = call_id or f"no_id:{name}"
+                if _dedup_key in _emitted_starts:
+                    continue
+                _emitted_starts.add(_dedup_key)
+                yield sse.sse({
+                    "type": "tool_call", "name": name,
+                    "label": tool_label(name), "status": "start",
+                    "call_id": call_id,
+                }), ""
+                if emit_tokens:
                     yield sse.ev_chat_stage("tool", tool_label(name)), ""
 
             piece = _extract_text(msg)

@@ -1,13 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag } from "lucide-react";
+import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag, Sparkles } from "lucide-react";
 import { PROVIDERS, type Provider, type ModelInfo, type Region } from "../../data/providers";
-import { api, type UserProfile } from "../../api/client";
+import { api, type MemoryEmbeddingStatus, type UserProfile } from "../../api/client";
+import { PROVIDERS as ALL_PROVIDERS } from "../../data/providers";
 
 type Status = "idle" | "testing" | "connected" | "error";
 interface Cfg { baseUrl: string; apiKey: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface Props {
   active: { providerId: string; modelId: string } | null;
@@ -121,10 +120,31 @@ export function Settings({ active, onActivate }: Props) {
   async function testConn() {
     if (!cfg.apiKey.trim()) { patch(selectedId, { status: "error", message: "请先填入 API Key" }); return; }
     patch(selectedId, { status: "testing", message: "" });
-    await sleep(1100);
-    const ok = cfg.apiKey.trim().length >= 8;
-    if (ok) patch(selectedId, { status: "connected", latency: Math.round(120 + Math.random() * 380), message: "连接成功" });
-    else patch(selectedId, { status: "error", message: "认证失败：API Key 无效（示例校验需 ≥ 8 位）" });
+    const t0 = Date.now();
+    try {
+      // 真探活：走后端代理实测厂商 /v1/models（带 Key 验证连通与鉴权）。
+      // 曾经是 sleep(1100) + Key 长度校验 + 随机延迟假扮网络测试，坏 Key 也显示"连接成功"，
+      // 用户带着坏配置去研究/聊天，到 SSE 阶段才报错，错误归因被严重误导。
+      const r = await api.models(cfg.baseUrl, cfg.apiKey);
+      const latency = Date.now() - t0;
+      const err = (r.provenance as { error?: string } | undefined)?.error || "";
+      if (err) {
+        const friendly = err.includes("401") ? "认证失败（401）：API Key 无效"
+          : err.includes("403") ? "鉴权被拒（403）：该 Key 无权访问此接口"
+          : err.toLowerCase().includes("timed out") ? "连接超时：请检查网络或 Base URL"
+          : `连接失败：${err.slice(0, 120)}`;
+        patch(selectedId, { status: "error", message: friendly });
+        return;
+      }
+      const count = (r.models || []).length;
+      patch(selectedId, {
+        status: "connected",
+        latency,
+        message: count ? `连接成功（${count} 个模型可用）` : "连接成功",
+      });
+    } catch (e) {
+      patch(selectedId, { status: "error", message: e instanceof Error ? e.message : String(e) });
+    }
   }
 
   async function fetchModels() {
@@ -153,6 +173,66 @@ export function Settings({ active, onActivate }: Props) {
     }
   }
 
+  // ── 记忆嵌入（供应商向量模型，可选增强记忆/知识库语义检索）──
+  const embeddingProviders = ALL_PROVIDERS.filter((p) => (p.embeddingModels?.length || 0) > 0);
+  const [embedStatus, setEmbedStatus] = useState<MemoryEmbeddingStatus | null>(null);
+  const [embedProviderId, setEmbedProviderId] = useState(embeddingProviders[0]?.id || "");
+  const [embedModel, setEmbedModel] = useState("");
+  const [embedKey, setEmbedKey] = useState("");
+  const [embedBusy, setEmbedBusy] = useState(false);
+  const [embedMsg, setEmbedMsg] = useState("");
+
+  useEffect(() => {
+    api.memoryEmbedding()
+      .then((s) => {
+        setEmbedStatus(s);
+        if (s.mode === "provider" && s.model) setEmbedModel(s.model);
+      })
+      .catch(() => setEmbedStatus(null));
+  }, []);
+
+  const embedProvider = embeddingProviders.find((p) => p.id === embedProviderId);
+
+  async function saveEmbedding() {
+    if (!embedProvider) return;
+    setEmbedBusy(true);
+    setEmbedMsg("");
+    try {
+      const r = await api.saveMemoryEmbedding({
+        base_url: embedProvider.baseUrl,
+        api_key: embedKey.trim(),
+        model: (embedModel.trim() || embedProvider.embeddingModels![0]).trim(),
+      });
+      setEmbedMsg(r.rebuilt >= 0
+        ? "已激活 " + r.model + "（" + r.dim + " 维），重建向量 " + r.rebuilt + " 条"
+        : "已激活 " + r.model + "（" + r.dim + " 维），向量库正在后台重建");
+      setEmbedStatus(await api.memoryEmbedding());
+      setEmbedKey("");
+    } catch (e) {
+      setEmbedMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEmbedBusy(false);
+    }
+  }
+
+  async function clearEmbedding() {
+    setEmbedBusy(true);
+    setEmbedMsg("");
+    try {
+      const r = await api.clearMemoryEmbedding();
+      setEmbedMsg(r.rebuilt >= 0
+        ? "已回到本地嵌入，重建向量 " + r.rebuilt + " 条"
+        : "已回到本地嵌入，向量库正在后台重建");
+      setEmbedStatus(await api.memoryEmbedding());
+      setEmbedKey("");
+      setEmbedModel("");
+    } catch (e) {
+      setEmbedMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEmbedBusy(false);
+    }
+  }
+
   const list = useMemo(() => PROVIDERS.filter((p) => regionFilter === "all" || p.region === regionFilter), [regionFilter]);
 
   const statusDot = (s: Status) => s === "connected" ? "var(--down)" : s === "error" ? "var(--up)" : s === "testing" ? "var(--gold)" : "var(--muted-foreground)";
@@ -161,6 +241,76 @@ export function Settings({ active, onActivate }: Props) {
     <div className="h-full grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-4 p-5 overflow-hidden">
       {/* 供应商列表 */}
       <div className="flex flex-col gap-3 min-h-0">
+        {/* 记忆嵌入配置（本地哈希 ⇄ 供应商向量模型） */}
+        <div className="rounded-xl border border-border bg-card p-3.5 shrink-0">
+          <div className="flex items-center gap-1.5 text-sm">
+            <Sparkles className="size-3.5 text-gold" /> 记忆嵌入
+          </div>
+          {embedStatus?.mode === "provider" ? (
+            <>
+              <div className="mt-2 rounded-lg bg-down/10 px-2.5 py-2 text-[11px] leading-relaxed">
+                <div className="text-down">语义嵌入已激活</div>
+                <div className="mt-0.5 text-muted-foreground">
+                  {embedStatus.model} · {embedStatus.dim} 维 · 向量 {embedStatus.chunks} 条
+                </div>
+              </div>
+              <button
+                onClick={() => void clearEmbedding()}
+                disabled={embedBusy}
+                className="mt-2 w-full rounded-lg bg-secondary px-3 py-1.5 text-xs hover:bg-secondary/70 disabled:opacity-50"
+              >
+                {embedBusy ? "重建中…" : "停用并回到本地嵌入"}
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="mt-1.5 text-[10.5px] leading-relaxed text-muted-foreground">
+                当前：本地离线嵌入（零成本）。配置下列厂商的向量模型可显著增强记忆/知识库的语义检索。
+              </p>
+              <div className="mt-2 grid grid-cols-2 gap-1.5">
+                {embeddingProviders.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => { setEmbedProviderId(p.id); setEmbedModel(""); }}
+                    className={`rounded-lg border px-2 py-1.5 text-[11px] transition-colors ${embedProviderId === p.id ? "border-gold/50 bg-accent text-gold" : "border-border hover:border-border/80"}`}
+                  >
+                    {p.name}
+                  </button>
+                ))}
+              </div>
+              {embedProvider && (
+                <>
+                  <input
+                    value={embedModel}
+                    onChange={(e) => setEmbedModel(e.target.value)}
+                    placeholder={embedProvider.embeddingModels![0]}
+                    className="mt-2 w-full rounded-lg bg-input px-2.5 py-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-gold/40"
+                  />
+                  <input
+                    value={embedKey}
+                    onChange={(e) => setEmbedKey(e.target.value)}
+                    type="password"
+                    placeholder={`${embedProvider.name} API Key`}
+                    className="mt-1.5 w-full rounded-lg bg-input px-2.5 py-1.5 text-[11px] outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-gold/40"
+                  />
+                  <button
+                    onClick={() => void saveEmbedding()}
+                    disabled={embedBusy || !embedKey.trim()}
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 rounded-lg bg-gold px-3 py-1.5 text-xs text-[#17140a] hover:brightness-110 disabled:opacity-40"
+                  >
+                    {embedBusy ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+                    {embedBusy ? "探测并重建向量…" : "激活语义嵌入"}
+                  </button>
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground/70">
+                    {embedProvider.docsHint}；Key 加密存本机。切换嵌入器会自动重建向量库。
+                  </p>
+                </>
+              )}
+            </>
+          )}
+          {embedMsg && <p className="mt-2 text-[10.5px] leading-relaxed text-muted-foreground">{embedMsg}</p>}
+        </div>
+
         <div className="rounded-xl border border-border bg-card p-1 flex gap-1">
           {([["all", "全部", Globe], ["domestic", "国内", Flag], ["foreign", "国外", Globe]] as const).map(([id, label]) => (
             <button key={id} onClick={() => setRegionFilter(id)} className="relative flex-1 py-1.5 text-xs rounded-lg">
@@ -280,6 +430,19 @@ export function Settings({ active, onActivate }: Props) {
               </AnimatePresence>
             </div>
 
+            {provider.embeddingModels?.length ? (
+              <div className="mt-4 rounded-lg border border-gold/25 bg-accent/30 px-3 py-2.5">
+                <div className="flex items-center gap-1.5 text-xs text-gold">
+                  <Sparkles className="size-3.5" />
+                  该厂商提供向量模型：{provider.embeddingModels.join(" / ")}
+                </div>
+                <p className="mt-1 text-[10.5px] leading-relaxed text-muted-foreground">
+                  可在下方「记忆嵌入」区配置，用语义向量增强记忆与知识库的检索精度；
+                  不配置则使用本地离线嵌入，功能不受影响。
+                </p>
+              </div>
+            ) : null}
+
             {/* 模型 */}
             <div className="mt-6 pt-5 border-t border-border">
               <div className="flex items-center justify-between mb-3">
@@ -329,13 +492,16 @@ export function Settings({ active, onActivate }: Props) {
               )}
 
               <AnimatePresence>
-                {cfg.selectedModel && (
+                {cfg.selectedModel && cfg.models.some((x) => x.id === cfg.selectedModel) && (
                   <motion.button
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
                     onClick={() => {
-                      const m = cfg.models.find((x) => x.id === cfg.selectedModel)!;
+                      // 已保存的 selectedModel 可能不在当前清单（拉取失败回退/厂商下线），
+                      // 旧代码的非空断言在这里直接 undefined.id 崩掉整页
+                      const m = cfg.models.find((x) => x.id === cfg.selectedModel);
+                      if (!m) return;
                       onActivate({ providerId: provider.id, modelId: m.id, provider: provider.name, model: m.label, accent: provider.accent });
                     }}
                     className="mt-4 w-full flex items-center justify-center gap-2 rounded-lg border border-gold/40 bg-accent/60 py-2.5 text-sm text-gold hover:bg-accent transition-colors overflow-hidden"

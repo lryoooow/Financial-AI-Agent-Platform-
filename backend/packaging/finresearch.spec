@@ -25,11 +25,19 @@ binaries = []
 hiddenimports = []
 
 # 重型 / 动态导入的库：全量收集（数据 + 二进制 + 子模块）
-for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar"]:
+for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar", "sqlite_vec"]:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
+# sqlite_vec 的 vec0 可加载扩展（.dll）必须随包：collect_all 已带 binaries，
+# 再显式兜一份防止上游打包布局变化（loadable_path 指向的文件缺失时记忆功能优雅降级）
+try:
+    import sqlite_vec as _sv
+
+    binaries += [(os.path.join(os.path.dirname(_sv.__file__), "vec0.dll"), "sqlite_vec")]
+except Exception:
+    pass
 
 # langchain 系列 / sqlite 检查点：按子模块收集
 for pkg in [

@@ -19,19 +19,27 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import Literal, Optional
 
+import httpx
 from langchain_openai import ChatOpenAI
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
+ReasoningLevel = Literal["low", "medium", "high", "max"]
+_REASONING_LEVELS = {"low", "medium", "high", "max"}
+
+# 显式超时（默认是 openai SDK 的 600s 全量超时）：
+# connect 5s 让死端点快速失败；read 300s 是"两次字节间"的静默上限且无总超时——
+# 长流式回复（推理模型）不会被整体截断，而挂死的连接最迟 5 分钟内断开并走重试/报错。
+_LLM_TIMEOUT = httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0)
 
 # ── temperature 三层智能解析 ──────────────────────────────────────────
 # 第一层：推理模型（拒绝非默认 temperature，必须 1.0）
-# o1/o3/o4-mini、QwQ、DeepSeek-R1、reasoning、rt 系等
+# o1/o3/o4-mini、gpt-5、QwQ、DeepSeek-R1、reasoning、rt 系等
 _REASONING_PATTERNS = re.compile(
-    r"(?:\bo[134](?:-|\b)|qwq|deepseek-r|reasoning|\brt\b)", re.IGNORECASE
+    r"(?:\bo[134](?:-|\b)|\bgpt-5(?:-|\b)|qwq|deepseek-r|reasoning|\brt\b)", re.IGNORECASE
 )
 
 # 第二层：Kimi / Moonshot —— API 强制 temperature=1，传 0.7 会 400
@@ -80,6 +88,113 @@ def _resolve_temperature(model: str) -> float:
 def is_reasoning_model(model: str) -> bool:
     """推理模型判断（供 routes 智能体阶段标签 / 外部使用）。"""
     return bool(_REASONING_PATTERNS.search(model or ""))
+
+
+# ── 上下文窗口表（模型 → 输入窗口 tokens）─────────────────────────────
+# 为什么要手工挂 profile：ChatOpenAI 的 profile 自动加载只认 OpenAI 官方模型名，
+# DeepSeek/GLM/Kimi/Qwen 走 base_url 时 profile 恒为 None → deepagents 的
+# SummarizationMiddleware 回退到 170,000 token 才触发的保守默认——高于
+# DeepSeek 64K 的真实窗口，历史压缩永远不触发，长会话直接 400 且线程永久坏死。
+# 挂上 profile 后：fraction 触发（0.85）、按比例 keep、溢出尾部裁剪全部激活。
+#
+# 64K 档再打 0.8 折：近似计数对中文正文低估约 2 倍（1 token≈1.5-2 汉字，
+# 而估算按 4 字符/token），折算后等效触发 ≈0.68×窗口，给输出与计数误差留余量。
+# 未知模型 32K 最保守：宁早压缩，勿爆仓。
+_WINDOW_TABLE: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"deepseek", re.IGNORECASE), 64_000),
+    (re.compile(r"glm|chatglm|zhipu", re.IGNORECASE), 128_000),
+    (re.compile(r"kimi|moonshot", re.IGNORECASE), 128_000),
+    (re.compile(r"qwen|qwq", re.IGNORECASE), 128_000),
+    (re.compile(r"\bgpt-5", re.IGNORECASE), 400_000),
+    (re.compile(r"\bo[134]\b|\bo[134]-", re.IGNORECASE), 200_000),
+    (re.compile(r"gpt-4o|gpt-4\.1|gpt-4-turbo", re.IGNORECASE), 128_000),
+    (re.compile(r"claude", re.IGNORECASE), 200_000),
+]
+_UNKNOWN_WINDOW = 32_000
+
+
+def model_window_tokens(model: str) -> int:
+    """模型名 → 有效输入窗口（tokens）。64K 档打 0.8 折，见上表注释。"""
+    for pat, window in _WINDOW_TABLE:
+        if pat.search(model or ""):
+            return int(window * 0.8) if window <= 64_000 else window
+    return _UNKNOWN_WINDOW
+
+
+def _model_profile(model: str) -> dict:
+    """langchain ModelProfile 的 dict 形态；deepagents 的压缩/裁剪都读这里。"""
+    return {"max_input_tokens": model_window_tokens(model)}
+
+
+# ── 思考档位 ──────────────────────────────────────────────────────────
+# 档位是用户唯一该转的详略旋钮。此前报告长度由代码常量写死（单段 320 字符硬断流），
+# 选 max 和选 low 出来一样短——档位形同虚设。现在改由档位决定 completion 预算与写作深度。
+#
+# 为什么以 max_tokens 为主、厂商 reasoning 参数为辅：
+# max_tokens 是 OpenAI 兼容协议的通用参数，DeepSeek/通义/GLM/Kimi/豆包全都认；
+# 而 reasoning_effort / thinking_budget 各家键名与取值都不同，覆盖面窄且变动快。
+# 把详略控制押在通用参数上，厂商专属参数只作 best-effort 增强。
+#
+# max 档的 16000 不是内容上限，是防跑飞的安全阀：模型陷入循环时不至于烧光额度。
+_LEVEL_MAX_TOKENS = {"low": 1500, "medium": 3000, "high": 6000, "max": 16000}
+
+_LEVEL_DEPTH = {
+    "low": "【篇幅与深度】简明扼要：每部分只给最关键的结论与支撑数据，不铺陈。",
+    "medium": "【篇幅与深度】正常展开：结论、依据、关键数据之间的因果链要写清楚。",
+    "high": "【篇幅与深度】充分展开：多角度论证，交叉验证不同指标，并指出与结论相悖的信号。",
+    "max": (
+        "【篇幅与深度】尽可能详尽：穷尽事实块中每一条可用证据，逐项论证，"
+        "覆盖正反两面与边界情况。不要因为篇幅顾虑而省略任何有据可依的分析。"
+    ),
+}
+
+
+def normalize_reasoning_level(requested: Optional[str]) -> str:
+    """归一化档位；非法值一律回落 low（与前端默认一致）。"""
+    level = (requested or "low").strip().lower()
+    return level if level in _REASONING_LEVELS else "low"
+
+
+def reasoning_profile(requested: Optional[str] = None) -> tuple[str, int, str]:
+    """档位 → (归一档位, completion 预算, 写作深度指令)。
+
+    调用方把 max_tokens 传给 build_llm、把深度指令拼进 system prompt，
+    这样"详略跟着档位走"对任何厂商都成立，不依赖厂商是否支持 reasoning 参数。
+    """
+    level = normalize_reasoning_level(requested)
+    return level, _LEVEL_MAX_TOKENS[level], _LEVEL_DEPTH[level]
+
+
+def resolve_reasoning_effort(
+    *,
+    base_url: str,
+    model: str,
+    requested: Optional[str] = None,
+) -> Optional[str]:
+    """把应用四档映射为厂商支持值；普通/未知模型不发送该参数。
+
+    只发各厂商文档里确实存在的取值。曾经把 max 映射成 "xhigh" 下发给 OpenAI，
+    而 reasoning_effort 的合法值只有 minimal/low/medium/high——那是一个稳定 400。
+    """
+    level = normalize_reasoning_level(requested)
+    identity = f"{base_url} {model}".lower()
+    if "deepseek" in identity and re.search(r"(?:reasoner|deepseek-r|\br1\b)", identity):
+        return "high"
+    # o1-mini / o1-preview 不支持 reasoning_effort 参数，下发即 400，需排除
+    if re.search(r"\bo1-(?:mini|preview)\b", model.lower()):
+        return None
+    if re.search(r"(?:\bo[134](?:-|\b)|\bgpt-5(?:-|\b))", model.lower()):
+        return "high" if level == "max" else level
+    return None
+
+
+def _reasoning_kwargs(base_url: str, model: str, override: Optional[dict]) -> dict:
+    effective = resolve_reasoning_effort(
+        base_url=base_url,
+        model=model,
+        requested=(override or {}).get("reasoning_effort"),
+    )
+    return {"reasoning_effort": effective} if effective else {}
 
 
 def _resolve(override: Optional[dict]):
@@ -136,6 +251,9 @@ def build_llm(
         max_tokens=max_tokens,
         base_url=base_url,
         api_key=api_key,
+        timeout=_LLM_TIMEOUT,
+        profile=_model_profile(used_model),
+        **_reasoning_kwargs(base_url, used_model, override),
     )
 
 
@@ -155,6 +273,9 @@ def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
         streaming=False,
         base_url=base_url,
         api_key=api_key,
+        timeout=_LLM_TIMEOUT,
+        profile=_model_profile(model),
+        **_reasoning_kwargs(base_url, model, override),
     )
 
 

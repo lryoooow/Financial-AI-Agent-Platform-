@@ -1,5 +1,6 @@
 packages:
-  - '.'
+  - "."
+
 supportedArchitectures:
   os:
     - win32
@@ -10,5 +11,15 @@ supportedArchitectures:
     - arm64
   libc:
     - glibc
-# Refuse packages published < 7 days ago, matching the root pnpm-workspace.yaml.
+
+# Refuse packages published < 7 days ago.
 minimumReleaseAge: 10080
+
+overrides:
+  vite: 6.3.5
+
+allowBuilds:
+  "@tailwindcss/oxide": true
+  electron: true
+  electron-winstaller: true
+  esbuild: true

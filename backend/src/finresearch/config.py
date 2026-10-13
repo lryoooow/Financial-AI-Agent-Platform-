@@ -73,9 +73,18 @@ class Settings(BaseSettings):
     # 1.2.3：摘要改为默认走 LLM（+1 并发给 summary），四段分析不受影响。
     report_llm_concurrency: int = Field(default=4)
     report_section_timeout_s: float = Field(default=30.0)
-    # 提示词中的字数要求不是协议约束；同时限制 completion token 与最终展示字符数。
+
+    # 记忆与知识库（本地 rag.db + 生命周期）
+    memory_enabled: bool = Field(default=True)
+    memory_archive_days: int = Field(default=90)    # 会话闲置 N 天后归档（摘要保留、原文压缩落盘）
+    rag_chat_purge_days: int = Field(default=180)   # 对话片段向量 N 天后清理（摘要与报告不受影响）
+    # 以下两项只服务「整篇失败后的分段降级路径」。主路径（一次写完整篇）不设字数限制，
+    # 篇幅由用户选的思考档位决定（llm.reasoning_profile）——把它写成常量等于焊死用户的旋钮。
     report_section_max_tokens: int = Field(default=480)
     report_section_max_chars: int = Field(default=420)
+    # 整篇一次撰写：事实块要装下所有段（单段是 2400），耗时也远长于单段。
+    report_facts_max_chars: int = Field(default=7200)
+    report_timeout_s: float = Field(default=180.0)
     # 摘要必须先快速可见，详细章节再并发增强；避免“摘要 60s + 章节 60s”的串行双超时。
     report_use_llm_summary: bool = Field(default=False)
     context_summary_timeout_s: float = Field(default=20.0)

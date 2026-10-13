@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, Cpu } from "lucide-react";
 import { PROVIDERS } from "../data/providers";
-import { api, type LlmConfig } from "../api/client";
+import { api, type LlmConfig, type ReasoningLevel } from "../api/client";
+
+const REASONING_KEY = "finresearch_reasoning_effort";
+const REASONING_LEVELS: ReasoningLevel[] = ["low", "medium", "high", "max"];
+
+function loadReasoningLevel(): ReasoningLevel {
+  const saved = localStorage.getItem(REASONING_KEY);
+  return REASONING_LEVELS.includes(saved as ReasoningLevel) ? saved as ReasoningLevel : "low";
+}
 
 /**
  * 行内模型选择器（根因修复 #4/#5）。
@@ -41,6 +49,7 @@ export function loadPickerOptions(): PickerOption[] {
         base_url: (s.baseUrl || p.baseUrl || "").trim(),
         api_key: (s.apiKey || "").trim(),
         model: (s.selectedModel || "").trim(),
+        reasoning_effort: loadReasoningLevel(),
       },
     });
   }
@@ -94,6 +103,7 @@ export function ModelPicker({
   }, [options, active]);
   const [idx, setIdx] = useState<number>(defaultIdx);
   const [open, setOpen] = useState(false);
+  const [reasoning, setReasoning] = useState<ReasoningLevel>(() => loadReasoningLevel());
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -101,10 +111,14 @@ export function ModelPicker({
   }, [defaultIdx]);
 
   useEffect(() => {
-    if (options.length) onChange(options[Math.min(idx, options.length - 1)].llm);
+    if (options.length) onChange({ ...options[Math.min(idx, options.length - 1)].llm, reasoning_effort: reasoning });
     else onChange(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [options.length, idx]);
+  }, [options.length, idx, reasoning]);
+
+  useEffect(() => {
+    localStorage.setItem(REASONING_KEY, reasoning);
+  }, [reasoning]);
 
   useEffect(() => {
     if (!open) return;
@@ -140,6 +154,7 @@ export function ModelPicker({
         <Cpu className="size-3 shrink-0" style={{ color: cur.accent }} />
         <span className="hidden shrink-0 text-muted-foreground sm:inline">模型</span>
         <span className="truncate text-foreground/85">{cur.provider} · {cur.model}</span>
+        <span className="rounded bg-background/60 px-1 text-[9px] uppercase text-gold">{reasoning}</span>
         <ChevronDown className={`size-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
       </button>
 
@@ -165,6 +180,22 @@ export function ModelPicker({
               </button>
             );
           })}
+          <div className="mt-1 border-t border-border px-1.5 pt-2 pb-1">
+            <div className="mb-1.5 flex items-center justify-between text-[10px] text-muted-foreground"><span>思考强度</span><span>默认 low</span></div>
+            <div className="grid grid-cols-4 gap-1">
+              {REASONING_LEVELS.map((level) => (
+                <button
+                  key={level}
+                  type="button"
+                  onClick={() => setReasoning(level)}
+                  className={`rounded px-1 py-1 text-[9px] uppercase ${reasoning === level ? "bg-gold text-[#17140a]" : "bg-secondary text-muted-foreground hover:text-foreground"}`}
+                >
+                  {level}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[9px] leading-relaxed text-muted-foreground/70">档位为定性推理强度；后端会按模型能力映射，不等同于精确 token 上限。</p>
+          </div>
         </div>
       )}
     </div>

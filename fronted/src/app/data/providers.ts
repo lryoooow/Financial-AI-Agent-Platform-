@@ -23,6 +23,10 @@ export interface Provider {
   short: string; // 图标字母
   // 默认模型清单（2026-07 当前线）；"拉取最新模型"会从厂商实时覆盖
   models: ModelInfo[];
+  // 该厂商是否提供 OpenAI 兼容的向量模型（embeddings）。
+  // 有 → 配置界面提示用户可在「记忆嵌入」中启用，增强记忆/知识库的语义检索。
+  // 查证（2026-09）：DeepSeek 与 Kimi 官方均不提供 embeddings 端点。
+  embeddingModels?: string[];
 }
 
 export const PROVIDERS: Provider[] = [
@@ -50,6 +54,7 @@ export const PROVIDERS: Provider[] = [
     docsHint: "阿里云百炼控制台创建 DashScope Key",
     accent: "#615ced",
     short: "QW",
+    embeddingModels: ["text-embedding-v4", "text-embedding-v3"],
     models: [
       { id: "qwen3-max", label: "Qwen3-Max", context: "256K", tag: "旗舰" },
       { id: "qwen-plus", label: "Qwen3-Plus", context: "1M", tag: "推荐" },
@@ -67,6 +72,7 @@ export const PROVIDERS: Provider[] = [
     docsHint: "bigmodel.cn 开放平台获取 Key",
     accent: "#3859ff",
     short: "GLM",
+    embeddingModels: ["embedding-3"],
     models: [
       { id: "glm-5.2", label: "GLM-5.2", context: "1M", tag: "旗舰" },
       { id: "glm-5", label: "GLM-5", context: "200K", tag: "推荐" },
@@ -98,6 +104,7 @@ export const PROVIDERS: Provider[] = [
     docsHint: "火山方舟控制台创建推理接入点（模型 id 即接入点对应模型）",
     accent: "#3b5bff",
     short: "DB",
+    embeddingModels: ["doubao-embedding-large", "doubao-embedding"],
     models: [
       { id: "doubao-seed-2-0-pro-260215", label: "Doubao Seed 2.0 Pro", context: "256K", tag: "旗舰" },
       { id: "doubao-seed-2-0-mini-260428", label: "Doubao Seed 2.0 Mini", context: "256K", tag: "推荐" },
@@ -162,6 +169,7 @@ export const PROVIDERS: Provider[] = [
     docsHint: "platform.openai.com 获取 API Key",
     accent: "#10a37f",
     short: "AI",
+    embeddingModels: ["text-embedding-3-small", "text-embedding-3-large"],
     models: [
       { id: "gpt-5.5", label: "GPT-5.5", context: "1M", tag: "旗舰" },
       { id: "gpt-5.4", label: "GPT-5.4", context: "1M", tag: "推荐" },
@@ -194,6 +202,7 @@ export const PROVIDERS: Provider[] = [
     docsHint: "aistudio.google.com 获取 Key",
     accent: "#4285f4",
     short: "GE",
+    embeddingModels: ["gemini-embedding", "text-embedding-004"],
     models: [
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", context: "1M", tag: "旗舰" },
       { id: "gemini-3-flash-preview", label: "Gemini 3 Flash", context: "1M", tag: "极速" },

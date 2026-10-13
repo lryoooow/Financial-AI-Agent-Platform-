@@ -31,7 +31,11 @@ from deepagents.backends import StateBackend
 from ...llm import build_chart_llm, build_llm
 from ...tools.context import render_time_anchor
 from ..prompts import TEMPLATE_FOCUS
-from .chat_agent import ExcludeToolsMiddleware, _EXCLUDED_TOOLS
+from .chat_agent import (
+    RESEARCH_EXCLUDED_TOOLS,
+    ContextOverflowAdapterMiddleware,
+    ExcludeToolsMiddleware,
+)
 from .research_tools import build_research_tools
 from .tools import resolve_entity
 
@@ -48,7 +52,9 @@ RESEARCH_SYSTEM_PROMPT = """你是金融研究任务的执行者。你的职责�
 - 行业研究（任务是研究某个行业，如"光伏行业"、"半导体"）：
   1. 调用 prefetch_industry，传行业名称（如"光伏"）。
   2. 调用 compose_report 生成报告。
-最后用一句话说明结果，不要复述报告内容。
+compose_report 返回后任务即告完成：不要生成总结性文字、不要复述报告内容，
+只回复"已完成"三个字立即结束——报告已通过事件流直接送达用户，
+多余的收尾话术只会拖慢出报告的时间。
 
 【纪律】
 - 你没有任何计算能力，也不掌握任何实时数据。不要在回复里给出任何具体数值——
@@ -104,5 +110,8 @@ def build_research_agent(
         checkpointer=checkpointer,
         # 与对话链路同样摘掉 execute（"能跑 shell"，会破坏数字零幻觉）与 task
         # （研究是定向任务，不需要 general-purpose subagent 再套一层循环）。
-        middleware=[ExcludeToolsMiddleware(excluded=_EXCLUDED_TOOLS)],
+        middleware=[
+            ExcludeToolsMiddleware(excluded=RESEARCH_EXCLUDED_TOOLS),
+            ContextOverflowAdapterMiddleware(),
+        ],
     )

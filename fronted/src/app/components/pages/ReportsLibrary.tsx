@@ -153,6 +153,16 @@ export function ReportsLibrary({ tick, onNew }: { tick?: number; onNew: () => vo
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
 
+  // 自动刷新：报告生成中每 15 秒拉一次，确保新报告及时出现
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (tick !== undefined) return; // 已有外部触发时跳过
+      refresh();
+    }, 15000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);

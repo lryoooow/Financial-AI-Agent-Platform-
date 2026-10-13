@@ -6,8 +6,12 @@ _strip_md 旧实现最后三行是无差别字符删除（`.replace("*","")` 等
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
+from finresearch.api import routes
 from finresearch.api.routes import _strip_md
 
 
@@ -80,9 +84,60 @@ def test_structured_labels_are_preserved():
     assert _strip_md(text) == text
 
 
+def test_vision_fallback_removes_current_image_from_unseeded_history(monkeypatch):
+    from finresearch.agents.deep import chat_agent
+
+    captured = {}
+
+    class FakeAgent:
+        async def aget_state(self, _config):
+            return SimpleNamespace(values={})
+
+    async def fake_stream(_agent, inputs, _config):
+        captured.update(inputs)
+        yield routes.sse.ev_token("请补充文字描述"), "请补充文字描述"
+
+    monkeypatch.setattr(chat_agent, "build_chat_agent", lambda **kwargs: FakeAgent())
+    monkeypatch.setattr(routes, "get_checkpointer", lambda: (None, "memory"))
+    monkeypatch.setattr(routes, "build_llm", lambda **kwargs: object())
+    monkeypatch.setattr(routes, "_probe_vision", lambda _llm, _images: asyncio.sleep(0, result=False))
+    monkeypatch.setattr(routes, "stream_agent_sse", fake_stream)
+
+    async def scenario():
+        events = []
+        async for line, piece in routes._deepagent_chat_stream(
+            conv_id="conv-vision",
+            text="",
+            history=[{"role": "user", "content": "", "images": ["data:image/png;base64,AA=="]}],
+            profile={},
+            llm_cfg={"api_key": "test"},
+            images=["data:image/png;base64,AA=="],
+            user_msg={"role": "user", "content": "", "images": ["data:image/png;base64,AA=="]},
+        ):
+            events.append((line, piece))
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert '"type": "warning"' in events[0][0]
+    assert isinstance(captured["messages"][0]["content"], str)
+    assert "补充文字描述" in captured["messages"][0]["content"]
+
+
 # 原本这里有 test_node_labels_cover_every_graph_node，守的是"漏登记节点标签会让该节点
 # 静默通过、进度条不推进"。固定图已由 agent 取代，node_labels 不复存在，该不变量作废。
 # 它的等价物在 test_deep_agent.py:test_every_exposed_tool_has_a_chinese_label——
 # 工具漏登记标签同样会静默失真（把函数名甩给用户看）。
 
 
+
+
+def test_utc_iso_normalizes_naive_utc_timestamps():
+    """SQLite CURRENT_TIMESTAMP 是 UTC naive，裸 isoformat() 前端会按本地时区解析（差 8 小时）。"""
+    import datetime as dt
+
+    naive = dt.datetime(2026, 9, 28, 5, 30, 0)  # UTC naive（DB 读回形态）
+    assert routes._utc_iso(naive) == "2026-09-28T05:30:00+00:00"
+    aware = dt.datetime(2026, 9, 28, 13, 30, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+    assert routes._utc_iso(aware) == "2026-09-28T05:30:00+00:00"  # 东八区 → UTC 归一
+    assert routes._utc_iso(None) == ""

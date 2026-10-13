@@ -47,6 +47,11 @@ async function compressImage(file: File, maxDim = 1280, quality = 0.82): Promise
   });
 }
 
+async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
+  const response = await fetch(dataUrl);
+  return response.blob();
+}
+
 /** 阶段摘要文字的打字机滚动动效（逐字浮现 + 光标），比静态文字 + 跳点更具"思考动效"。 */
 function Typewriter({ text, className }: { text: string; className?: string }) {
   const [n, setN] = useState(0);
@@ -88,6 +93,12 @@ export function ChatDesk({
   const [stage, setStage] = useState("");
   const [streamingId, setStreamingId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 当前查看会话 id 的同步镜像：SSE 回调闭包拿到的 current 是发送时的旧值，
+  // 校验"用户是否已切走会话"必须读 ref，否则旧会话的 done/error 会覆盖新会话界面
+  const currentIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentIdRef.current = current?.id ?? null;
+  }, [current]);
 
   // 图片上传状态
   const [pendingImages, setPendingImages] = useState<string[]>([]); // 待发送的 base64 data URL
@@ -120,14 +131,24 @@ export function ChatDesk({
     refreshList(showArchived).catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [showArchived]);
 
+  // 流式跟随只在用户本来就贴底时才发生。曾经每个 token 触发一次 smooth 滚动：
+  // 动画被高频打断表现为抖动卡顿，且会把正在上翻历史的用户强行拉回底部。
+  const atBottomRef = useRef(true);
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    if (!atBottomRef.current) return;
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages, loading]);
 
   async function openConversation(id: string) {
     setError("");
     try {
       const r = await api.chatConversation(id);
+      atBottomRef.current = true; // 换会话回到贴底跟随，避免沿用旧会话的上翻状态
       setCurrent(r.conversation);
       setMessages(r.messages);
     } catch (e) {
@@ -200,6 +221,7 @@ export function ChatDesk({
       { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
     ]);
     setStreamingId(assistantId);
+    let conversationId = current?.id || "";
     try {
       let conv = current;
       if (!conv) {
@@ -208,25 +230,45 @@ export function ChatDesk({
         setCurrent(conv);
         setConversations((prev) => [conv!, ...prev]);
       }
-      await api.sendChatMessageStream(conv.id, text, llm, imgs.length ? imgs : undefined, {
+      conversationId = conv.id;
+      const assets = await Promise.all(imgs.map(async (image) => api.uploadChatImage(await dataUrlToBlob(image))));
+      await api.sendChatMessageStream(conv.id, text, llm, undefined, {
+        imageAssetIds: assets.map((asset) => asset.asset_id),
         onStage: (_s, label) => setStage(label),
+        onWarning: (message) => setError(message),
         onToken: (piece) =>
           setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x))),
         onDone: (payload) => {
-          if (payload.conversation) setCurrent(payload.conversation);
-          setMessages(payload.messages?.length ? payload.messages : (m) => m);
+          // 流式期间用户可能已切到别的会话：旧会话的完成事件只许更新列表，
+          // 不许把界面强制切回旧会话、也不许用旧会话消息覆盖当前列表
+          const stillViewing = currentIdRef.current === conversationId;
+          if (stillViewing) {
+            if (payload.conversation) setCurrent(payload.conversation);
+            if (payload.messages?.length) setMessages(payload.messages);
+          }
           setStreamingId(null);
           refreshList(false);
         },
         onError: (msg) => {
           setError(msg);
-          setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
           setStreamingId(null);
+          if (currentIdRef.current === conversationId) {
+            void api.chatConversation(conversationId)
+              .then((payload) => {
+                if (currentIdRef.current === conversationId) setMessages(payload.messages);
+              })
+              .catch(() => {});
+          }
         },
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content) && x.id !== optimistic.id));
+      if (conversationId) {
+        try {
+          const payload = await api.chatConversation(conversationId);
+          setMessages(payload.messages);
+        } catch {}
+      }
       setStreamingId(null);
     } finally {
       setLoading(false);
@@ -325,7 +367,7 @@ export function ChatDesk({
           <ModelPicker active={activeModel} onChange={setLlm} onGoSettings={onGoSettings} />
         </div>
 
-        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+        <div ref={scrollRef} onScroll={handleScroll} className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
           {!messages.length && !loading && !showArchived && (
             <div className="h-full grid place-items-center">
               <div className="max-w-xl w-full">
@@ -388,9 +430,9 @@ export function ChatDesk({
                   ) : (
                     <>
                       {m.content && <span className="whitespace-pre-wrap">{m.content}</span>}
-                      {m.images?.length ? (
+                      {(m.images?.length || m.image_asset_ids?.length) ? (
                         <div className={`grid grid-cols-2 gap-1.5 ${m.content ? "mt-2" : ""} max-w-[280px]`}>
-                          {m.images.map((img, i) => (
+                          {[...(m.images || []), ...(m.image_asset_ids || []).map(api.imageAssetUrl)].map((img, i) => (
                             <img
                               key={i}
                               src={img}

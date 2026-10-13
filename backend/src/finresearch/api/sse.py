@@ -59,3 +59,8 @@ def ev_done(report: Any) -> str:
 
 def ev_error(message: str) -> str:
     return sse({"type": "error", "message": message})
+
+
+def ev_warning(message: str) -> str:
+    """可恢复告警，不结束当前 SSE 流。"""
+    return sse({"type": "warning", "message": message})

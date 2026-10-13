@@ -5,6 +5,8 @@ import { ChatDesk } from "./components/pages/ChatDesk";
 import { ResearchTasks } from "./components/pages/ResearchTasks";
 import { ReportsLibrary } from "./components/pages/ReportsLibrary";
 import { Settings } from "./components/pages/Settings";
+import { KnowledgeBase } from "./components/pages/KnowledgeBase";
+import { MarketView } from "./components/pages/MarketView";
 import { api } from "./api/client";
 
 interface ActiveModel { providerId: string; modelId: string; provider: string; model: string; accent: string; }
@@ -16,6 +18,7 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem("finresearch_active") || "null"); } catch { return null; }
   });
   const [reportsTick, setReportsTick] = useState(0); // 新报告生成后触发报告库刷新
+  const [selectedCode, setSelectedCode] = useState("000001.SH"); // 初始展示大盘（上证指数）而非个股
 
   useEffect(() => {
     let cancelled = false;
@@ -33,34 +36,56 @@ export default function App() {
   }, [active]);
 
   const activeModel = active ? { provider: active.provider, model: active.model, accent: active.accent } : null;
-  const vis = (id: PageId) => (page === id ? "h-full" : "h-full hidden");
+
+  const renderPage = () => {
+    switch (page) {
+      case "market":
+        return (
+          <MarketView
+            code={selectedCode}
+            active
+            activeModel={activeModel}
+            onSelect={setSelectedCode}
+            onOpenResearch={(code) => {
+              setSelectedCode(code);
+              setPage("research");
+            }}
+            onGoSettings={() => setPage("settings")}
+          />
+        );
+      case "research":
+        return (
+          <ResearchTasks
+            selectedCode={selectedCode}
+            onSelectCode={setSelectedCode}
+            activeModel={activeModel}
+            onGoSettings={() => setPage("settings")}
+            onReportGenerated={() => setReportsTick((tick) => tick + 1)}
+          />
+        );
+      case "reports":
+        return <ReportsLibrary tick={reportsTick} onNew={() => setPage("research")} />;
+      case "kb":
+        return <KnowledgeBase />;
+      case "settings":
+        return (
+          <Settings
+            active={active ? { providerId: active.providerId, modelId: active.modelId } : null}
+            onActivate={(provider) => setActive(provider)}
+          />
+        );
+      case "chat":
+      default:
+        return <ChatDesk activeModel={activeModel} onGoSettings={() => setPage("settings")} />;
+    }
+  };
 
   return (
     <div className="size-full flex flex-col bg-background text-foreground overflow-hidden">
       <TitleBar />
       <div className="flex-1 flex min-h-0">
         <Sidebar page={page} onNavigate={setPage} />
-        <main className="flex-1 min-w-0 relative">
-          <div className={vis("chat")}>
-            <ChatDesk activeModel={activeModel} onGoSettings={() => setPage("settings")} />
-          </div>
-          <div className={vis("research")}>
-            <ResearchTasks
-              activeModel={activeModel}
-              onGoSettings={() => setPage("settings")}
-              onReportGenerated={() => setReportsTick((t) => t + 1)}
-            />
-          </div>
-          <div className={vis("reports")}>
-            <ReportsLibrary tick={reportsTick} onNew={() => setPage("research")} />
-          </div>
-          <div className={vis("settings")}>
-            <Settings
-              active={active ? { providerId: active.providerId, modelId: active.modelId } : null}
-              onActivate={(p) => setActive(p)}
-            />
-          </div>
-        </main>
+        <main className="relative min-w-0 flex-1" data-page={page}>{renderPage()}</main>
       </div>
     </div>
   );

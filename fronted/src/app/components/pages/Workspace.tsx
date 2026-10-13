@@ -8,12 +8,15 @@ import { api, type EvidenceStatus, type LlmConfig, type ResolveHit } from "../..
 import { ModelPicker } from "../ModelPicker";
 
 interface ActiveModel { provider: string; model: string; accent: string; }
+/** 从任务列表发起的"恢复查看"请求：nonce 变化触发一次附着（同一任务可重复恢复）。 */
+export interface AttachRequest { taskId: string; code: string; template: TemplateId; nonce: number; }
 interface Props {
-  initialCode?: string;
   selectedCode?: string;
+  onSelectCode?: (code: string) => void;
   activeModel: ActiveModel | null;
   onGoSettings: () => void;
   onReportGenerated: (r: { id: string; name: string; code: string; template: string; date: string; summary: string }) => void;
+  attachRequest?: AttachRequest;
 }
 
 interface CurrentStock {
@@ -34,6 +37,7 @@ interface ToolCall {
   label: string;
   status: "start" | "ok" | "error";
   events: { text: string; time: string }[];
+  callId?: string;
 }
 
 /** agent 的待办快照（write_todos）。当前模板化研究只有取数+撰写两步，不需要待办；
@@ -54,7 +58,7 @@ const SUMMARY_LABEL: Record<TemplateId, string> = {
   risk: "风险评估摘要",
 };
 
-export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings, onReportGenerated }: Props) {
+export function Workspace({ selectedCode, onSelectCode, activeModel, onGoSettings, onReportGenerated, attachRequest }: Props) {
   const [query, setQuery] = useState(selectedCode ?? "");
   const [template, setTemplate] = useState<TemplateId>("equity_deep");
   const [displayTemplate, setDisplayTemplate] = useState<TemplateId>("equity_deep");
@@ -72,14 +76,72 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   const runId = useRef(0);
   const reportRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (initialCode) {
-      const code = initialCode.split(":")[0];
-      setQuery(code);
-      run(code);
+  // 流式 token 的合帧缓冲：SSE 每来一帧就 setState 的话，每次重渲染的是**已累积的全部正文**，
+  // 越写到后面单帧成本越高（O(n²)），表现为"先卡住、然后一次性刷出一大段"。
+  // 这里把同一帧动画周期内到达的 token 按段合并，一次性提交。
+  const tokenBuffer = useRef<Map<string, string>>(new Map());
+  const flushHandle = useRef<number | null>(null);
+  // 光标跟随目标：最近收到 token 的段（并行补写时末段可能在等模型，光标挂它会误导）
+  const activeTitleRef = useRef<string | null>(null);
+
+  const flushTokens = () => {
+    flushHandle.current = null;
+    const pending = tokenBuffer.current;
+    if (!pending.size) return;
+    tokenBuffer.current = new Map();
+    // 摘要 token 走 setTyped（打字机追加）；正文 token 走 partialSections
+    const summaryText = pending.get("__summary__");
+    if (summaryText) {
+      pending.delete("__summary__");
+      setTyped((t) => t + summaryText);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialCode]);
+    if (!pending.size) return;
+    setPartialSections((items) => {
+      const next = items.slice();
+      pending.forEach((text, title) => {
+        const idx = next.findIndex((item) => item.title === title);
+        if (idx === -1) next.push({ title, body: text });
+        else next[idx] = { title, body: next[idx].body + text };
+      });
+      // 段落顺序按模板序归位：token 可能先于 section_start 到达（补写段/回放折叠帧），
+      // 不排序会错位到末尾
+      const order = SECTION_ORDER[displayTemplate];
+      return next.sort((a, b) => {
+        const ai = order.indexOf(a.title);
+        const bi = order.indexOf(b.title);
+        return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+      });
+    });
+    // 光标跟着"最近在写的段"走，而不是数组末段（多段并行补写时末段可能在等模型）
+    const titles = [...pending.keys()];
+    if (titles.length) activeTitleRef.current = titles[titles.length - 1];
+  };
+
+  const queueToken = (title: string, text: string) => {
+    if (!text) return;
+    tokenBuffer.current.set(title, (tokenBuffer.current.get(title) ?? "") + text);
+    activeTitleRef.current = title;
+    if (flushHandle.current == null) {
+      flushHandle.current = window.requestAnimationFrame(flushTokens);
+      // 后台标签页 rAF 会被暂停（回焦后缓冲一次性 flush = "整块出现"），定时器兜底
+      window.setTimeout(() => {
+        if (flushHandle.current != null) flushTokens();
+      }, 250);
+    }
+  };
+
+  /** 段收口/流结束前必须排空缓冲，否则最后一批 token 会丢。 */
+  const drainTokens = () => {
+    if (flushHandle.current != null) {
+      window.cancelAnimationFrame(flushHandle.current);
+      flushHandle.current = null;
+    }
+    flushTokens();
+  };
+
+  useEffect(() => () => {
+    if (flushHandle.current != null) window.cancelAnimationFrame(flushHandle.current);
+  }, []);
 
   useEffect(() => {
     if (!selectedCode || phase === "running") return;
@@ -119,8 +181,9 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
     if (!m) return null;
     const pure = m[1];
     if (m[2]) return `${pure}.${m[2]}`;
-    if (/^(60|68|90|11|51|56)/.test(pure)) return `${pure}.SH`;
-    if (/^(43|83|87|88)/.test(pure)) return `${pure}.BJ`;
+    // 上交所：60 主板 / 68 科创板 / 90 B股 / 11 可转债 / 50、51、52、56、58 ETF（588xxx 科创板 ETF）
+    if (/^(60|68|90|11|50|51|52|56|58)/.test(pure)) return `${pure}.SH`;
+    if (/^(43|83|87|88|92)/.test(pure)) return `${pure}.BJ`;
     return `${pure}.SZ`;
   }
 
@@ -143,11 +206,15 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   }
 
   // —— 后端真实流程（SSE）：失败直接展示错误，禁止回退 mock ——
-  async function runBackend(resolved: CurrentStock): Promise<boolean> {
+  // attachTaskId：恢复/附着一个已存在的任务（直连其 SSE，不重新 createResearch——
+  // 避免"应用重启后误重启付费研究"）；templateOverride：附着时模板来自任务元数据
+  // 而非当前 UI 状态（setState 在同一 tick 内不可见）。
+  async function runBackend(resolved: CurrentStock, attachTaskId?: string, templateOverride?: TemplateId): Promise<boolean> {
     const id = ++runId.current;
-    const runTemplate = template;
+    const runTemplate = templateOverride ?? template;
     setDisplayTemplate(runTemplate);
     setStock(resolved);
+    if (runTemplate !== "industry") onSelectCode?.(resolved.code);
     setPhase("running");
     setDoc(null);
     setTyped("");
@@ -166,46 +233,72 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
       });
 
     let taskId: string;
-    try {
-      const r = await api.createResearch(resolved.code, runTemplate, undefined, llm ?? undefined);
-      taskId = r.task_id;
-    } catch {
-      setError("无法提交研究任务：后端服务不可用或真实数据接口异常。");
-      setPhase("idle");
-      return false;
+    if (attachTaskId) {
+      // 恢复附着：任务已存在，直连其流（后端回放 history + 订阅直播）
+      taskId = attachTaskId;
+    } else {
+      try {
+        const r = await api.createResearch(resolved.code, runTemplate, undefined, llm ?? undefined);
+        taskId = r.task_id;
+      } catch {
+        setError("无法提交研究任务：后端服务不可用或真实数据接口异常。");
+        setPhase("idle");
+        return false;
+      }
     }
     if (runId.current !== id) return true;
 
     emit(`提交研究任务 ${taskId.slice(0, 8)}…`);
     await new Promise<void>((resolve) => {
       const es = new EventSource(api.researchStreamUrl(taskId, resolved.code, runTemplate));
+      // 重连语义：后端为断线设计了 history 回放（段级折叠后一份完整报告都能装下），
+      // EventSource 断开后会自动重连。这里不在首个 onerror 上放弃——那会把仍在后台
+      // 正常运行的任务打成"失败"，过一会儿报告又"自己冒出来"，两处状态互相矛盾。
+      let consecutiveErrors = 0;
+      let terminal = false;
       const finish = () => { try { es.close(); } catch {} resolve(); };
       es.onmessage = (e: MessageEvent) => {
-        if (runId.current !== id) { finish(); return; }
+        if (runId.current !== id || terminal) { finish(); return; }
+        consecutiveErrors = 0; // 有帧到达即视为连接健康
         let ev: any;
         try { ev = JSON.parse(e.data); } catch { return; }
         if (ev.type === "tool_call") {
-          // agent 真实工具调用：start 追加一条，ok/error 更新最后那条同名的状态。
+          // 工具调用配对：优先按 call_id 精确匹配，无 id 时配最旧的 start 同名芯片（FIFO）
           setToolCalls((calls) => {
+            const callId = (ev as any).call_id || "";
             if (ev.status === "start") {
+              // 去重：同 call_id 已有芯片则不追加
+              if (callId && calls.some((c) => c.callId === callId)) return calls;
               const placeholder = calls.length === 1 && calls[0].name === "_task" ? calls[0].events : [];
               const base = calls.filter((c) => c.name !== "_task");
-              return [...base, { name: ev.name, label: ev.label || ev.name, status: "start", events: placeholder }];
+              return [...base, { name: ev.name, label: ev.label || ev.name, status: "start", events: placeholder, callId }];
             }
-            for (let i = calls.length - 1; i >= 0; i--) {
-              if (calls[i].name === ev.name) {
-                const next = [...calls];
-                next[i] = { ...next[i], status: ev.status };
-                return next;
-              }
+            // ok/error：按 call_id 精确配对
+            let idx = -1;
+            if (callId) {
+              idx = calls.findIndex((c) => c.callId === callId);
             }
-            return calls;
+            // 无 id 时配最旧的 start 同名芯片（FIFO，对顺序重复调用正确）
+            if (idx === -1) {
+              idx = calls.findIndex((c) => c.name === ev.name && c.status === "start");
+            }
+            // 兜底：最后一条同名
+            if (idx === -1) {
+              idx = calls.findLastIndex?.((c) => c.name === ev.name) ?? -1;
+            }
+            if (idx >= 0) {
+              const next = [...calls];
+              next[idx] = { ...next[idx], status: ev.status };
+              return next;
+            }
+            return calls; // 配不上不追加（terminal replay 已兜底）
           });
         } else if (ev.type === "todo") {
           setTodos(ev.items ?? []);
         } else if (ev.type === "tool") {
           emit(ev.text);
         } else if (ev.type === "summary") {
+          drainTokens(); // 排空残留的摘要 token，防替换后追加闪变
           setTyped(ev.text ?? "");
           if (ev.name || ev.ticker) {
             setStock((current) => ({
@@ -217,36 +310,36 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
               changePct: ev.changePct ?? current.changePct,
             }));
           }
+        } else if (ev.type === "summary_token") {
+          // 摘要逐 token 流（打字机效果）：走与 section_token 相同的 rAF 合帧通道
+          queueToken("__summary__", ev.text ?? "");
         } else if (ev.type === "token") {
           // 兼容旧后端；新后端使用 summary 快照，重连时不会重复 append。
           setTyped((t) => t + (ev.text ?? ""));
         } else if (ev.type === "section_start") {
-          // 真流式：某板块开始撰写，建一个空 body 的段并按模板序插入（不重复建段）
+          // 某部分开始撰写，建一个空 body 的段并按模板序插入。
+          // 已存在的段必须清空 body：整篇失败降级到分段重写时会重发 section_start，
+          // 旧实现"已存在则原样返回"会把被中止的半截正文与重写正文拼成脏流。
           const title = ev.title ?? "分析章节";
+          drainTokens();   // 切段前把上一段的残留 token 落盘，避免串到新段
           setPartialSections((items) =>
-            items.some((item) => item.title === title)
-              ? items
-              : [...items, { title, body: "" }].sort((a, b) => {
-                  const order = SECTION_ORDER[runTemplate];
-                  const ai = order.indexOf(a.title);
-                  const bi = order.indexOf(b.title);
-                  return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
-                })
+            (items.some((item) => item.title === title)
+              ? items.map((item) => (item.title === title ? { title, body: "" } : item))
+              : [...items, { title, body: "" }]
+            ).sort((a, b) => {
+              const order = SECTION_ORDER[runTemplate];
+              const ai = order.indexOf(a.title);
+              const bi = order.indexOf(b.title);
+              return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+            })
           );
         } else if (ev.type === "section_token") {
-          // 真流式：逐 token 追加到对应板块 body（打字机效果）
-          const title = ev.title ?? "分析章节";
-          const token = ev.text ?? "";
-          setPartialSections((items) => {
-            const idx = items.findIndex((item) => item.title === title);
-            if (idx === -1) return [...items, { title, body: token }];
-            const next = items.slice();
-            next[idx] = { title, body: next[idx].body + token };
-            return next;
-          });
+          // 逐 token 追加（按帧合并后提交，见 queueToken）
+          queueToken(ev.title ?? "分析章节", ev.text ?? "");
         } else if (ev.type === "section") {
-          // 权威收口：用最终 body 覆盖流式累积（截断/禁用词回退后以此为准）
+          // 权威收口：用最终 body 覆盖流式累积（漏段回退/降级后以此为准）
           const section = { title: ev.title ?? "分析章节", body: ev.body ?? "" };
+          drainTokens();
           setPartialSections((items) => [
             ...items.filter((item) => item.title !== section.title),
             section,
@@ -257,20 +350,32 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
             return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
           }));
         } else if (ev.type === "done") {
+          if (terminal) { finish(); return; }
+          terminal = true; // 重连回放会再次送达 done：报告入库回调只许触发一次
+          // 终态兜底：任务已结束，仍处于 start 的芯片不可能再等到 ok 帧
+          // （丢帧/重复 start 配对失败/异常路径），统一收口为完成态，杜绝永久转圈。
+          setToolCalls((calls) => calls.map((c) => (c.status === "start" ? { ...c, status: "ok" } : c)));
           const rep = ev.report;
           const reportId = ev.report_id || `${resolved.code}-${Date.now()}`;
+          drainTokens();   // 排空最后一批 token，否则末尾会缺一小段
           setDoc(rep);
           setStock((current) => ({
             ...current,
             code: rep?.ticker || current.code,
             name: rep?.name || current.name,
           }));
+          if (rep?.ticker) onSelectCode?.(rep.ticker);
           setPhase("done");
           reportRef.current?.scrollTo({ top: 0 });
           onReportGenerated({ id: reportId, name: rep?.name || resolved.name, code: rep?.ticker || resolved.code, template: TEMPLATES.find((t) => t.id === runTemplate)!.label, date: rep?.as_of ?? new Date().toLocaleString("zh-CN", { hour12: false }), summary: rep?.summary ?? "" });
           finish();
         } else if (ev.type === "error") {
+          if (terminal) { finish(); return; }
+          terminal = true;
+          // 终态兜底：失败的 run 里没跑完的工具芯片标 error，不再永久转圈
+          setToolCalls((calls) => calls.map((c) => (c.status === "start" ? { ...c, status: "error" } : c)));
           const message = ev.message ?? "研究管线失败";
+          drainTokens();   // 出错也要保留已经流出来的内容
           emit(`⚠ ${message}`);
           setError(message);
           setPhase("idle");
@@ -278,15 +383,62 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
         }
       };
       es.onerror = () => {
-        if (runId.current === id) {
-          setError("研究流连接中断，请检查后端服务或模型响应。");
+        if (runId.current !== id || terminal) { finish(); return; }
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= 6) {
+          setError("研究流连接中断（多次重连失败）。任务可能仍在后台运行，完成后会出现在报告库。");
           setPhase("idle");
+          finish();
+          return;
         }
-        finish();
+        // 重连成功后后端整段回放 history：本地清空待回放重建，
+        // 避免工具轨迹/段落/摘要与已渲染内容重复叠加
+        setToolCalls([]);
+        setTodos([]);
+        setPartialSections([]);
+        setTyped("");
+        emit(`研究流中断，正在重连（${consecutiveErrors}/6）…`);
       };
     });
     return true;
   }
+
+  // 挂载时自动恢复运行中的研究任务（刷新/切页回来不丢进度）。
+  // 直连任务 SSE 附着而非重新提交：后端回放 history + 订阅直播帧；
+  // 应用重启后的孤儿任务会被后端如实标记中断（终态 error 帧），不会误启新的付费研究。
+  const autoResumed = useRef(false);
+  useEffect(() => {
+    if (autoResumed.current) return;
+    autoResumed.current = true;
+    api.researchTasks()
+      .then(({ tasks }) => {
+        // 取最近一条有意义的任务（后端已按 updated_at desc 排序）
+        // running/pending → 附着直播流；succeeded → 附着终态回放（后端发完整 done 帧）
+        const active = tasks.find(
+          (t) => t.status === "running" || t.status === "pending"
+            || (t.status === "succeeded" && t.report_id)
+        );
+        if (!active) return;
+        setQuery(active.code);
+        setTemplate(active.template as TemplateId);
+        void runBackend(
+          { code: active.code, name: active.code },
+          active.id,
+          active.template as TemplateId,
+        );
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 任务列表发起的"恢复查看"（ResearchTasks 页）
+  useEffect(() => {
+    if (!attachRequest) return;
+    setQuery(attachRequest.code);
+    setTemplate(attachRequest.template);
+    void runBackend({ code: attachRequest.code, name: attachRequest.code }, attachRequest.taskId, attachRequest.template);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attachRequest?.nonce]);
 
   async function run(qOverride?: string) {
     const raw = qOverride ?? query;
@@ -311,6 +463,19 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   }
 
   const running = phase === "running";
+
+  // 终态强制收口：phase 变为 done/error 时，所有 start 芯片必定变绿/变红。
+  // 曾经只在 done 事件的内联 setToolCalls 里做——如果 React 批处理/时序
+  // 导致那次 setState 被跳过（或在 finish() 之后执行），芯片就永远转圈。
+  // useEffect 在渲染后必定执行，是结构性兜底。
+  useEffect(() => {
+    if (phase === "done") {
+      setToolCalls((calls) => calls.map((c) => (c.status === "start" ? { ...c, status: "ok" as const } : c)));
+    } else if (phase === "idle") {
+      // error 路径 phase 回到 idle
+      setToolCalls((calls) => calls.map((c) => (c.status === "start" ? { ...c, status: "error" as const } : c)));
+    }
+  }, [phase]);
 
   return (
     <div className="h-full min-h-0 grid grid-cols-1 xl:grid-cols-[380px_1fr] gap-4 p-5 overflow-hidden">
@@ -361,7 +526,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
 
           <div className="flex flex-wrap gap-1.5 mt-2.5">
             {WATCHLIST.slice(0, 5).map((s) => (
-              <button key={s.code} onClick={() => { setQuery(s.name); }} className="text-[11px] px-2 py-1 rounded-md bg-secondary/60 hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
+              <button key={s.code} onClick={() => { setQuery(s.code); onSelectCode?.(s.code); }} className="text-[11px] px-2 py-1 rounded-md bg-secondary/60 hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors">
                 {s.name}
               </button>
             ))}
@@ -491,6 +656,7 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
             sections={doc?.sections || partialSections}
             template={displayTemplate}
             running={phase === "running"}
+            activeTitle={phase === "running" ? activeTitleRef.current : undefined}
           />
         )}
       </div>
@@ -498,22 +664,29 @@ export function Workspace({ initialCode, selectedCode, activeModel, onGoSettings
   );
 }
 
-function ResearchReportView({ doc, stock, summary, sections, template, running }: {
+function ResearchReportView({ doc, stock, summary, sections, template, running, activeTitle }: {
   doc: ReportDoc | null;
   stock: CurrentStock;
   summary: string;
   sections: { title: string; body: string }[];
   template: TemplateId;
   running: boolean;
+  activeTitle?: string;
 }) {
-  const stagger = (i: number) => ({ initial: { opacity: 0, y: 14 }, animate: { opacity: 1, y: 0 }, transition: { delay: 0.08 * i, duration: 0.5, ease: [0.16, 1, 0.3, 1] as any } });
-  const expected = SECTION_ORDER[template];
-  const visibleSections = running
-    ? [
-        ...expected.map((title) => ({ title, body: sections.find((item) => item.title === title)?.body || "", pending: !sections.some((item) => item.title === title) })),
-        ...sections.filter((item) => !expected.includes(item.title)).map((item) => ({ ...item, pending: false })),
-      ]
-    : sections.map((item) => ({ ...item, pending: false }));
+  // 生成中不做入场延迟：正文是逐字流进来的，再叠一个 0.08*i 的错峰动画，
+  // 段落会慢半拍才浮现，看起来就像"一段一段蹦出来"。
+  const stagger = (i: number) => ({
+    initial: { opacity: 0, y: 14 },
+    animate: { opacity: 1, y: 0 },
+    transition: { delay: running ? 0 : 0.08 * i, duration: running ? 0.2 : 0.5, ease: [0.16, 1, 0.3, 1] as any },
+  });
+  // 只渲染真正开始撰写的部分。
+  //
+  // 此前这里按 SECTION_ORDER 把全部标题预先摆出来，未到达的显示"正在生成本章节…"转圈——
+  // 于是一开门就是一副空骨架 + 四个转圈，然后被逐格填满。后端早已改成一次写完整篇，
+  // 但这层把它重新渲染成了"分章节等待"，观感反而更乱。
+  // 现在标题随正文一起出现：写到哪、显示到哪，从头到尾一条连续的文章。
+  const visibleSections = sections;
   const observationLabel = template === "risk" ? "监测重点" : template === "earnings" ? "后续观察" : template === "industry" ? "行业催化" : "催化剂";
   return (
     <div className="p-6 max-w-3xl mx-auto">
@@ -522,7 +695,7 @@ function ResearchReportView({ doc, stock, summary, sections, template, running }
           <span className="px-2 py-0.5 rounded bg-accent">{TEMPLATES.find((t) => t.id === template)!.label}</span>
           <span className={`flex items-center gap-1 ${running ? "text-gold" : "text-down"}`}>
             {running ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}
-            {running ? "分章节生成中" : "数字零幻觉 · 可溯源"}
+            {running ? "连续撰写中" : "数字零幻觉 · 可溯源"}
           </span>
         </div>
         <h1 className="font-display" style={{ fontSize: 26, fontWeight: 700 }}>
@@ -565,28 +738,32 @@ function ResearchReportView({ doc, stock, summary, sections, template, running }
         </div>
       </motion.div>}
 
-      {visibleSections.map((sec, i) => (
-        <motion.div key={sec.title} {...stagger(3 + i)} className="mt-6">
-          <h2 className="font-display border-l-[3px] border-gold pl-2.5 mb-2" style={{ fontSize: 16, fontWeight: 600 }}>{sec.title}</h2>
-          {sec.pending ? (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin text-gold" /> 正在生成本章节…
-            </div>
-          ) : sec.body.trim() ? (
-            <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">{sec.body}</p>
-          ) : (
-            // 双保险：段已到达但正文为空（后端理应已兜底回退模板，这里防任何空 body 泄漏到 UI，
-            // 不让用户面对一片空白的标题）。running 时当作仍在生成，done 后如实说明本段无内容。
-            running ? (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Loader2 className="size-3.5 animate-spin text-gold" /> 正在生成本章节…
-              </div>
+      {visibleSections.map((sec, i) => {
+        const isActive = running && sec.title === (activeTitle ?? visibleSections[visibleSections.length - 1]?.title);
+        return (
+          <motion.div key={sec.title} {...stagger(3 + i)} className="mt-6">
+            <h2 className="font-display border-l-[3px] border-gold pl-2.5 mb-2" style={{ fontSize: 16, fontWeight: 600 }}>{sec.title}</h2>
+            {sec.body.trim() ? (
+              <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">
+                {sec.body}
+                {/* 光标只跟在正在写的那一段末尾，标记"笔停在这里"，而不是每段都挂一个转圈 */}
+                {isActive && (
+                  <span className="ml-0.5 inline-block h-4 w-1.5 -mb-0.5 animate-pulse rounded-sm bg-gold align-middle" />
+                )}
+              </p>
+            ) : running ? (
+              // 标题刚到、正文还没流出来的那一瞬间：只留光标，不要转圈+文案，
+              // 否则每段开头都会闪一下"正在生成本章节…"，又变回分段等待的观感。
+              <p className="text-sm leading-relaxed">
+                <span className="inline-block h-4 w-1.5 -mb-0.5 animate-pulse rounded-sm bg-gold align-middle" />
+              </p>
             ) : (
+              // 双保险：段已到达但正文为空（后端理应已兜底回退模板，这里防任何空 body 泄漏到 UI）
               <p className="text-xs text-muted-foreground">本章节暂无可展示内容（数据不足或撰写失败）。</p>
-            )
-          )}
-        </motion.div>
-      ))}
+            )}
+          </motion.div>
+        );
+      })}
 
       {doc && <motion.div {...stagger(3 + sections.length)} className="mt-6">
         <h2 className="font-display border-l-[3px] border-up pl-2.5 mb-2 flex items-center gap-2" style={{ fontSize: 16, fontWeight: 600 }}>

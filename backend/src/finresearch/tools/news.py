@@ -37,10 +37,13 @@ def _news_direct(raw: str, limit: int) -> List[dict]:
         }},
     }
     callback = "jQuery_finresearch"
+    # Referer 头必须纯 ASCII：行业研究传中文关键词（如"光伏"）时未编码会触发
+    # requests 的 latin-1 头编码错误，直连永远失败、每次都回退慢速 akshare。
+    from urllib.parse import quote as _urlquote
     resp = requests.get(
         "https://search-api-web.eastmoney.com/search/jsonp",
         params={"cb": callback, "param": json.dumps(inner, ensure_ascii=True), "_": "1"},
-        headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://so.eastmoney.com/news/s?keyword={raw}"},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": f"https://so.eastmoney.com/news/s?keyword={_urlquote(str(raw))}"},
         timeout=6,
     )
     resp.raise_for_status()

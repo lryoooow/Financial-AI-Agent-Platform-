@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+# ruff: noqa: E402
 import asyncio
 import logging
 import os
+import socket
 import sys
 from contextlib import asynccontextmanager
 
@@ -20,17 +22,19 @@ if sys.platform == "win32":
 
 # 兜底所有 socket（akshare/requests/httpx）—— 外部数据源不可达时快速失败，
 # 避免单次行情请求挂死整个服务。各工具内已有 try/except 转 provenance.error。
-import socket
 socket.setdefaulttimeout(15)
 
 # 行情代理策略（根因 1）：在导入路由/工具（可能触发 akshare 行为）之前，
 # 对东方财富/Sina 行情域名写入 NO_PROXY，绕过会被远端断开的系统/环境代理。
 from .tools.market_provider import configure_market_network
+
 configure_market_network()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from . import __version__
 from .agents.graph import init_checkpointer
 from .api.routes import router
 from .config import settings
@@ -44,36 +48,62 @@ logger = logging.getLogger("finresearch")
 
 
 def _warmup_indexes() -> None:
-    """后台线程预加载别名/搜索索引（首次构建约 1-3s），消除对话首轮冷启动超时。"""
+    """后台线程预加载搜索索引（首次构建约 1-3s），消除对话首轮冷启动超时。
+
+    别名索引（_load_alias_index）已随未接线的自然语言标的检测方案一并删除：
+    它只被这里预热、从未被任何查询消费，纯耗一次 1-3s 的无效构建。
+    """
     try:
-        from .tools.entity import _load_alias_index, _load_search_index
+        from .tools.entity import _load_search_index
 
         _load_search_index()
-        _load_alias_index()
-        logger.info("索引预加载完成（alias + search）")
+        logger.info("索引预加载完成（search）")
     except Exception as e:  # noqa: BLE001
         logger.debug("索引预加载跳过：%s", e)
+
+
+async def _memory_maintenance_loop() -> None:
+    """记忆维护：启动 60s 后首跑，此后每 24h 一次（向量清理 + 会话归档）。"""
+    from .tools import memory as memory_mod
+
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if memory_mod.memory_available():
+                await memory_mod.run_memory_maintenance()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug("记忆维护跳过：%s", e)
+        await asyncio.sleep(24 * 3600)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from .agents.graph import close_checkpointer  # 延迟导入避免循环
+    from .tools import memory as memory_mod
 
     logger.info("启动：init_db + checkpointer")
     await init_db()
     await init_checkpointer()
     # 后台预加载别名索引与搜索索引，消除对话首轮 detect_ticker 冷启动超时
     asyncio.get_event_loop().run_in_executor(None, _warmup_indexes)
+    # 本地记忆与知识库（rag.db + sqlite-vec）；失败优雅降级，绝不阻断启动
+    await memory_mod.init_memory()
+    maintenance_task = asyncio.create_task(_memory_maintenance_loop(), name="memory-maintenance")
     yield
+    maintenance_task.cancel()
     await close_checkpointer()
+    memory_mod.close_memory()
     logger.info("关闭。")
 
 
 app = FastAPI(
     title="景渊 JingYuan · 家用金融研究助手",
-    version="1.3.1",
+    version=__version__,
     lifespan=lifespan,
 )
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver"])
 
 # CORS：允许本地前端与 Tauri
 app.add_middleware(
@@ -85,6 +115,13 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+
+FRONTEND_INDEX_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 # ── 前端静态托管（打包后由后端一并提供 UI；dev 无 dist 时跳过）──
@@ -129,15 +166,19 @@ if _DIST:
             raise HTTPException(404)
         # （路径遍历已在上方校验，f 已 resolve）
         if full_path and f.is_file():
-            return FileResponse(f)
-        return FileResponse(_DIST / "index.html")
+            headers = FRONTEND_INDEX_HEADERS if f.name == "index.html" else None
+            return FileResponse(f, headers=headers)
+        return FileResponse(
+            _DIST / "index.html",
+            headers=FRONTEND_INDEX_HEADERS,
+        )
 else:
 
     @app.get("/")
     async def root() -> dict:
         return {
             "name": "景渊 JingYuan · 家用金融研究助手",
-            "version": "1.3.1",
+            "version": __version__,
             "llm_configured": settings.llm_configured,
             "docs": "/docs",
         }

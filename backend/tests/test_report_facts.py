@@ -174,8 +174,13 @@ def test_check_generated_detects_without_rewriting():
     assert not hasattr(rep, "_sanitize")
 
 
-def test_forbidden_section_output_falls_back_without_a_second_model_call(monkeypatch):
-    """合规检测保留：流式中命中禁用词即停流回退模板，不为同一段发起第二次模型调用。"""
+def test_forbidden_section_output_sanitized_not_discarded(monkeypatch):
+    """裸指令词收口替换：流不中断、不落模板、词被换成方向性表述。
+
+    曾经"流中命中即停流回退模板"——降级段拿同样事实块大概率再次命中，
+    生成零 token 的模板段，是"报告正文整块出现"的主因之一。
+    引文/数据口径豁免由 check_generated 分层保证，这里锁裸词的新语义。
+    """
     llm = _FakeStreamLLM(["建议", "买入", "。"])
     monkeypatch.setattr(rep, "build_llm", lambda **_kwargs: llm)
     body, source = asyncio.run(rep._llm_section(
@@ -185,8 +190,14 @@ def test_forbidden_section_output_falls_back_without_a_second_model_call(monkeyp
     ))
 
     assert llm.astream_calls == 1  # 只一次流式，无第二次重写调用
-    assert source == "template"
-    assert "事实模板" in body
+    assert source == "llm"  # 不再因裸词落模板
+    assert "买入" not in body
+    assert "看多" in body  # 方向性替换生效
+    # 引文与数据口径豁免：含禁用词的引文/搭配原样保留
+    quoted = rep.sanitize_generated("「北向资金净买入3.2亿元」创纪录")[0]
+    assert quoted == "「北向资金净买入3.2亿元」创纪录"
+    compound = rep.sanitize_generated("获买入评级，净卖出减少")[0]
+    assert compound == "获买入评级，净卖出减少"
 
 
 def test_quoted_headlines_are_never_sanitized():
@@ -205,7 +216,7 @@ def test_fact_footer_appears_exactly_once_per_assembled_block():
     for build in (rep._facts_technical, rep._facts_valuation, rep._facts_industry, rep._facts_scenario):
         block = build({"quote": GOOD_QUOTE, "fins": FINS, "indicators": [], "news": [], "web": []})
         assert block.count("【约束】") == 1, build.__name__
-    chat = facts.render_chat_facts(GOOD_QUOTE, [{"title": "t", "source": "s"}])
+    chat = facts.compose_facts(facts.render_quote_facts(GOOD_QUOTE))
     assert chat.count("【约束】") == 1
 
 
@@ -341,3 +352,145 @@ def test_nonempty_llm_output_still_uses_llm(monkeypatch):
     state = {"template": "equity_deep", "task_id": "t", "llm_config": {"api_key": "x", "model": "m"}}
     body, source = asyncio.run(rep._llm_section(state, rep._SPEC_VALUATION, _good_fv()))
     assert source == "llm" and body.strip()
+
+
+def test_financial_indicator_row_names_match_consumers(monkeypatch):
+    """fundamentals 生产方行名必须与 report/facts 消费方查询名一致。
+
+    曾经行名是"扣非净利润"而值优先取"净利润"，消费方 row_vals(fins, "净利润")
+    永远查不到 → 报告里净利润一栏长期显示"—（未获取）"，即使接口完全正常。
+    """
+    import sys
+    import types
+
+    import pandas as pd
+
+    from finresearch.cache import slow_cache
+    from finresearch.tools import fundamentals
+
+    # 双源：摘要源（主，营收绝对值/归母净利/毛利率）+ indicator 源（原生同比）
+    abstract = pd.DataFrame(
+        [
+            {"选项": "常用指标", "指标": "归母净利润", "20241231": 61e8, "20251231": 71e8},
+            {"选项": "常用指标", "指标": "营业总收入", "20241231": 151e8, "20251231": 171e8},
+            {"选项": "常用指标", "指标": "毛利率", "20241231": 91.0, "20251231": 91.5},
+            {"选项": "常用指标", "指标": "净资产收益率(ROE)", "20241231": 30.0, "20251231": 31.0},
+            {"选项": "常用指标", "指标": "资产负债率", "20241231": 20.0, "20251231": 19.0},
+        ]
+    )
+    df = pd.DataFrame([
+        {"日期": "2024-12-31", "主营业务收入(元)": 150e8, "净利润": 60e8,
+         "主营业务收入增长率(%)": 10.0, "净利润增长率(%)": 8.0,
+         "净资产收益率(%)": 30.0, "销售毛利率(%)": 91.0, "资产负债率(%)": 20.0},
+        {"日期": "2025-12-31", "主营业务收入(元)": 170e8, "净利润": 70e8,
+         "主营业务收入增长率(%)": 13.3, "净利润增长率(%)": 16.7,
+         "净资产收益率(%)": 31.0, "销售毛利率(%)": 91.5, "资产负债率(%)": 19.0},
+    ])
+    fake_ak = types.SimpleNamespace()
+    fake_ak.stock_financial_abstract = lambda **_: abstract
+    fake_ak.stock_financial_analysis_indicator = lambda **_: df
+    monkeypatch.setitem(sys.modules, "akshare", fake_ak)
+    slow_cache.clear()
+
+    fins = fundamentals.get_financial_indicators("600519.SH")["financials"]
+    names = {r["name"] for r in fins["rows"]}
+    # report._section_fundamentals 与 facts.render_financial_facts 查询的行名全集
+    for needed in ("营业收入", "净利润", "营收同比", "净利润同比", "ROE", "毛利率", "资产负债率"):
+        assert needed in names, f"行名 {needed} 缺失，消费方将永远查不到"
+    net = next(r for r in fins["rows"] if r["name"] == "净利润")
+    assert net["values"][-1] == "71.00亿"  # 摘要源归母净利润优先（71e8），不是 indicator 的 70e8
+    rev = next(r for r in fins["rows"] if r["name"] == "营业收入")
+    assert rev["values"][-1] == "171.00亿"  # 营收绝对值来自摘要源
+    gm = next(r for r in fins["rows"] if r["name"] == "毛利率")
+    assert gm["values"][-1] == "91.5%"  # 毛利率来自摘要源
+    assert fins["periods"][-1] == "2025-12-31"  # 报告期披露
+
+
+def test_financial_yoy_prefers_native_growth_and_guards_period_mismatch():
+    """中报（H1 累计）不得与上年年报直接相除；接口原生同比列优先；报告期必须披露。
+
+    曾经拿当年中报对上年年报算同比，4~10 月的报告"营收同比"稳定输出 -50% 式
+    错误值，且"最新一期（2026）"不披露是中报还是年报，用户无从察觉。
+    """
+    # 1) 接口原生同比列优先（对比口径天然正确）
+    fins_native = {
+        "years": ["2025", "2026"], "periods": ["2025-12-31", "2026-06-30"],
+        "rows": [
+            {"name": "营业收入", "values": ["100.0亿", "45.0亿"]},
+            {"name": "营收同比", "values": ["10.0%", "12.5%"]},
+            {"name": "净利润", "values": ["20.0亿", "9.0亿"]},
+        ],
+    }
+    assert facts.yoy_from_fins(fins_native, "营业收入", "营收同比") == "+12.5%"
+    block = facts.render_financial_facts(fins_native)
+    assert "12.5%" in block
+    assert "2026-06-30（中报）" in block  # 披露报告期口径
+    assert "-55" not in block and "-55.0" not in block  # 不得出现 45/100-1 的错算
+
+    # 2) 无原生列 + 报告期不同形（中报 vs 年报）→ MISSING，宁可缺失不编数
+    fins_mismatch = {
+        "years": ["2025", "2026"], "periods": ["2025-12-31", "2026-06-30"],
+        "rows": [{"name": "净利润", "values": ["20.0亿", "9.0亿"]}],
+    }
+    assert facts.yoy_from_fins(fins_mismatch, "净利润", "净利润同比") == facts.MISSING
+    assert facts.periods_comparable(fins_mismatch) is False
+
+    # 3) 报告期同形（年报对年报）→ 仍可由 levels 重算
+    fins_ok = {
+        "years": ["2024", "2025"], "periods": ["2024-12-31", "2025-12-31"],
+        "rows": [{"name": "净利润", "values": ["10.0亿", "12.0亿"]}],
+    }
+    assert facts.yoy_from_fins(fins_ok, "净利润", "净利润同比") == "+20.0%"
+    assert facts.periods_comparable(fins_ok) is True
+
+    # 4) 旧形状（无 periods 字段）保持旧行为，不误伤
+    legacy = {"rows": [{"name": "净利润", "values": ["10.0亿", "12.0亿"]}]}
+    assert facts.yoy_from_fins(legacy, "净利润", "净利润同比") == "+20.0%"
+    assert facts.latest_period_label({"years": ["2024", "2025"]}) == "2025"
+
+
+def test_check_generated_layered_exemptions():
+    """分层检测：引文（「」）与数据口径名词豁免，裸指令词仍命中。
+
+    曾经纯子串扫描：A 股新闻标题高频含"净买入"，模型照引文要求原样引用
+    → 命中 → 整篇 7 秒作废降级 → 降级段再次命中 → 模板零 token。
+    """
+    assert rep.check_generated("北向资金净买入3.2亿元") == []
+    assert rep.check_generated("「主力净买入创纪录」") == []
+    assert rep.check_generated("获买入评级，机构净卖出减少") == []
+    assert rep.check_generated("") == []
+    assert rep.check_generated("建议买入该股") == ["买入"]
+    assert rep.check_generated("止损位设在3200点") == ["止损"]
+    # 引文内的裸指令词也豁免（提示词要求引文一字不改）
+    assert rep.check_generated("「散户纷纷清仓离场」") == []
+
+
+def test_whole_report_keeps_clean_sections_on_midstream_failure(monkeypatch):
+    """整篇中途异常：已切完的干净段保留，只有缺失段进入补写——
+    用户不再看到"全文消失重来"。"""
+    class _BoomAfterTwo:
+        def __init__(self):
+            self.calls = 0
+
+        def astream(self, _messages):
+            async def _gen():
+                yield type("Chunk", (), {"content": "【技术面分析】\n"})()
+                yield type("Chunk", (), {"content": "均线多头排列。\n"})()
+                yield type("Chunk", (), {"content": "【基本面分析】\n"})()
+                yield type("Chunk", (), {"content": "营收"})()
+                raise RuntimeError("connection reset")
+            return _gen()
+
+    monkeypatch.setattr(rep, "build_llm", lambda **_kwargs: _BoomAfterTwo())
+    state = {"template": "equity_deep", "normalized_ticker": "600519.SH",
+             "llm_config": {"model": "deepseek-chat", "api_key": "k"}}
+    fv = {"quote": GOOD_QUOTE, "profile": {}, "fins": FINS,
+          "indicators": [{"name": "MACD", "value": "-8.60", "signal": "空"}],
+          "news": [], "web": []}
+    specs = [s for s in rep._section_specs("equity_deep") if s.has_data(fv)]
+    assert any(s.title == "技术面分析" for s in specs)  # fixture 必须让技术面 spec 可用
+    whole = asyncio.run(rep._llm_report(state, specs, fv))
+    assert "技术面分析" in whole and whole["技术面分析"][1] == "llm"
+    assert "均线多头排列。" in whole["技术面分析"][0]
+    # 中断在"基本面分析"中途：该段不完整，不得保留
+    assert "基本面分析" not in whole

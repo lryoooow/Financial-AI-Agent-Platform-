@@ -90,6 +90,29 @@ async def main() -> None:
     r2, t2 = await exists("rep2", "task2")
     check(not r2 and not t2, "delete-by-task_id removed report+task")
 
+    # 4) 进程内残留同样清掉（"真删除"闭环）：_STORE 素材 / _TASK_LLM 明文密钥 / 诊断行
+    from finresearch.agents.deep import research_tools  # noqa: E402
+    from finresearch.db.models import LocalSetting  # noqa: E402
+    from finresearch.api import routes as routes_mod  # noqa: E402
+
+    await seed("rep3", "task3", "300750", "宁德时代")
+    research_tools._STORE["task3"] = {
+        "findings": {"quote": {"price": 999.0}},
+        "draft_report": {"sections": [{"title": "被删报告全文"}]},
+    }
+    routes_mod._TASK_LLM["task3"] = {"api_key": "sk-plain", "model": "deepseek-chat"}
+    async with session_scope() as s:
+        s.add(LocalSetting(key="context-diag:research:task3", payload={"items": [{"x": 1}]}))
+        await s.commit()
+
+    await delete_report("rep3")
+
+    check("task3" not in research_tools._STORE, "删除后 _STORE 素材被清理（报告全文不滞留内存）")
+    check("task3" not in routes_mod._TASK_LLM, "删除后 _TASK_LLM 明文密钥配置被清理")
+    async with session_scope() as s:
+        diag = await s.get(LocalSetting, "context-diag:research:task3")
+    check(diag is None, "删除后 context-diag 诊断行被清理")
+
     await close_checkpointer()
     print("\n" + ("ALL DELETE TESTS PASS" if not fails else f"FAILURES: {fails}"))
     sys.exit(0 if not fails else 1)

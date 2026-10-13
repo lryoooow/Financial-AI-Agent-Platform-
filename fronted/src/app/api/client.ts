@@ -3,6 +3,9 @@
 // 生产路径禁止静默回退到 mock；调用方必须展示真实失败态。
 
 import type { Candle } from "../data/market";
+import { createSseEventGate, parseSseFrames } from "./sseParser.js";
+
+export { parseSseFrames } from "./sseParser.js";
 
 const API_BASE: string =
   ((import.meta as any).env?.VITE_API_BASE as string) || "";
@@ -79,10 +82,13 @@ async function deleteJson<T>(path: string): Promise<T> {
   return (await r.json()) as T;
 }
 
+export type ReasoningLevel = "low" | "medium" | "high" | "max";
+
 export interface LlmConfig {
   base_url: string;
   api_key: string;
   model: string;
+  reasoning_effort?: ReasoningLevel;
 }
 
 export interface ChatMessage {
@@ -90,6 +96,7 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   images?: string[]; // base64 data URL（多模态图片，重开对话可恢复）
+  image_asset_ids?: string[];
   created_at: string;
 }
 
@@ -97,7 +104,7 @@ export interface ChatConversation {
   id: string;
   title: string;
   snapshot_interval: number;
-  model_config?: LlmConfig | null;
+  model_config?: { model: string; reasoning_effort: ReasoningLevel; configured: boolean } | null;
   archived_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -132,6 +139,7 @@ export interface Quote {
   as_of?: string;
   trading_date?: string;
   elapsed_ms?: number;
+  stale?: boolean;
   provenance?: {
     source?: string;
     endpoint?: string;
@@ -139,6 +147,7 @@ export interface Quote {
     fetched_at?: string;
     trading_date?: string;
     note?: string;
+    stale_reason?: string;
     attempts?: { source: string; ok: boolean; error?: string }[];
   };
 }
@@ -146,6 +155,8 @@ export interface Quote {
 /** 行情数据 + 来源/失败原因/耗时元信息（/intraday、/kline 返回此形状）。 */
 export interface MarketDataResult<T> {
   data: T;
+  interval?: "1m" | "5m" | string;
+  stale?: boolean;
   trading_date?: string;
   elapsed_ms?: number;
   provenance?: {
@@ -155,6 +166,7 @@ export interface MarketDataResult<T> {
     fetched_at?: string;
     trading_date?: string;
     note?: string;
+    stale_reason?: string;
     attempts?: { source: string; ok: boolean; error?: string }[];
   };
 }
@@ -238,7 +250,7 @@ export interface ResearchTaskSummary {
   code: string;
   template: string;
   query?: string | null;
-  status: "pending" | "running" | "done" | "error";
+  status: "pending" | "running" | "succeeded" | "done" | "error";
   stage: string;
   report_id?: string | null;
   error?: string | null;
@@ -261,6 +273,49 @@ export interface BookEntry {
   price: number;
   vol: number;
 }
+/** 记忆嵌入配置状态（GET /api/memory/embedding）。 */
+export interface MemoryEmbeddingStatus {
+  mode: "local" | "provider" | "disabled";
+  base_url?: string;
+  model?: string;
+  dim?: number;
+  signature?: string;
+  chunks?: number;
+  note?: string;
+  reason?: string;
+}
+
+/** 知识库文档（GET /api/kb/documents）。 */
+export interface KbDocument {
+  id: string;
+  name: string;
+  ext: string;
+  mime?: string;
+  size_bytes: number;
+  chunk_count: number;
+  added_at: number;
+}
+
+/** 知识库检索结果（GET /api/kb/search）。 */
+export interface KbSearchResult {
+  doc_id: string;
+  doc_name: string;
+  text: string;
+  ref: string;
+}
+
+/** 大盘指数条目（GET /api/market/indexes）。 */
+export interface IndexSummary {
+  code: string;
+  name: string;
+  price: number;
+  change: number;
+  changePct: number;
+  volume?: number;
+  turnover?: string;
+  trading_date?: string;
+}
+
 export interface Book {
   asks: BookEntry[];
   bids: BookEntry[];
@@ -271,12 +326,60 @@ export interface Indicator {
   value: string;
   signal: string;
 }
+export interface IndicatorPoint {
+  date: string;
+  // 均线随区间自适应（5/10/20/60/120/250），后端只下发周期 <= 区间长度的均线
+  ma5?: number | null;
+  ma10?: number | null;
+  ma20?: number | null;
+  ma60?: number | null;
+  ma120?: number | null;
+  ma250?: number | null;
+  dif: number | null;
+  dea: number | null;
+  macd: number | null;
+  rsi14: number | null;
+  k: number | null;
+  d: number | null;
+  j: number | null;
+  bollMid: number | null;
+  bollUpper: number | null;
+  bollLower: number | null;
+}
+export interface IndicatorResult extends MarketDataResult<Indicator[]> {
+  series: IndicatorPoint[];
+}
 export interface IntradayPoint {
   time: string;
   price: number;
   avg: number;
   volume: number;
 }
+export interface ChartBundle {
+  code: string;
+  quote: Quote;
+  intraday: MarketDataResult<IntradayPoint[]>;
+  kline: MarketDataResult<Candle[]>;
+  book: Book;
+  indicators: IndicatorResult;
+}
+
+export interface MarketContext {
+  code: string;
+  kind: "intraday" | "kline";
+  adjust?: "qfq" | "hfq" | "";
+  visible_start?: string;
+  visible_end?: string;
+  indicator?: "MACD" | "RSI" | "KDJ" | "BOLL";
+}
+
+export interface ImageAsset {
+  asset_id: string;
+  url: string;
+  mime_type: "image/jpeg" | "image/png" | "image/webp";
+  size: number;
+}
+
 export interface ResolveHit {
   code: string;
   name: string;
@@ -332,6 +435,46 @@ export const api = {
       signal
     ),
 
+  chartBundle: (code: string, n = 120, adjust = "qfq", signal?: AbortSignal) =>
+    getJson<ChartBundle>(
+      `/api/quote/${encodeURIComponent(code)}/chart-bundle?n=${n}&adjust=${adjust}`,
+      signal
+    ),
+
+  memoryEmbedding: () => getJson<MemoryEmbeddingStatus>("/api/memory/embedding"),
+
+  saveMemoryEmbedding: (body: { base_url: string; api_key: string; model: string }) =>
+    postJson<{ model: string; dim: number; rebuilt: number }>("/api/memory/embedding", body),
+
+  clearMemoryEmbedding: () => deleteJson<{ mode: string; rebuilt: number }>("/api/memory/embedding"),
+
+  kbDocuments: () => getJson<{ documents: KbDocument[] }>("/api/kb/documents"),
+
+  kbUpload: async (file: File) => {
+    const r = await fetch(`${API_BASE}/api/kb/documents`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Filename": encodeURIComponent(file.name),
+      },
+      body: await file.arrayBuffer(),
+    });
+    if (!r.ok) {
+      let detail = "";
+      try { const body = await r.json(); detail = body?.detail || body?.message || ""; } catch {}
+      throw new Error(detail ? `上传失败：${detail}` : `上传失败：${r.status}`);
+    }
+    return r.json() as Promise<{ document: KbDocument }>;
+  },
+
+  kbDelete: (id: string) => deleteJson<{ ok: boolean }>(`/api/kb/documents/${encodeURIComponent(id)}`),
+
+  kbSearch: (q: string, limit = 5) =>
+    getJson<{ items: KbSearchResult[] }>(`/api/kb/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  marketIndexes: () =>
+    getJson<{ indexes: IndexSummary[]; provenance: any }>("/api/market/indexes"),
+
   book: (code: string, signal?: AbortSignal) =>
     getJson<Book>(`/api/quote/${encodeURIComponent(code)}/book`, signal),
 
@@ -369,6 +512,22 @@ export const api = {
   chatConversation: (id: string) =>
     getJson<ChatPayload>(`/api/chat/conversations/${encodeURIComponent(id)}`),
 
+  uploadChatImage: async (file: Blob): Promise<ImageAsset> => {
+    const response = await fetch(`${API_BASE}/api/assets/images`, {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      body: file,
+    });
+    if (!response.ok) {
+      let detail = "";
+      try { const body = await response.json(); detail = body?.detail || body?.message || ""; } catch {}
+      throw new Error(detail || `图片上传失败（${response.status}）`);
+    }
+    return response.json() as Promise<ImageAsset>;
+  },
+
+  imageAssetUrl: (assetId: string) => `${API_BASE}/api/assets/images/${encodeURIComponent(assetId)}`,
+
   /** 流式发送对话消息（POST → text/event-stream）。用 fetch + ReadableStream 解析（EventSource 仅 GET）。
    *  事件：stage(思考阶段) → 多个 token(回复流) → done(最终 conversation/messages/reply) | error。 */
   sendChatMessageStream: async (
@@ -380,7 +539,10 @@ export const api = {
       onStage?: (stage: string, label: string) => void;
       onToken?: (text: string) => void;
       onDone?: (payload: ChatPayload) => void;
+      onWarning?: (message: string) => void;
       onError?: (message: string) => void;
+      imageAssetIds?: string[];
+      marketContext?: MarketContext;
       signal?: AbortSignal;
     }
   ) => {
@@ -389,7 +551,13 @@ export const api = {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, llm: llm ?? undefined, images: images?.length ? images : undefined }),
+        body: JSON.stringify({
+          message,
+          llm: llm ?? undefined,
+          images: images?.length ? images : undefined,
+          image_asset_ids: handlers.imageAssetIds?.length ? handlers.imageAssetIds : undefined,
+          market_context: handlers.marketContext,
+        }),
         signal: handlers.signal,
       }
     );
@@ -401,22 +569,31 @@ export const api = {
     const reader = r.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
+    const eventGate = createSseEventGate();
+    const dispatch = (ev: any) => {
+      if (!eventGate.accept(ev)) return;
+      if (ev.type === "stage") handlers.onStage?.(ev.stage, ev.label);
+      else if (ev.type === "token") handlers.onToken?.(ev.text);
+      else if (ev.type === "tool_call") (handlers as any).onToolCall?.(ev);
+      else if (ev.type === "warning") handlers.onWarning?.(ev.message);
+      else if (ev.type === "done") {
+        handlers.onDone?.(ev as ChatPayload);
+      } else if (ev.type === "error") {
+        handlers.onError?.(ev.message);
+      }
+    };
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-      const frames = buf.split("\n\n");
-      buf = frames.pop() || "";
-      for (const frame of frames) {
-        const line = frame.split("\n").find((l) => l.startsWith("data: "));
-        if (!line) continue;
-        let ev: any;
-        try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-        if (ev.type === "stage") handlers.onStage?.(ev.stage, ev.label);
-        else if (ev.type === "token") handlers.onToken?.(ev.text);
-        else if (ev.type === "done") handlers.onDone?.(ev as ChatPayload);
-        else if (ev.type === "error") handlers.onError?.(ev.message);
-      }
+      const parsed = parseSseFrames(buf);
+      buf = parsed.rest;
+      parsed.events.forEach(dispatch);
+    }
+    const tail = parseSseFrames(buf + decoder.decode(), true);
+    tail.events.forEach(dispatch);
+    if (!eventGate.isTerminal() && !handlers.signal?.aborted) {
+      throw new Error("流式响应意外中断，正在从服务端恢复会话");
     }
   },
 

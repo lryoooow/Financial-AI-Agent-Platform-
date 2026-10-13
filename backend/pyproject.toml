@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finresearch"
-version = "1.5.0"
+version = "2.7.0"
 description = "景渊 JingYuan · 家用本地金融研究助手后端（akshare + LangGraph 固定管线）"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -19,7 +19,7 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.29",
   "aiosqlite>=0.20",                   # SQLite async 驱动（桌面默认）
   "langgraph-checkpoint-sqlite>=3.1",  # SQLite 检查点（桌面默认）；>=2.0 是误导性下界，
-                                       # 2.x 配不了 langgraph 1.x。3.1 + langgraph 1.2.9 已实测。
+  # 2.x 配不了 langgraph 1.x。3.1 + langgraph 1.2.9 已实测。
   # psycopg / langgraph-checkpoint-postgres 移至 [server] 可选依赖（桌面不安装，减小打包体积）
   # LLM / Agent
   # 下界按实际运行版本给：此前写 langchain>=0.3 / langgraph>=0.2.40 是误导性的——
@@ -52,6 +52,8 @@ dependencies = [
   "rapidfuzz>=3.6",
   "python-dotenv>=1.0.1",
   "chinese-calendar>=1.9",  # 中国法定节假日/调休日历（休市日判断，替代硬编码）
+  "sqlite-vec>=0.1.9",
+  "pypdf>=6.19.0",
 ]
 
 [project.optional-dependencies]
@@ -62,7 +64,14 @@ server = [                             # PostgreSQL 检查点（仅服务端部�
   "psycopg[binary]>=3.1.18",
   "langgraph-checkpoint-postgres>=0.2.0",
 ]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.12"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

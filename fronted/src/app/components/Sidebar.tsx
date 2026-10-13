@@ -1,12 +1,14 @@
 import { motion } from "motion/react";
-import { LayoutDashboard, FileText, MessageSquare, Settings, ShieldCheck } from "lucide-react";
+import { LayoutDashboard, FileText, MessageSquare, Settings, ShieldCheck, TrendingUp, BookOpen } from "lucide-react";
 
-export type PageId = "chat" | "research" | "reports" | "settings";
+export type PageId = "chat" | "market" | "research" | "reports" | "kb" | "settings";
 
 const NAV: { id: PageId; label: string; sub: string; icon: typeof LayoutDashboard }[] = [
   { id: "chat", label: "专业对话", sub: "Chat", icon: MessageSquare },
+  { id: "market", label: "行情分析", sub: "Market", icon: TrendingUp },
   { id: "research", label: "研究任务", sub: "Research", icon: LayoutDashboard },
   { id: "reports", label: "报告库", sub: "Reports", icon: FileText },
+  { id: "kb", label: "知识库", sub: "Knowledge", icon: BookOpen },
   { id: "settings", label: "模型配置", sub: "Providers", icon: Settings },
 ];
 

@@ -34,8 +34,11 @@ from ..workers.market import market_node
 from ..workers.report import _stream_push, report_node, summary_node
 from ..workers.research import research_node
 
-# 行业估值取数超时：与 deep/tools.py 的 _T_INDUSTRY 对齐（实测并行冷启动 5-12s）
-_T_INDUSTRY = 20.0
+# 行业估值取数超时：三个层级并行，各自最多重试 3 次（新浪申万接口不稳，重试能自愈）。
+# 实测最坏情况（两层持续失败、各重试到底）要 17-18s，卡在旧值 20s 的边上——网络稍慢就整体
+# 超时，行业研究直接报"未生成报告草稿"。放到 35s 给重试留出余量；正常命中 5-8s 就返回，
+# 抬高上限不会让成功路径变慢。
+_T_INDUSTRY = 35.0
 
 logger = logging.getLogger(__name__)
 
@@ -181,10 +184,14 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
             prov_err = (iv.get("provenance") or {}).get("error") if isinstance(iv, dict) else None
             source_failed = bool(iv_err) or bool(prov_err)
             if source_failed:
-                reason = f"数据源暂时不可用（{iv_err or prov_err}），请稍后重试"
+                reason = "行业估值数据源（申万/新浪）暂时不可用，请稍后重试"
             else:
                 reason = f"未找到名为「{industry_name}」的行业，请换个说法（如「光伏」「半导体」「白酒」）"
-            return f"未能取到行业估值数据：{reason}。无法生成行业报告。"
+            # 把真实原因留给路由层：否则它只能报一句笼统的"未生成报告草稿（数据源可能不可用）"，
+            # 用户既不知道是哪一步挂了，也不知道该重试还是换个说法。
+            _put(task_id, "fatal_error", reason)
+            detail = str(iv_err or prov_err or "")[:120]
+            return f"未能取到行业估值数据：{reason}{('（' + detail + '）') if detail else ''}。无法生成行业报告。"
 
         # 用最匹配的行业（items 已按粒度排序，第一个最具体）作为报告主体
         top = iv["items"][0]
@@ -265,13 +272,9 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
         # 2) report_use_llm_summary=True 时摘要由 LLM 撰写，与四段口吻统一。
         # 只调 report_node 的话，它那句 `state.get("draft_summary") or _compose_summary_block(...)`
         # 会永远走规则模板——LLM 摘要这条路就被静默砍掉了，开关打开也没反应。
-        sum_out = await summary_node(state)
-        state["draft_summary"] = sum_out.get("draft_summary", "")
-        state["facts"] = sum_out.get("facts") or state["facts"]
-
-        # 摘要快照推给前端：旧路由是在 updates 流里看到 summary 节点完成时发 summary 事件；
-        # 现在 summary_node 跑在工具内部，updates 流看不见它，改用 custom 事件带出去。
-        _emit_summary(state, sum_out.get("draft_summary", ""))
+        # 摘要已并入 report_node 的整篇流（第一个分段），不再独立生成
+        sum_out = {"draft_summary": "", "facts": state.get("facts"), "timings": {}}
+        state["draft_summary"] = ""  # report_node 从流中提取并写回
 
         out = await report_node(state)
         doc = out.get("draft_report")

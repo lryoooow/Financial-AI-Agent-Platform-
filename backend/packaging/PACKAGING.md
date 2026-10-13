@@ -1,5 +1,9 @@
 # 打包成 Windows 安装包
 
+> **2.0.0 起正式发布只使用仓库根目录的 `build_release.bat`。** 该命令生成
+> `fronted/release/JingYuan-Setup-<version>.exe` 与 `JingYuan-Portable-<version>.exe`，并完整重建
+> Electron 外壳和 Python sidecar。本文其余 Inno Setup 流程仅作为历史备用链路保留，不得用于正式发布。
+
 把"前端 + 后端 + SQLite"打成**一个 Windows 安装包**（`FinResearch-Setup.exe`），
 安装后双击桌面图标即弹出**独立应用窗口**（pywebview + 系统 WebView2，真软件，非浏览器）。
 **只打包运行所需**（无源码、无 node_modules、无 .git、无测试）。

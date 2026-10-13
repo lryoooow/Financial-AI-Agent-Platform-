@@ -124,6 +124,10 @@ function backendEnv() {
   };
 }
 
+function frontendUrl(port) {
+  return `http://127.0.0.1:${port}/?app_version=${encodeURIComponent(app.getVersion())}`;
+}
+
 function createWindow(port) {
   win = new BrowserWindow({
     width: 1280,
@@ -142,7 +146,17 @@ function createWindow(port) {
     },
   });
 
-  win.loadURL(`http://127.0.0.1:${port}/`);
+  win.loadURL(frontendUrl(port));
+  // frameless 窗口从无前台权限的上下文启动时会"可见但未激活"——打字无反应。
+  // 焦点必须在页面加载完成后给（loadURL 是异步的，提前 focus 会被 Windows 前台
+  // 权限限制丢弃；后端重启的整页 loadURL 重载同样走这里）。
+  win.webContents.once('did-finish-load', () => {
+    win.show();
+    win.focus();
+    win.webContents.focus();
+  });
+  // 兜底：如果 did-finish-load 3 秒后仍未触发（后端极慢），也强制 show
+  setTimeout(() => { if (!win.isDestroyed()) { win.show(); } }, 3000);
   win.on('closed', () => { win = null; });
 
   // 把最大化/还原状态变化推给渲染进程，TitleBar 据此切换图标
@@ -214,7 +228,10 @@ async function restartBackend() {
         appendBackendLog(`[restart] attempt=${backendRestartAttempts}`);
         const port = await launchBackend();
         if (win && !win.isDestroyed()) {
-          win.loadURL(`http://127.0.0.1:${port}/`);
+          win.loadURL(frontendUrl(port));
+          win.webContents.once('did-finish-load', () => {
+            if (!win.isDestroyed()) { win.show(); win.focus(); win.webContents.focus(); }
+          });
         }
         return;
       } catch (e) {
@@ -234,17 +251,32 @@ async function restartBackend() {
 // 必须与 electron-builder.yml 的 appId 一致，否则任务栏图标会与快捷方式分成两组。
 app.setAppUserModelId('com.jingyuan.app');
 
-app.whenReady().then(start).catch((e) => {
-  appendBackendLog(`[startup-failed] ${e && e.stack ? e.stack : e}`);
-  console.error('启动失败：', e);
+// 单实例锁：双开会让第二个实例 clearStalePort() 删掉第一实例正在使用的 port.txt，
+// 再 spawn 第二个后端进程——两个 FinResearch.exe 并发写同一个 SQLite（database is
+// locked / 数据错乱）且互抢端口。第二实例直接退出并聚焦已有窗口。
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
   app.quit();
-});
-app.on('window-all-closed', () => {
-  quitting = true;
-  if (backend) { try { backend.kill(); } catch (_) {} }
-  app.quit();
-});
-app.on('before-quit', () => {
-  quitting = true;
-  if (backend) { try { backend.kill(); } catch (_) {} }
-});
+} else {
+  app.on('second-instance', () => {
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
+  });
+
+  app.whenReady().then(start).catch((e) => {
+    appendBackendLog(`[startup-failed] ${e && e.stack ? e.stack : e}`);
+    console.error('启动失败：', e);
+    app.quit();
+  });
+  app.on('window-all-closed', () => {
+    quitting = true;
+    if (backend) { try { backend.kill(); } catch (_) {} }
+    app.quit();
+  });
+  app.on('before-quit', () => {
+    quitting = true;
+    if (backend) { try { backend.kill(); } catch (_) {} }
+  });
+}

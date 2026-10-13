@@ -21,18 +21,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...config import settings
-from ...llm import build_llm
-from ...tools import facts, report as report_tool
-from ...tools.context import build_report_section_context, finalize_diag
+from ...llm import build_llm, is_reasoning_model, reasoning_profile
+from ...tools import facts
+from ...tools import report as report_tool
+from ...tools.context import build_report_context, build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
+from ...tools.text import strip_md
 from ..prompts import (
+    FORBIDDEN_COMPOUNDS,
     FORBIDDEN_VERBS,
+    QUOTE_SPAN,
     SUMMARY_USER_TEMPLATE,
+    report_system_prompt,
     section_system_prompt,
     summary_system_prompt,
 )
@@ -51,6 +57,7 @@ _SRC_LABELS = {
 # 摘要 + 各段并发撰写；家用 key 的 RPS 有限，不加闸会成片 429 → 静默回退模板。
 _LLM_GATE = asyncio.Semaphore(max(1, int(getattr(settings, "report_llm_concurrency", 3))))
 _SECTION_TIMEOUT = float(getattr(settings, "report_section_timeout_s", 60.0))
+_REPORT_TIMEOUT = float(getattr(settings, "report_timeout_s", 180.0))
 
 
 async def _invoke(llm, messages) -> str:
@@ -92,15 +99,52 @@ def _stream_push(msg) -> None:
         pass
 
 
+def _scrub_protected(text: str) -> str:
+    """剔除检测豁免域：「」引文（提示词强制原样引用）与数据口径名词搭配。
+
+    豁免域里的禁用词是描述第三方事实（"北向资金净买入 3.2 亿"），不是对读者
+    发出的指令——曾经不分层，A 股新闻标题高频含这类词，整篇报告被子串检测误杀。
+    """
+    text = QUOTE_SPAN.sub("", text)
+    for compound in FORBIDDEN_COMPOUNDS:
+        text = text.replace(compound, "")
+    return text
+
+
 def check_generated(text: str) -> List[str]:
-    """检测 LLM 产出是否命中禁用词，返回命中列表（不改写文本）。
+    """检测 LLM 产出是否命中"裸"禁用词（引文与数据口径豁免后），返回命中列表。
 
     旧 _sanitize 盲替换会污染引文、产生"不建议建议关注（偏多）"等语义崩坏；
-    此处只检测，命中后由调用方发起重写或回退模板。
+    此处只检测。命中的处置见 sanitize_generated：收口时对裸词做映射替换。
     """
     if not text:
         return []
-    return [w for w in FORBIDDEN_VERBS if w in text]
+    scrubbed = _scrub_protected(text)
+    return [w for w in FORBIDDEN_VERBS if w in scrubbed]
+
+
+# 裸指令动词的方向性改写（2 字换 2-4 字，映射表不含任何数字字符；
+# 引文/口径搭配已在 _scrub_protected 阶段豁免，replace 不会碰到它们——
+# 数字零幻觉纪律不受影响：数字、来源、「」内容物理上不在替换域内）
+_VERB_REWRITES = {
+    "买入": "看多", "卖出": "看空", "加仓": "增配", "减仓": "减配",
+    "止损": "控制回撤", "清仓": "了结持仓", "抄底": "低位布局",
+    "建仓": "逐步布局", "满仓": "重仓参与",
+}
+
+
+def sanitize_generated(text: str) -> tuple[str, List[str]]:
+    """收口时把裸指令动词替换为方向性表述；返回 (新文本, 残余命中)。
+
+    只动 _scrub_protected 后仍裸露的词；替换后二次校验，理论上必空
+    （残余即模型自造「」包裹指令词的逃逸，由调用方落模板兜底）。
+    """
+    hits = check_generated(text)
+    if not hits:
+        return text, []
+    for word in set(hits):
+        text = text.replace(word, _VERB_REWRITES[word])
+    return text, check_generated(text)
 
 
 # ────────────────────────────────────────────────────────────
@@ -315,15 +359,14 @@ def _section_fundamentals(fv: dict) -> str:
     roe = facts.row_vals(fins, "ROE")
     gm = facts.row_vals(fins, "毛利率")
     debt = facts.row_vals(fins, "资产负债率")
-    years = fins.get("years", []) or []
 
     blocks: list[str] = []
-    rev_yoy = facts.yoy_pct(rev)
-    net_yoy = facts.yoy_pct(net)
+    rev_yoy = _latest_pct(fins, "营收同比", "营业收入")
+    net_yoy = _latest_pct(fins, "净利润同比", "净利润")
     rev_l, net_l = facts.val_str(rev), facts.val_str(net)
     if rev_yoy is not None or net_yoy is not None:
         line = (
-            f"【成长性】最新一期（{years[-1] if years else '—'}）实现营业收入 {rev_l}"
+            f"【成长性】最新一期（{facts.latest_period_label(fins)}）实现营业收入 {rev_l}"
             f"（同比 {facts.pct(rev_yoy, 1)}）、"
             f"净利润 {net_l}（同比 {facts.pct(net_yoy, 1)}）。"
         )
@@ -702,7 +745,273 @@ def _section_specs(template: str) -> List[SectionSpec]:
 
 
 # ────────────────────────────────────────────────────────────
+# 整篇一次撰写：流式段切分
+# ────────────────────────────────────────────────────────────
+class _SectionSplitter:
+    """把整篇报告的 token 流实时切成分段事件。
+
+    为什么要切：前端按 section_start / section_token(title) / report_section(title) 渲染，
+    这套契约是分段串行时代定的。整篇一次生成后仍沿用它，前端就一行都不用改——
+    而且因为中间没有停顿，视觉上正是"一篇文章连续写下来"。
+
+    切法：按行缓冲，把行内容剥掉装饰后与已知段标题比对，命中就切段。
+
+    **必须容忍多种标题写法**。提示词要求写【标题】，但模型不一定照办——写成
+    "## 技术面分析"、"**技术面分析**"、"1. 技术面分析" 或裸标题都很常见。
+    如果只认【】一种，模型换个写法就一段都切不出来，整篇被判为空 → 静默降级回分段撰写，
+    用户看到的还是老样子的"一段段等"。这里宽容匹配，就是为了让主路径真的走得通。
+
+    - 只认已知标题（剥装饰后精确相等），模型自己发挥的小标题按正文处理，不会切出幽灵段
+    - 标题行本身不进正文（前端另有 title 字段渲染，正文里再来一遍是重复）
+    - 跨 chunk 的半截标题（"【技术" + "面分析】"）由行缓冲天然处理：
+      没遇到 \\n 就一直攒着，不会误判
+
+    每个 token 都要过 on_token 回调（推 SSE），所以刻意不做整段缓冲。
+    """
+
+    # 标题行的常见装饰：md 标题符/强调符、书名号方括号、序号前缀、行尾冒号。
+    #
+    # 行尾**不剥句号**：标题不会以句号结尾，正文会。剥了的话正文里一句
+    # "……从技术面分析。" 会被归一成"技术面分析"，整句被当标题吞掉。
+    _DECOR = re.compile(r"^[\s#*_>\-–—]*[【\[（(]?\s*|\s*[】\]）)]?[\s*_:：]*$")
+    _ORDER = re.compile(r"^(?:第?\s*[0-9一二三四五六七八九十]+\s*[.、)）:：]?\s*(?:部分|章|节)?\s*)")
+
+    SUMMARY_TITLE = "投资摘要"  # 特殊段：token 以 summary_token 事件发出（前端打字机）
+
+    def __init__(self, titles: List[str], on_event: Callable[[dict], None]) -> None:
+        self._titles = list(titles)
+        self._by_norm = {self._normalize(t): t for t in titles}
+        self._on_event = on_event
+        self._line = ""            # 当前未闭合的行
+        self._current: Optional[str] = None
+        self._bodies: dict[str, list[str]] = {}
+        self._started: set[str] = set()
+        self._completed: set[str] = set()  # 经标题边界切过段的：确定完整
+
+    @property
+    def heading_closed(self) -> frozenset[str]:
+        """经标题边界收尾的段（后续又出现了新标题）——流中断时这些段仍完整可信；
+        close() 冲刷的尾段在流中断场景不可信（可能写了一半）。"""
+        return frozenset(self._completed)
+
+    def _emit_text(self, text: str) -> None:
+        if not text or self._current is None:
+            return
+        self._bodies.setdefault(self._current, []).append(text)
+        if self._current == self.SUMMARY_TITLE:
+            # 摘要段走独立事件通道：前端逐字追加到摘要卡（打字机效果）
+            self._on_event({"type": "summary_token", "text": text})
+        else:
+            self._on_event({"type": "section_token", "title": self._current, "text": text})
+
+    def _open(self, title: str) -> None:
+        if self._current is not None and self._current != title:
+            self._completed.add(self._current)  # 标题边界：上一段确定写完
+        self._current = title
+        if title not in self._started:
+            self._started.add(title)
+            self._bodies.setdefault(title, [])
+            # 摘要段不发 section_start：前端不会在正文区建空段（done 时 doc.sections
+            # 不含摘要 → 空段瞬间消失 = "内容闪现后消失"的根因）
+            if title != self.SUMMARY_TITLE:
+                self._on_event({"type": "section_start", "title": title})
+
+    @classmethod
+    def _normalize(cls, line: str) -> str:
+        """剥掉标题行的装饰，只留标题本身。用于宽容匹配各种写法。"""
+        s = cls._DECOR.sub("", line.strip())
+        return cls._ORDER.sub("", s).strip()
+
+    def _match_heading(self, line: str) -> Optional[str]:
+        """行是否是某个已知段标题。长行直接排除，避免正文句子误判成标题。"""
+        stripped = line.strip()
+        if not stripped or len(stripped) > 40:
+            return None
+        return self._by_norm.get(self._normalize(stripped))
+
+    def _adopt_single(self) -> bool:
+        """单段模板下，把无归属的正文认领给唯一的那一段。
+
+        industry / earnings / risk 三个模板都只有一段，正文归属没有歧义。模型漏写标题时
+        若不认领，整篇会被判为空 → 白白降级重跑一次（多花一轮调用与等待）。
+        多段模板不能这么做：分不清哪段是哪段，宁可降级重来。
+        """
+        if self._current is None and len(self._titles) == 1:
+            self._open(self._titles[0])
+            return True
+        return self._current is not None
+
+    def _flush_line(self, *, with_newline: bool) -> None:
+        """处理一个已闭合的行：是标题就切段，否则作为正文发出去。"""
+        line, self._line = self._line, ""
+        title = self._match_heading(line)
+        if title:
+            self._open(title)
+            return
+        # 段首的空行不发（标题与正文之间的空行会让正文平白多一个换行）
+        if self._current is None and not (line.strip() and self._adopt_single()):
+            return
+        if not self._bodies.get(self._current) and not line.strip():
+            return
+        self._emit_text(line + ("\n" if with_newline else ""))
+
+    def feed(self, token: str) -> None:
+        """按 chunk 处理，**不要拆成字符**。
+
+        只有「行」才可能是标题，所以按 \\n 切开即可；行内内容整块外发。
+        早先这里写成 `for ch in token`，正文里绝大多数字符都不是标题前缀，于是每个字符
+        立刻单独发一帧——实测帧数放大到字符级（平均每帧 1.00 字符，是模型 chunk 数的 7.8 倍）。
+        这些小帧要逐个穿过 langgraph custom writer → JSON → SSE → 前端解析 → React re-render，
+        五层叠加后就表现为"流式卡住，然后一次性把整段刷出来"。
+        """
+        if not token:
+            return
+        parts = token.split("\n")
+        for index, part in enumerate(parts):
+            self._line += part
+            if index < len(parts) - 1:
+                self._flush_line(with_newline=True)
+            elif part and not self._maybe_heading() and self._adopt_single():
+                # 行未闭合但已不可能是标题：整块外发，别攒着等换行（长段落会卡住不动）
+                self._emit_text(self._line)
+                self._line = ""
+
+    def _maybe_heading(self) -> bool:
+        """当前未闭合行是否还可能长成标题（决定要不要继续攒着不外发）。
+
+        宽容匹配下不能只比前缀：'## 技术' 剥装饰后是 '技术'，得看它是不是某个标题的前缀。
+        """
+        stripped = self._line.strip()
+        if not stripped:
+            return True   # 纯空白：可能是标题行的缩进
+        if len(stripped) > 40:
+            return False
+        norm = self._normalize(stripped)
+        if not norm:
+            return True   # 只有装饰符（"## "、"【"），还看不出来
+        return any(t.startswith(norm) for t in self._by_norm)
+
+    def close(self) -> dict[str, str]:
+        """收尾：冲掉残留行，返回 {标题: 正文}（未出现的段不在里面）。"""
+        if self._line:
+            self._flush_line(with_newline=False)
+        return {
+            title: "".join(parts).strip()
+            for title, parts in self._bodies.items()
+            if "".join(parts).strip()
+        }
+
+
+def _whole_facts_block(specs: List[SectionSpec], fv: dict) -> str:
+    """把各段事实块按段标题合并成整篇的事实块。
+
+    保留段边界（每段以【标题】起头）有两个作用：模型知道哪些数字归哪一段用；
+    以及 _truncate_facts_by_segment 超预算时能按段整块丢弃，不会把某段截半截。
+    """
+    blocks = []
+    for spec in specs:
+        if not spec.has_data(fv):
+            continue
+        blocks.append(f"【{spec.title}·事实】\n{spec.build_facts(fv)}")
+    return "\n\n".join(blocks)
+
+
+async def _llm_report(
+    state: ResearchState, specs: List[SectionSpec], fv: dict
+) -> dict[str, tuple[str, str]]:
+    """一次调用写完整篇，边流边切段。返回 {标题: (正文, 来源)}。
+
+    没有字符上限、没有断流——篇幅由用户选的思考档位经 max_tokens 控制。
+    整篇失败（模型不可用/超时/禁用词）返回空 dict，由调用方降级到并行分段。
+    """
+    template = state.get("template", "equity_deep")
+    task_id = state.get("task_id") or state.get("normalized_ticker", "")
+    usable = [s for s in specs if s.has_data(fv)]
+    if not usable:
+        return {}
+    # 摘要并入整篇流：作为第一个分段，token 以 summary_token 逐字流出，
+    # 摘要写完标题一切正文无缝续上——一条流从摘要首字到报告结尾不断
+    splitter_titles = [_SectionSplitter.SUMMARY_TITLE] + [s.title for s in usable]
+
+    llm_cfg = state.get("llm_config") or {}
+    _level, max_tokens, depth_spec = reasoning_profile(llm_cfg.get("reasoning_effort"))
+    llm = build_llm(streaming=True, max_tokens=max_tokens, override=state.get("llm_config"))
+    if llm is None:
+        return {}
+
+    sys_prompt = report_system_prompt(
+        [(s.key, s.title) for s in usable], template, depth_spec
+    )
+    # 摘要事实块拼在最前（模型按提纲先写摘要再写正文）
+    summary_facts = _compose_summary_block(state, fv)
+    whole_facts = ("【投资摘要·事实】\n" + summary_facts + "\n\n" + _whole_facts_block(usable, fv)) if summary_facts else _whole_facts_block(usable, fv)
+    lc, diag = build_report_context(
+        system_prompt=sys_prompt,
+        facts_block=whole_facts,
+        profile=state.get("profile"),
+        template=template,
+        obj_id=task_id,
+    )
+    _t0 = time.perf_counter()
+    splitter = _SectionSplitter(splitter_titles, _stream_push)
+    model_name = str((state.get("llm_config") or {}).get("model") or "")
+    gen_budget = 120.0 if is_reasoning_model(model_name) else _REPORT_TIMEOUT
+    try:
+        async with asyncio.timeout(gen_budget + 120.0):  # 外层：排队不计入生成预算
+            async with _LLM_GATE:
+                async with asyncio.timeout(gen_budget):
+                    async for chunk in llm.astream(lc):
+                        tok = _extract_token(chunk)
+                        if not tok:
+                            continue
+                        # 禁用词不再中止流：引文/数据口径已在 check_generated 分层豁免，
+                        # 裸指令词留到收口用 sanitize_generated 局部替换（曾有"北向资金
+                        # 净买入"引文命中 → 整篇 7 秒作废 → 降级再命中 → 模板零 token
+                        # 的事故链）。流式体验优先，合规在收口硬保证。
+                        splitter.feed(tok)
+    except Exception as e:  # noqa: BLE001
+        finalize_diag(diag, int((time.perf_counter() - _t0) * 1000), error=str(e))
+        # 异常也不丢弃已完成的干净段落：只保留经标题边界切过段的（heading_closed），
+        # close() 冲刷的尾段可能写了一半，不可信——交由调用方按"缺失段"补写。
+        partial = splitter.close()
+        reliable = splitter.heading_closed
+        kept = {}
+        for title, body in partial.items():
+            if title not in reliable:
+                continue
+            body, residual = sanitize_generated(strip_md(body))
+            if not residual:
+                kept[title] = (body, "llm")
+        logger.warning("整篇撰写失败，保留 %d 个已完成段落，仅缺失段补写：%s", len(kept), e)
+        return kept
+
+    bodies = splitter.close()
+    if not bodies:
+        finalize_diag(diag, int((time.perf_counter() - _t0) * 1000), error="empty_llm_output")
+        logger.warning("整篇撰写返回空内容，转分段补写")
+        return {}
+    finalize_diag(diag, int((time.perf_counter() - _t0) * 1000))
+    # 提示词是软约束，清洗才是硬保证：模型仍可能吐 **加粗**，而前端是纯文本渲染。
+    # 裸指令词在此统一替换（引文/口径豁免域不受影响）；替换后仍脏的极少数段落
+    # 不返回，由调用方按"缺失段"单独重写。
+    result = {}
+    for title, body in bodies.items():
+        body, residual = sanitize_generated(strip_md(body))
+        if residual:
+            logger.warning("整篇段落「%s」替换后仍含禁用表述，转单段重写", title)
+            continue
+        result[title] = (body, "llm")
+    return result
+
+
+# ────────────────────────────────────────────────────────────
 # 单段 LLM 撰写（命中禁用词→重写→仍命中回退模板并标注）
+#
+# 2.0.3 起这是**降级路径**：主路径是 _llm_report 一次写完整篇。整篇失败时各段并行
+# 重试一次，仍失败才落规则模板。
+#
+# 篇幅同样跟随思考档位（与主路径一致）——降级不该让用户看到一份莫名其妙变短的报告。
+# 保留的 report_section_max_chars 只当安全阀：单段真跑飞时截断，正常篇幅碰不到。
 # ────────────────────────────────────────────────────────────
 async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tuple[str, str]:
     """单段撰写，返回 (正文, 生成来源)。来源取值 llm / template / insufficient。
@@ -718,14 +1027,21 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
         return f"（{spec.title}所需数据不足，本报告不展开该部分。）", "insufficient"
 
     facts_block = spec.build_facts(fv)
-    sys_prompt = section_system_prompt(spec.key, template)
+    llm_cfg = state.get("llm_config") or {}
+    _level, level_tokens, depth_spec = reasoning_profile(llm_cfg.get("reasoning_effort"))
+    sys_prompt = section_system_prompt(spec.key, template, depth_spec)
 
     # temperature 统一 1.0：o3 / QwQ 等推理模型拒绝非默认 temperature，
     # 设 0.7 会让这些模型整段静默回退模板。
-    # streaming=True：报告分段改真流式，逐 token 吐给前端（见下方 astream 循环）。
+    # streaming=True：逐 token 吐给前端（见下方 astream 循环）。
+    # max_tokens 按档位分摊到单段：整篇预算除以段数，下限 480（旧的固定值，保证不比以前差）。
+    section_tokens = max(
+        int(getattr(settings, "report_section_max_tokens", 480)),
+        level_tokens // max(1, len(_section_specs(template))),
+    )
     llm = build_llm(
         streaming=True,
-        max_tokens=max(64, int(getattr(settings, "report_section_max_tokens", 480))),
+        max_tokens=section_tokens,
         override=state.get("llm_config"),
     )
     if llm is None:
@@ -741,34 +1057,33 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
     def _elapsed() -> int:
         return int((time.perf_counter() - _t0) * 1000)
 
-    # 真流式（方案A）：逐 token 从模型流出，每个安全 token 立即经 section_token 推给前端，
-    # 同时累积成整段正文。相较旧的一次性 _invoke，前端能一字字看到板块生成过程。
-    cap = min(spec.max_chars, max(120, int(getattr(settings, "report_section_max_chars", 420))))
+    # 逐 token 从模型流出，每个安全 token 立即经 section_token 推给前端，同时累积成整段正文。
+    #
+    # cap 是安全阀不是篇幅限制：从本段的 token 预算换算（1 token 约 1.5 中文字，×4 留足余量），
+    # 正常输出碰不到它，只在模型陷入循环时兜底。此前它是 min(spec.max_chars=320, 420)=320，
+    # 那是个实打实的篇幅限制——每段刚写到 200 字就被 break 掉，末尾还补个"…"。
+    cap = max(int(getattr(settings, "report_section_max_chars", 420)), section_tokens * 4)
     parts: list[str] = []
     acc = ""
-    forbidden = False
+    # 推理模型（DeepSeek-R1/QwQ/o 系/gpt-5）首字前的思考阶段可远超 30s：
+    # 生成预算按首字宽限放宽；闸排队时间不计入（外层 +120s 只防无限排队）。
+    model_name = str(llm_cfg.get("model") or "")
+    gen_budget = 90.0 if is_reasoning_model(model_name) else _SECTION_TIMEOUT
     try:
-        async with asyncio.timeout(_SECTION_TIMEOUT):
+        async with asyncio.timeout(gen_budget + 120.0):
             async with _LLM_GATE:
-                async for chunk in llm.astream(lc):
-                    tok = _extract_token(chunk)
-                    if not tok:
-                        continue
-                    if not acc and not tok.strip():
-                        continue  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
-                    # 实时禁用词闸：并入这段 token 会命中禁用词，就不外发它、停止流式，
-                    # 转下方回退模板（最终 report_section 事件会以模板 body 覆盖已流出的片段）。
-                    if check_generated(acc + tok):
-                        forbidden = True
-                        break
-                    acc += tok
-                    parts.append(tok)
-                    _stream_push({"type": "section_token", "title": spec.title, "text": tok})
-                    if len(acc) >= cap:
-                        break  # 到确定性字符上限即停，省 token
-        if forbidden:
-            finalize_diag(diag, _elapsed(), error="forbidden_verbs")
-            return spec.fallback(fv) + "（模型输出含禁用表述，已使用事实模板。）", "template"
+                async with asyncio.timeout(gen_budget):
+                    async for chunk in llm.astream(lc):
+                        tok = _extract_token(chunk)
+                        if not tok:
+                            continue
+                        if not acc and not tok.strip():
+                            continue  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
+                        acc += tok
+                        parts.append(tok)
+                        _stream_push({"type": "section_token", "title": spec.title, "text": tok})
+                        if len(acc) >= cap:
+                            break  # 到确定性字符上限即停，省 token
         text = "".join(parts)
         # 空/纯空白兜底：模型在并发限流、内容审查、max_tokens 被 reasoning 吃满等情况下偶发返回空。
         # 空返回当撰写失败、回退规则模板（body 必非空），如实标注来源 template；否则渲染成空白章节。
@@ -777,6 +1092,12 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
             finalize_diag(diag, _elapsed(), error="empty_llm_output")
             return spec.fallback(fv), "template"
         text, truncated = _bound_generated_text(text, cap)
+        # 收口统一替换裸指令词（引文/口径豁免）；替换后仍脏 = 模型自造「」逃逸，落模板兜底
+        text, residual = sanitize_generated(text)
+        if residual:
+            finalize_diag(diag, _elapsed(), error="forbidden_verbs")
+            logger.warning("%s 段替换后仍含禁用表述，回退模板", spec.key)
+            return spec.fallback(fv) + "（模型输出含禁用表述，已使用事实模板。）", "template"
         finalize_diag(diag, _elapsed(), note="output_truncated" if truncated else "")
         return text, "llm"
     except Exception as e:  # noqa: BLE001
@@ -822,9 +1143,17 @@ def _quote_measures(quote: dict) -> dict:
 
 
 def _latest_pct(fins: dict, direct_name: str, base_name: str) -> Optional[float]:
-    """优先使用数据源直接提供的同比，旧数据再由绝对值序列计算。"""
+    """优先使用数据源直接提供的同比，旧数据再由绝对值序列计算。
+
+    levels 重算前校验最近两期报告期同形：中报对上年年报直接相除
+    是 -50% 式系统性错误，口径不一致时返回 None 走 MISSING。
+    """
     direct = facts.to_float(facts.val_str(facts.row_vals(fins, direct_name)))
-    return direct if direct is not None else facts.yoy_pct(facts.row_vals(fins, base_name))
+    if direct is not None:
+        return direct
+    if not facts.periods_comparable(fins):
+        return None
+    return facts.yoy_pct(facts.row_vals(fins, base_name))
 
 
 def _compose_summary_block(state: ResearchState, fv: dict) -> str:
@@ -911,9 +1240,9 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
         "as_of": quote.get("as_of") or state.get("data_as_of", "") or facts.MISSING,
         "roe": facts.val_str(facts.row_vals(fins, "ROE")),
         "revenue": facts.val_str(rev),
-        "rev_yoy": facts.pct(facts.yoy_pct(rev), 1),
+        "rev_yoy": facts.pct(_latest_pct(fins, "营收同比", "营业收入"), 1),
         "net_profit": facts.val_str(net),
-        "net_yoy": facts.pct(facts.yoy_pct(net), 1),
+        "net_yoy": facts.pct(_latest_pct(fins, "净利润同比", "净利润"), 1),
         "gross_margin": facts.val_str(facts.row_vals(fins, "毛利率")),
         "debt_ratio": facts.val_str(facts.row_vals(fins, "资产负债率")),
         "tech_direction": direction,
@@ -1023,12 +1352,10 @@ async def summary_node(state: ResearchState) -> dict:
         fv = facts.normalize_findings(findings)
     fv["profile"] = fv.get("profile") or _find(findings, "profile")
 
-    _stream_push("正在撰写投资摘要…")
     if getattr(settings, "report_use_llm_summary", False):
         summary = await _llm_summary(state, fv)
     else:
         summary = _compose_summary_block(state, fv)
-    _stream_push("✓ 投资摘要完成")
 
     return {
         "draft_summary": summary,
@@ -1054,47 +1381,69 @@ async def report_node(state: ResearchState) -> dict:
 
     sections_t0 = time.perf_counter()
     summary = state.get("draft_summary") or _compose_summary_block(state, fv)
-    # 模板对应各段并发撰写（并发闸在 _invoke 里，避免家用 key 成片 429）。
     specs = _section_specs(template)
-    # 逐段真流式（方案A）：串行撰写，每段先发 section_start 让前端建段并置为 streaming，
-    # 段内由 _llm_section 逐 token 发 section_token，最后发权威 report_section 收口。
-    # 比旧的并行 gather 慢，但前端能一段段、一字字看到生成，而非等整段算完才闪出。
-    _stream_push(f"开始撰写 {len(specs)} 段分析（逐段真流式）…")
 
-    results: list = []
+    # 整篇一次撰写（摘要并入）：一次 LLM 调用从摘要首字到报告结尾连续流式。
+    _stream_push("开始撰写报告…")
+    whole = await _llm_report(state, specs, fv)
+
+    # 摘要从整篇流中提取（模型按提纲先写摘要段）
+    SUMMARY_KEY = _SectionSplitter.SUMMARY_TITLE
+    draft_summary = ""
+    if SUMMARY_KEY in whole:
+        draft_summary = whole[SUMMARY_KEY][0].strip()
+        del whole[SUMMARY_KEY]  # 不作为普通 section 渲染
+        # 权威收口：替换语义兜住 sanitize/strip_md 差异 + 断线重连回放
+        _stream_push({"type": "research_summary", "text": draft_summary, "name": state.get("code", ""), "ticker": state.get("normalized_ticker", "")})
+    else:
+        draft_summary = _compose_summary_block(state, fv)
+        _stream_push({"type": "research_summary", "text": draft_summary, "name": state.get("code", ""), "ticker": state.get("normalized_ticker", "")})
+
+    results: dict[str, tuple[str, str]] = {}
     for spec in specs:
-        _stream_push({"type": "section_start", "title": spec.title})
-        _stream_push(f"正在撰写：{spec.title}…")
-        try:
-            result = await _llm_section(state, spec, fv)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("%s 段撰写异常：%s", spec.key, exc)
-            _stream_push(f"⚠ {spec.title} 撰写异常，回退模板")
-            results.append(exc)
-            continue
-        body, source = result
-        # 权威 body 收口：覆盖流式期间已展示的片段（截断/禁用词回退后以此为准）
-        _stream_push({"type": "report_section", "title": spec.title, "body": body, "source": source})
-        _stream_push(f"✓ {spec.title} 完成")
-        results.append(result)
-    _stream_push("各段撰写完成，正在组装报告…")
+        if spec.title in whole:
+            results[spec.title] = whole[spec.title]
+        elif not spec.has_data(fv):
+            results[spec.title] = (f"（{spec.title}所需数据不足，本报告不展开该部分。）", "insufficient")
+
+    # 整篇成功段的权威收口：整篇流结束即逐段发出（不等补写段）
+    for spec in specs:
+        if spec.title in whole:
+            body, source = whole[spec.title]
+            _stream_push({"type": "report_section", "title": spec.title, "body": body, "source": source})
+
+    missing = [s for s in specs if s.title not in results]
+    if missing:
+        if whole:
+            _stream_push("部分内容重新撰写中…")
+
+        async def _run_section(spec: SectionSpec) -> tuple[str, str]:
+            # 只对真正重写的段发 section_start（前端清空该段旧正文），已完成的段永不闪空
+            _stream_push({"type": "section_start", "title": spec.title})
+            try:
+                body, source = await _llm_section(state, spec, fv)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("%s 段撰写异常，回退模板：%s", spec.key, e)
+                try:
+                    body, source = spec.fallback(fv) + "（撰写异常，已回退模板。）", "template"
+                except Exception as fb_err:  # noqa: BLE001
+                    logger.warning("%s 段 fallback 也失败：%s", spec.key, fb_err)
+                    body, source = f"（{spec.title}生成失败，数据可能异常，本段暂不展开。）", "error"
+            # 完成即收口：不等兄弟段（曾有 gather 拦栅——一个慢段把所有已完成段的
+            # 权威收口全部拖住，前端表现"正文迟迟整块出现"）
+            _stream_push({"type": "report_section", "title": spec.title, "body": body, "source": source})
+            return body, source
+
+        gathered = await asyncio.gather(*(_run_section(s) for s in missing))
+        for spec, res in zip(missing, gathered):
+            results[spec.title] = res
 
     sections: list[dict] = []
     gen: dict[str, str] = {}
-    for spec, res in zip(specs, results):
-        if isinstance(res, Exception):
-            logger.warning("%s 段 gather 异常，回退模板：%s", spec.key, res)
-            # fallback 本身也可能抛异常（如数据源返回畸形 kline，_ma_arrangement 崩）。
-            # 这里是"单段独立降级"的最后一道兜底：fallback 再崩，也只让这一段显示占位，
-            # 绝不让整个报告因一段挂掉（此前无保护，fallback 一崩 report_node 直接抛异常，
-            # 整份报告失败）。
-            try:
-                body, source = spec.fallback(fv) + "（撰写异常，已回退模板。）", "template"
-            except Exception as fb_err:  # noqa: BLE001
-                logger.warning("%s 段 fallback 也失败：%s", spec.key, fb_err)
-                body, source = f"（{spec.title}生成失败，数据可能异常，本段暂不展开。）", "error"
-        else:
-            body, source = res
+    for spec in specs:
+        # results 全量覆盖：整篇段 / insufficient / _run_section 兜底后的补写段，
+        # 异常兜底已在 _run_section 内完成（fallback 再崩也有占位段），这里不会再缺。
+        body, source = results[spec.title]
         gen[spec.title] = source
         sections.append({"title": spec.title, "body": body})
 
@@ -1121,7 +1470,7 @@ async def report_node(state: ResearchState) -> dict:
         ticker=_ticker,
         name=name,
         template=template,
-        summary=summary,
+        summary=draft_summary or summary,
         catalyst=catalyst,
         financials=fv.get("fins", {"years": [], "rows": []}),
         sections=sections,

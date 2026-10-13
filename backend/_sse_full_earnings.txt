@@ -1,0 +1,1520 @@
+data: {"type": "tool_call", "name": "prefetch_basics", "label": "取数（行情/财务/新闻/K线）", "status": "start", "call_id": "call_00_nxETkKgmUDrAbXgLc8kA1955"}
+
+data: {"type": "tool_call", "name": "prefetch_basics", "label": "取数（行情/财务/新闻/K线）", "status": "ok"}
+
+data: {"type": "tool_call", "name": "compose_report", "label": "撰写报告", "status": "start", "call_id": "call_00_ET_zkmOJPq0xM9ZMyRvknQ24744"}
+
+data: {"type": "tool", "text": "开始撰写报告…", "report_stage": true}
+
+data: {"type": "section_start", "title": "投资摘要"}
+
+data: {"type": "summary_token", "text": "📊"}
+
+data: {"type": "summary_token", "text": " 贵州"}
+
+data: {"type": "summary_token", "text": "茅台"}
+
+data: {"type": "summary_token", "text": "最新"}
+
+data: {"type": "summary_token", "text": "可得"}
+
+data: {"type": "summary_token", "text": "口径"}
+
+data: {"type": "summary_token", "text": "为"}
+
+data: {"type": "summary_token", "text": " 2026-"}
+
+data: {"type": "summary_token", "text": "06-"}
+
+data: {"type": "summary_token", "text": "30（"}
+
+data: {"type": "summary_token", "text": "中"}
+
+data: {"type": "summary_token", "text": "报"}
+
+data: {"type": "summary_token", "text": "）：营业收入"}
+
+data: {"type": "summary_token", "text": " 922.78"}
+
+data: {"type": "summary_token", "text": " 亿元"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": " +"}
+
+data: {"type": "summary_token", "text": "1.5"}
+
+data: {"type": "summary_token", "text": "%；"}
+
+data: {"type": "summary_token", "text": "净利润"}
+
+data: {"type": "summary_token", "text": " 445.17"}
+
+data: {"type": "summary_token", "text": " 亿元"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": " -2.0"}
+
+data: {"type": "summary_token", "text": "%，"}
+
+data: {"type": "summary_token", "text": "收入"}
+
+data: {"type": "summary_token", "text": "端"}
+
+data: {"type": "summary_token", "text": "小幅"}
+
+data: {"type": "summary_token", "text": "正"}
+
+data: {"type": "summary_token", "text": "增长"}
+
+data: {"type": "summary_token", "text": "而"}
+
+data: {"type": "summary_token", "text": "利润"}
+
+data: {"type": "summary_token", "text": "端"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "转"}
+
+data: {"type": "summary_token", "text": "负"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "呈"}
+
+data: {"type": "summary_token", "text": "「"}
+
+data: {"type": "summary_token", "text": "增收"}
+
+data: {"type": "summary_token", "text": "未"}
+
+data: {"type": "summary_token", "text": "增"}
+
+data: {"type": "summary_token", "text": "利"}
+
+data: {"type": "summary_token", "text": "」"}
+
+data: {"type": "summary_token", "text": "的"}
+
+data: {"type": "summary_token", "text": "形态"}
+
+data: {"type": "summary_token", "text": "。\n"}
+
+data: {"type": "summary_token", "text": "\n"}
+
+data: {"type": "summary_token", "text": "盈利"}
+
+data: {"type": "summary_token", "text": "质量"}
+
+data: {"type": "summary_token", "text": "口径"}
+
+data: {"type": "summary_token", "text": "显示"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "RO"}
+
+data: {"type": "summary_token", "text": "E"}
+
+data: {"type": "summary_token", "text": " 16.8"}
+
+data: {"type": "summary_token", "text": "%（"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "变动"}
+
+data: {"type": "summary_token", "text": " -15.7"}
+
+data: {"type": "summary_token", "text": "p"}
+
+data: {"type": "summary_token", "text": "ct"}
+
+data: {"type": "summary_token", "text": "）、"}
+
+data: {"type": "summary_token", "text": "毛利率"}
+
+data: {"type": "summary_token", "text": " 89.6"}
+
+data: {"type": "summary_token", "text": "%（"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "变动"}
+
+data: {"type": "summary_token", "text": " -1.6"}
+
+data: {"type": "summary_token", "text": "p"}
+
+data: {"type": "summary_token", "text": "ct"}
+
+data: {"type": "summary_token", "text": "），"}
+
+data: {"type": "summary_token", "text": "两项"}
+
+data: {"type": "summary_token", "text": "均为"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "变动"}
+
+data: {"type": "summary_token", "text": "（百分点"}
+
+data: {"type": "summary_token", "text": "）口径"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "是"}
+
+data: {"type": "summary_token", "text": "本期"}
+
+data: {"type": "summary_token", "text": "最"}
+
+data: {"type": "summary_token", "text": "需要"}
+
+data: {"type": "summary_token", "text": "关注的"}
+
+data: {"type": "summary_token", "text": "边际"}
+
+data: {"type": "summary_token", "text": "变化"}
+
+data: {"type": "summary_token", "text": "；"}
+
+data: {"type": "summary_token", "text": "资产负债"}
+
+data: {"type": "summary_token", "text": "率"}
+
+data: {"type": "summary_token", "text": " 15.2"}
+
+data: {"type": "summary_token", "text": "%（"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "变动"}
+
+data: {"type": "summary_token", "text": " -1.2"}
+
+data: {"type": "summary_token", "text": "p"}
+
+data: {"type": "summary_token", "text": "ct"}
+
+data: {"type": "summary_token", "text": "），"}
+
+data: {"type": "summary_token", "text": "杠杆"}
+
+data: {"type": "summary_token", "text": "水平"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "进一步"}
+
+data: {"type": "summary_token", "text": "回落"}
+
+data: {"type": "summary_token", "text": "。\n"}
+
+data: {"type": "summary_token", "text": "\n"}
+
+data: {"type": "summary_token", "text": "我们认为"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "营收"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "增速"}
+
+data: {"type": "summary_token", "text": "与"}
+
+data: {"type": "summary_token", "text": "净利润"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "增速"}
+
+data: {"type": "summary_token", "text": "分别为"}
+
+data: {"type": "summary_token", "text": " +"}
+
+data: {"type": "summary_token", "text": "1.5"}
+
+data: {"type": "summary_token", "text": "%"}
+
+data: {"type": "summary_token", "text": " 与"}
+
+data: {"type": "summary_token", "text": " -2.0"}
+
+data: {"type": "summary_token", "text": "%，"}
+
+data: {"type": "summary_token", "text": "方向"}
+
+data: {"type": "summary_token", "text": "相反"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "说明"}
+
+data: {"type": "summary_token", "text": "本期"}
+
+data: {"type": "summary_token", "text": "收入"}
+
+data: {"type": "summary_token", "text": "增长"}
+
+data: {"type": "summary_token", "text": "尚未"}
+
+data: {"type": "summary_token", "text": "有效"}
+
+data: {"type": "summary_token", "text": "传导"}
+
+data: {"type": "summary_token", "text": "至"}
+
+data: {"type": "summary_token", "text": "利润"}
+
+data: {"type": "summary_token", "text": "端"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "盈利"}
+
+data: {"type": "summary_token", "text": "转化"}
+
+data: {"type": "summary_token", "text": "效率"}
+
+data: {"type": "summary_token", "text": "的"}
+
+data: {"type": "summary_token", "text": "边际"}
+
+data: {"type": "summary_token", "text": "走"}
+
+data: {"type": "summary_token", "text": "弱"}
+
+data: {"type": "summary_token", "text": "是"}
+
+data: {"type": "summary_token", "text": "核心"}
+
+data: {"type": "summary_token", "text": "矛盾"}
+
+data: {"type": "summary_token", "text": "。\n"}
+
+data: {"type": "summary_token", "text": "\n"}
+
+data: {"type": "summary_token", "text": "✅"}
+
+data: {"type": "summary_token", "text": " 对"}
+
+data: {"type": "summary_token", "text": "以"}
+
+data: {"type": "summary_token", "text": "营收"}
+
+data: {"type": "summary_token", "text": "增速"}
+
+data: {"type": "summary_token", "text": "、"}
+
+data: {"type": "summary_token", "text": "RO"}
+
+data: {"type": "summary_token", "text": "E"}
+
+data: {"type": "summary_token", "text": "、"}
+
+data: {"type": "summary_token", "text": "现金流"}
+
+data: {"type": "summary_token", "text": "为"}
+
+data: {"type": "summary_token", "text": "关注"}
+
+data: {"type": "summary_token", "text": "重点"}
+
+data: {"type": "summary_token", "text": "的中"}
+
+data: {"type": "summary_token", "text": "期"}
+
+data: {"type": "summary_token", "text": "稳健"}
+
+data: {"type": "summary_token", "text": "型"}
+
+data: {"type": "summary_token", "text": "视角"}
+
+data: {"type": "summary_token", "text": "而言"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "本期"}
+
+data: {"type": "summary_token", "text": "可"}
+
+data: {"type": "summary_token", "text": "确认"}
+
+data: {"type": "summary_token", "text": "的事实"}
+
+data: {"type": "summary_token", "text": "是"}
+
+data: {"type": "summary_token", "text": "收入"}
+
+data: {"type": "summary_token", "text": "正"}
+
+data: {"type": "summary_token", "text": "增长"}
+
+data: {"type": "summary_token", "text": "、"}
+
+data: {"type": "summary_token", "text": "杠杆"}
+
+data: {"type": "summary_token", "text": "下行"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "但"}
+
+data: {"type": "summary_token", "text": " RO"}
+
+data: {"type": "summary_token", "text": "E"}
+
+data: {"type": "summary_token", "text": " 与"}
+
+data: {"type": "summary_token", "text": "毛利率"}
+
+data: {"type": "summary_token", "text": "同比"}
+
+data: {"type": "summary_token", "text": "回落"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "需"}
+
+data: {"type": "summary_token", "text": "待"}
+
+data: {"type": "summary_token", "text": "后续"}
+
+data: {"type": "summary_token", "text": "披露"}
+
+data: {"type": "summary_token", "text": "的口"}
+
+data: {"type": "summary_token", "text": "径"}
+
+data: {"type": "summary_token", "text": "验证"}
+
+data: {"type": "summary_token", "text": "是否为"}
+
+data: {"type": "summary_token", "text": "阶段性"}
+
+data: {"type": "summary_token", "text": "波动"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "建议"}
+
+data: {"type": "summary_token", "text": "关注"}
+
+data: {"type": "summary_token", "text": "。\n"}
+
+data: {"type": "summary_token", "text": "\n"}
+
+data: {"type": "summary_token", "text": "⚠"}
+
+data: {"type": "summary_token", "text": "️"}
+
+data: {"type": "summary_token", "text": " 事实"}
+
+data: {"type": "summary_token", "text": "块"}
+
+data: {"type": "summary_token", "text": "未"}
+
+data: {"type": "summary_token", "text": "提供的"}
+
+data: {"type": "summary_token", "text": "指标"}
+
+data: {"type": "summary_token", "text": "保持"}
+
+data: {"type": "summary_token", "text": "未"}
+
+data: {"type": "summary_token", "text": "获取"}
+
+data: {"type": "summary_token", "text": "状态"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "本"}
+
+data: {"type": "summary_token", "text": "报告"}
+
+data: {"type": "summary_token", "text": "不使用"}
+
+data: {"type": "summary_token", "text": "股价"}
+
+data: {"type": "summary_token", "text": "走势"}
+
+data: {"type": "summary_token", "text": "补"}
+
+data: {"type": "summary_token", "text": "写"}
+
+data: {"type": "summary_token", "text": "业绩结论"}
+
+data: {"type": "summary_token", "text": "，"}
+
+data: {"type": "summary_token", "text": "亦"}
+
+data: {"type": "summary_token", "text": "不对"}
+
+data: {"type": "summary_token", "text": "环比"}
+
+data: {"type": "summary_token", "text": "数据"}
+
+data: {"type": "summary_token", "text": "作"}
+
+data: {"type": "summary_token", "text": "任何"}
+
+data: {"type": "summary_token", "text": "评"}
+
+data: {"type": "summary_token", "text": "述"}
+
+data: {"type": "summary_token", "text": "。\n"}
+
+data: {"type": "summary_token", "text": "\n"}
+
+data: {"type": "section_start", "title": "业绩快评"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本期"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为公司"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 2026-"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "06-"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "30（"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "中"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "报"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "）口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：营业收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 922.78"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 亿元"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " +"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "1.5"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增速"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "（%）"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：净利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 445.17"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 亿元"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -2.0"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增速"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "（%）"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "两者"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "方向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "相反"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "构"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "成本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "次"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "财报"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "最"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "直观"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的特征"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "——增收"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "而"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未能"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "从"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "盈利"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "转化"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "效率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "看"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "RO"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "E"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 16.8"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -15.7"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "p"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "ct"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 89.6"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -1.6"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "p"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "ct"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "此处"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "须"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "严格"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "区分"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：16"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "."}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "8%"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 89.6"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "比率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "水平"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "-15.7"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "p"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "ct"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -1.6"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "p"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "ct"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "（百分点"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "），"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "并非"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增速"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "💡"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 我们"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "据此"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "可以"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "确认"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "两项"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "事实"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：一是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "绝对"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "水平"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "仍"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "处于"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "很高"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "位置"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "二是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "其"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "方向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "下行"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "单位"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "所"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "留"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "存的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "空间"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "在"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "窄"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "RO"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "E"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "回落"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "幅度"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "则"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "明显"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "大于"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "回落"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "幅度"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "说明"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本期"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "股东"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "回报"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "效率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "边际"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变化"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "更为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "显著"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "受"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "事实"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "块"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "披露"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "范围"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "限制"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "我们"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "不对"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " RO"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "E"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "背后的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "构成"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "因素"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "作"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "拆分"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "归"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "因"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "也不"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "推测"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "披露"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "季度"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "数据"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "从"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "经营"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "杠杆"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "传导"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "看"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "实现"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " +"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "1.5"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "正"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增长"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "但"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "净利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -2.0"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "即"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的正"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未能"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同步"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "反映"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的正"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "⚠"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "️"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 需要"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "说明"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "事实"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "块"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "披露"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "营业"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "成本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "期间"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "费用"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "非"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "经常"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "性"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "损益"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "等"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "分"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "项"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "数据"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "因此"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本期"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "承"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "压"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "具体"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "来自"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "成本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "费用"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "还"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "是一次"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "性"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "项目"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "无法"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "从"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "现有"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "判断"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "我们"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "也不"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "做"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "估算"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "推"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "演"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "在"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "之外"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "事实"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "块"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "提供"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "环比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "数据"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "故"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "报告"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "不对"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "环比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "不对"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "单"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "季"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "表现"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "作"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "任何"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "评价"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "亦"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "不"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "给出"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "任何"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "业绩预测"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "数字"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "从"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "杠杆"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "财务"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "结构"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "看"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "资产负债"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 15.2"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "%，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " -1.2"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "p"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "ct"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "为"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "比率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变动"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "（百分点"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "）口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "该"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "指标"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "下行"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "指向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "负债"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "相对"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收缩"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "财务"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "杠杆"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "进一步"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "降低"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "资产"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "端的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "稳健"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "程度"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "并未"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "因"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本期"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "转"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "负"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "而"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "恶化"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "综合"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "而言"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本期"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "经营"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "质量"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "呈现"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "「"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收入"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "正"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "增长"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "、"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "杠杆"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "下行"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "但"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "利润"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "回报"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "效率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "走"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "弱"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "」"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的组合"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：✅"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 结构"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "安全"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "边际"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "尚"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "在"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "💡"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 但"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "盈利"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "转化"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "效率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "边际"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "变化"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "是本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "轮"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "财报"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "中"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "更"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "值得"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "跟踪"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的主"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "线"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "静"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "待"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "后续"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "披露"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "给出"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "更"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "完整的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "费用"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "现金流"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "信息"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "以"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "验证"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "性质"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "🎯"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": " 后续"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "关注"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "点"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "集中在"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "三项"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "未"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "获取"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "指标的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "补"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "全"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "：一是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "环比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "口径"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "能否"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "印证"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "回落"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "的方向"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "性"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "二是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "费用"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "现金流"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "质量"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "数据"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "能否"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "区分"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "成本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "压力"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "与"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "一次性"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "影响"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "三是"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "毛利率"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "同比"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "下"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "行的"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "幅度"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "能否"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "收敛"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "\n"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "本"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "内容"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "仅供参考"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "不"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "构成"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "投资建议"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "；"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "市场"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "有"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "风险"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "，"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "投资需"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "谨慎"}
+
+data: {"type": "section_token", "title": "业绩快评", "text": "。"}
+
+data: {"type": "summary", "text": "📊 贵州茅台最新可得口径为 2026-06-30（中报）：营业收入 922.78 亿元，同比 +1.5%；净利润 445.17 亿元，同比 -2.0%，收入端小幅正增长而利润端同比转负，呈「增收未增利」的形态。\n\n盈利质量口径显示，ROE 16.8%（同比变动 -15.7pct）、毛利率 89.6%（同比变动 -1.6pct），两项均为同比变动（百分点）口径，是本期最需要关注的边际变化；资产负债率 15.2%（同比变动 -1.2pct），杠杆水平同比进一步回落。\n\n我们认为，营收同比增速与净利润同比增速分别为 +1.5% 与 -2.0%，方向相反，说明本期收入增长尚未有效传导至利润端，盈利转化效率的边际走弱是核心矛盾。\n\n✅ 对以营收增速、ROE、现金流为关注重点的中期稳健型视角而言，本期可确认的事实是收入正增长、杠杆下行，但 ROE 与毛利率同比回落，需待后续披露的口径验证是否为阶段性波动，建议关注。\n\n⚠️ 事实块未提供的指标保持未获取状态，本报告不使用股价走势补写业绩结论，亦不对环比数据作任何评述。", "name": "600519", "ticker": "600519", "price": null, "change": null, "changePct": null}
+
+data: {"type": "section", "title": "业绩快评", "body": "本期为公司 2026-06-30（中报）口径。收入端：营业收入 922.78 亿元，同比 +1.5%，为同比增速（%）口径；利润端：净利润 445.17 亿元，同比 -2.0%，同为同比增速（%）口径。两者方向相反，构成本次财报最直观的特征——增收而未能增利。\n\n从盈利转化效率看，ROE 16.8%，同比变动 -15.7pct；毛利率 89.6%，同比变动 -1.6pct。此处须严格区分口径：16.8% 与 89.6% 是比率水平，-15.7pct 与 -1.6pct 是同比变动（百分点），并非同比增速。💡 我们据此可以确认两项事实：一是毛利率的绝对水平仍处于很高位置，二是其同比方向为下行，单位收入所留存的毛利空间在收窄；ROE 的同比回落幅度则明显大于毛利率的回落幅度，说明本期股东回报效率的边际变化更为显著。受事实块披露范围限制，我们不对 ROE 与毛利率变动背后的构成因素作拆分归因，也不推测未披露的季度数据。\n\n从经营杠杆与利润传导看，收入端实现 +1.5% 的同比正增长，但净利润同比为 -2.0%，即收入的正向变动未能同步反映为利润的正向变动。⚠️ 需要说明的是，事实块未披露营业成本、期间费用率、非经常性损益等分项数据，因此本期利润端承压具体来自成本、费用还是一次性项目，无法从现有口径判断，我们也不做估算与推演。在同比口径之外，事实块未提供环比数据，故本报告不对环比变动、不对单季表现作任何评价，亦不给出任何业绩预测数字。\n\n从杠杆与财务结构看，资产负债率 15.2%，同比变动 -1.2pct，为比率变动（百分点）口径。该指标同比下行，指向负债端相对收缩、财务杠杆进一步降低，资产端的稳健程度并未因本期利润同比转负而恶化。综合而言，本期经营质量呈现「收入正增长、杠杆下行，但利润与回报效率同比走弱」的组合：✅ 结构安全边际尚在，💡 但盈利转化效率的边际变化是本轮财报中更值得跟踪的主线，静待后续披露口径给出更完整的费用与现金流信息以验证性质。\n\n🎯 后续关注点集中在三项未获取指标的补全：一是环比口径能否印证同比回落的方向性；二是费用率与现金流质量数据能否区分成本压力与一次性影响；三是毛利率同比下行的幅度能否收敛。\n\n本内容仅供参考，不构成投资建议；市场有风险，投资需谨慎。", "source": "llm"}
+
+data: {"type": "tool_call", "name": "compose_report", "label": "撰写报告", "status": "ok"}
+
+data: {"type": "done", "report_id": "7b1804e62e694eaa833ee9ad39e444ca", "report": {"ticker": "600519.SH", "name": "贵州茅台", "template": "earnings", "summary": "📊 贵州茅台最新可得口径为 2026-06-30（中报）：营业收入 922.78 亿元，同比 +1.5%；净利润 445.17 亿元，同比 -2.0%，收入端小幅正增长而利润端同比转负，呈「增收未增利」的形态。\n\n盈利质量口径显示，ROE 16.8%（同比变动 -15.7pct）、毛利率 89.6%（同比变动 -1.6pct），两项均为同比变动（百分点）口径，是本期最需要关注的边际变化；资产负债率 15.2%（同比变动 -1.2pct），杠杆水平同比进一步回落。\n\n我们认为，营收同比增速与净利润同比增速分别为 +1.5% 与 -2.0%，方向相反，说明本期收入增长尚未有效传导至利润端，盈利转化效率的边际走弱是核心矛盾。\n\n✅ 对以营收增速、ROE、现金流为关注重点的中期稳健型视角而言，本期可确认的事实是收入正增长、杠杆下行，但 ROE 与毛利率同比回落，需待后续披露的口径验证是否为阶段性波动，建议关注。\n\n⚠️ 事实块未提供的指标保持未获取状态，本报告不使用股价走势补写业绩结论，亦不对环比数据作任何评述。", "catalyst": "后续重点核验下一报告期营收、利润、毛利率和现金流是否延续当前趋势。", "financials": {"years": ["2022", "2023", "2024", "2025", "2026"], "periods": ["2022-12-31", "2023-12-31", "2024-12-31", "2025-12-31", "2026-06-30"], "rows": [{"name": "营业收入", "values": ["1275.54亿", "1505.60亿", "1741.44亿", "1720.54亿", "922.78亿"]}, {"name": "净利润", "values": ["627.17亿", "747.34亿", "862.28亿", "823.20亿", "445.17亿"]}, {"name": "营收同比", "values": ["16.9%", "19.0%", "15.7%", "-1.2%", "1.5%"]}, {"name": "净利润同比", "values": ["17.3%", "18.6%", "15.2%", "-4.5%", "-2.0%"]}, {"name": "ROE", "values": ["30.3%", "34.2%", "36.0%", "32.5%", "16.8%"]}, {"name": "毛利率", "values": ["91.9%", "92.0%", "91.9%", "91.2%", "89.6%"]}, {"name": "资产负债率", "values": ["19.4%", "18.0%", "19.0%", "16.4%", "15.2%"]}]}, "sections": [{"title": "业绩快评", "body": "本期为公司 2026-06-30（中报）口径。收入端：营业收入 922.78 亿元，同比 +1.5%，为同比增速（%）口径；利润端：净利润 445.17 亿元，同比 -2.0%，同为同比增速（%）口径。两者方向相反，构成本次财报最直观的特征——增收而未能增利。\n\n从盈利转化效率看，ROE 16.8%，同比变动 -15.7pct；毛利率 89.6%，同比变动 -1.6pct。此处须严格区分口径：16.8% 与 89.6% 是比率水平，-15.7pct 与 -1.6pct 是同比变动（百分点），并非同比增速。💡 我们据此可以确认两项事实：一是毛利率的绝对水平仍处于很高位置，二是其同比方向为下行，单位收入所留存的毛利空间在收窄；ROE 的同比回落幅度则明显大于毛利率的回落幅度，说明本期股东回报效率的边际变化更为显著。受事实块披露范围限制，我们不对 ROE 与毛利率变动背后的构成因素作拆分归因，也不推测未披露的季度数据。\n\n从经营杠杆与利润传导看，收入端实现 +1.5% 的同比正增长，但净利润同比为 -2.0%，即收入的正向变动未能同步反映为利润的正向变动。⚠️ 需要说明的是，事实块未披露营业成本、期间费用率、非经常性损益等分项数据，因此本期利润端承压具体来自成本、费用还是一次性项目，无法从现有口径判断，我们也不做估算与推演。在同比口径之外，事实块未提供环比数据，故本报告不对环比变动、不对单季表现作任何评价，亦不给出任何业绩预测数字。\n\n从杠杆与财务结构看，资产负债率 15.2%，同比变动 -1.2pct，为比率变动（百分点）口径。该指标同比下行，指向负债端相对收缩、财务杠杆进一步降低，资产端的稳健程度并未因本期利润同比转负而恶化。综合而言，本期经营质量呈现「收入正增长、杠杆下行，但利润与回报效率同比走弱」的组合：✅ 结构安全边际尚在，💡 但盈利转化效率的边际变化是本轮财报中更值得跟踪的主线，静待后续披露口径给出更完整的费用与现金流信息以验证性质。\n\n🎯 后续关注点集中在三项未获取指标的补全：一是环比口径能否印证同比回落的方向性；二是费用率与现金流质量数据能否区分成本压力与一次性影响；三是毛利率同比下行的幅度能否收敛。\n\n本内容仅供参考，不构成投资建议；市场有风险，投资需谨慎。"}, {"title": "证据分层与数据来源", "body": "【行情事实】实时快照与日K数据来自 腾讯（Tencent 直连），所有价位、成交量、技术指标均由本地工具库计算，未经人工调整。\n【新闻证据】个股资讯来自 akshare·stock_news_em（东方财富），共引用 10 条，仅作背景参考，不代表本报告立场。\n【公开信息】联网搜索增强未配置（SERPER_API_KEY 缺失）：本报告未引入真实网页搜索证据。如需补充公开信息交叉验证，请在「设置」中填入 Serper API Key。\n【生成来源】模型撰写：业绩快评（基于结构化事实块，凡未出现在事实块中的判断均为定性推断）。本报告不构成投资建议。"}], "risks": ["MACD 死叉（值 -8.296）", "最新一期净利润同比 -2.0%，盈利端承压", "市场有风险，投资需谨慎；本报告不构成任何投资建议。"], "sources": [{"title": "[新闻证据] 段永平发帖称买了3万股，贵州茅台股价拉升翻红", "url": "http://finance.eastmoney.com/a/202609283885196115.html", "date": "2026-09-28 15:48:00"}, {"title": "[新闻证据] 越跌越买！“十年之约”后，段永平又花近3700万买入茅台", "url": "http://finance.eastmoney.com/a/202609283885221822.html", "date": "2026-09-28 15:10:00"}, {"title": "[新闻证据] 月内股价累计跌超4%，段永平斥资近3700万元买入3万股贵州茅台", "url": "http://finance.eastmoney.com/a/202609283885241190.html", "date": "2026-09-28 16:42:00"}, {"title": "[新闻证据] 贵州茅台600519.SH)：2026年中报净利润为445.17亿元、同比较去年同期下降1.95%", "url": "http://finance.eastmoney.com/a/202608153842377958.html", "date": "2026-08-15 10:11:51"}, {"title": "[新闻证据] 8.01亿元主力资金今日抢筹食品饮料板块", "url": "http://finance.eastmoney.com/a/202609233882531294.html", "date": "2026-09-23 17:42:00"}, {"title": "[新闻证据] 百元股数量达216只，一日减少17只", "url": "http://finance.eastmoney.com/a/202609283885257088.html", "date": "2026-09-28 16:48:00"}, {"title": "[行情事实/财务] 贵州茅台 财务分析指标 · akshare", "url": "stock_financial_analysis_indicator", "date": ""}], "disclaimer": "本报告由 AI 辅助生成，所有数值由本地工具库（akshare / pandas-ta-classic）计算并可溯源，仅供研究参考，不构成任何投资建议。市场有风险，决策需谨慎。", "as_of": "2026-09-29 11:45", "quote": {"code": "600519.SH", "name": "贵州茅台", "exchange": "上证", "price": 1235.68, "change": -8.2, "changePct": -0.66, "open": 1244.6, "high": 1245.87, "low": 1230.88, "prevClose": 1243.88, "volume": "1.59万手", "turnover": "19.69亿", "marketCap": "15447.01亿", "pe": 18.97, "pb": 6.15, "roe": 0.0, "industry": "", "as_of": "2026-09-29 11:44:47", "trading_date": "2026-09-29", "provenance": {"source": "tencent", "endpoint": "qt.gtimg.cn", "fetched_at": "2026-09-29 11:45:09", "raw_value": "sh600519", "error": null, "trading_date": "2026-09-29", "attempts": [{"source": "tencent", "ok": true}]}, "elapsed_ms": 133}, "html": "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"UTF-8\" />\n<title>贵州茅台（600519.SH）· earnings</title>\n<style>\n  :root {\n    --up: #ef4444;        /* A 股红涨 */\n    --down: #22c55e;      /* 绿跌 */\n    --accent: #d97757;\n    --bg: #ffffff;\n    --fg: #1f2328;\n    --muted: #6b7280;\n    --border: #e5e7eb;\n    --card: #f9fafb;\n    --font-mono: \"JetBrains Mono\", \"Cascadia Code\", Consolas, monospace;\n  }\n  body {\n    font-family: \"PingFang SC\", \"Microsoft YaHei\", \"Noto Sans CJK SC\", system-ui, sans-serif;\n    color: var(--fg);\n    background: var(--bg);\n    margin: 0;\n    line-height: 1.7;\n  }\n  .wrap { max-width: 820px; margin: 0 auto; padding: 32px 28px 64px; }\n  header.title { border-bottom: 2px solid var(--accent); padding-bottom: 12px; margin-bottom: 18px; }\n  header.title h1 { font-size: 22px; margin: 0 0 4px; }\n  header.title .sub { color: var(--muted); font-size: 13px; font-family: var(--font-mono); }\n  h2 { font-size: 16px; margin: 24px 0 8px; border-left: 4px solid var(--accent); padding-left: 8px; }\n  .summary { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }\n  .catalyst { margin-top: 10px; color: #92400e; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 14px; font-size: 13px; }\n  table { width: 100%; border-collapse: collapse; font-size: 13px; }\n  th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: right; }\n  th:first-child, td:first-child { text-align: left; }\n  thead th { background: var(--card); font-weight: 600; }\n  .section p { margin: 6px 0; font-size: 14px; }\n  ul.risks { padding-left: 20px; }\n  ul.risks li { margin: 4px 0; font-size: 14px; }\n  .sources { font-size: 12px; color: var(--muted); }\n  .sources li { margin: 2px 0; }\n  .disclaimer { margin-top: 24px; padding: 10px 12px; font-size: 12px; color: var(--muted); border-top: 1px dashed var(--border); }\n  .mono { font-family: var(--font-mono); }\n</style>\n</head>\n<body>\n<div class=\"wrap\">\n  <header class=\"title\">\n    <h1>贵州茅台（600519.SH）</h1>\n    <div class=\"sub\">模板：earnings · 生成于 2026-09-29 11:45</div>\n  </header>\n\n  <section class=\"summary\">\n    <h2>摘要</h2>\n<p>📊 贵州茅台最新可得口径为 2026-06-30（中报）：营业收入 922.78 亿元，同比 +1.5%；净利润 445.17 亿元，同比 -2.0%，收入端小幅正增长而利润端同比转负，呈「增收未增利」的形态。\n\n盈利质量口径显示，ROE 16.8%（同比变动 -15.7pct）、毛利率 89.6%（同比变动 -1.6pct），两项均为同比变动（百分点）口径，是本期最需要关注的边际变化；资产负债率 15.2%（同比变动 -1.2pct），杠杆水平同比进一步回落。\n\n我们认为，营收同比增速与净利润同比增速分别为 +1.5% 与 -2.0%，方向相反，说明本期收入增长尚未有效传导至利润端，盈利转化效率的边际走弱是核心矛盾。\n\n✅ 对以营收增速、ROE、现金流为关注重点的中期稳健型视角而言，本期可确认的事实是收入正增长、杠杆下行，但 ROE 与毛利率同比回落，需待后续披露的口径验证是否为阶段性波动，建议关注。\n\n⚠️ 事实块未提供的指标保持未获取状态，本报告不使用股价走势补写业绩结论，亦不对环比数据作任何评述。</p><div class=\"catalyst\"><b>催化剂：</b>后续重点核验下一报告期营收、利润、毛利率和现金流是否延续当前趋势。</div>  </section>\n\n  <section>\n    <h2>财务概览</h2>\n    <table>\n      <thead><tr><th>项目</th><th>2022</th><th>2023</th><th>2024</th><th>2025</th><th>2026</th></tr></thead>\n      <tbody>\n        <tr><td>营业收入</td><td class=\"mono\">1275.54亿</td><td class=\"mono\">1505.60亿</td><td class=\"mono\">1741.44亿</td><td class=\"mono\">1720.54亿</td><td class=\"mono\">922.78亿</td></tr>\n        <tr><td>净利润</td><td class=\"mono\">627.17亿</td><td class=\"mono\">747.34亿</td><td class=\"mono\">862.28亿</td><td class=\"mono\">823.20亿</td><td class=\"mono\">445.17亿</td></tr>\n        <tr><td>营收同比</td><td class=\"mono\">16.9%</td><td class=\"mono\">19.0%</td><td class=\"mono\">15.7%</td><td class=\"mono\">-1.2%</td><td class=\"mono\">1.5%</td></tr>\n        <tr><td>净利润同比</td><td class=\"mono\">17.3%</td><td class=\"mono\">18.6%</td><td class=\"mono\">15.2%</td><td class=\"mono\">-4.5%</td><td class=\"mono\">-2.0%</td></tr>\n        <tr><td>ROE</td><td class=\"mono\">30.3%</td><td class=\"mono\">34.2%</td><td class=\"mono\">36.0%</td><td class=\"mono\">32.5%</td><td class=\"mono\">16.8%</td></tr>\n        <tr><td>毛利率</td><td class=\"mono\">91.9%</td><td class=\"mono\">92.0%</td><td class=\"mono\">91.9%</td><td class=\"mono\">91.2%</td><td class=\"mono\">89.6%</td></tr>\n        <tr><td>资产负债率</td><td class=\"mono\">19.4%</td><td class=\"mono\">18.0%</td><td class=\"mono\">19.0%</td><td class=\"mono\">16.4%</td><td class=\"mono\">15.2%</td></tr>\n      </tbody>\n    </table>\n  </section>\n\n\n  <section>\n    <h2>分析</h2>\n  <div class=\"section\">\n    <h3 style=\"font-size:14px;margin:14px 0 4px;\">业绩快评</h3>\n    <p>本期为公司 2026-06-30（中报）口径。收入端：营业收入 922.78 亿元，同比 +1.5%，为同比增速（%）口径；利润端：净利润 445.17 亿元，同比 -2.0%，同为同比增速（%）口径。两者方向相反，构成本次财报最直观的特征——增收而未能增利。\n\n从盈利转化效率看，ROE 16.8%，同比变动 -15.7pct；毛利率 89.6%，同比变动 -1.6pct。此处须严格区分口径：16.8% 与 89.6% 是比率水平，-15.7pct 与 -1.6pct 是同比变动（百分点），并非同比增速。💡 我们据此可以确认两项事实：一是毛利率的绝对水平仍处于很高位置，二是其同比方向为下行，单位收入所留存的毛利空间在收窄；ROE 的同比回落幅度则明显大于毛利率的回落幅度，说明本期股东回报效率的边际变化更为显著。受事实块披露范围限制，我们不对 ROE 与毛利率变动背后的构成因素作拆分归因，也不推测未披露的季度数据。\n\n从经营杠杆与利润传导看，收入端实现 +1.5% 的同比正增长，但净利润同比为 -2.0%，即收入的正向变动未能同步反映为利润的正向变动。⚠️ 需要说明的是，事实块未披露营业成本、期间费用率、非经常性损益等分项数据，因此本期利润端承压具体来自成本、费用还是一次性项目，无法从现有口径判断，我们也不做估算与推演。在同比口径之外，事实块未提供环比数据，故本报告不对环比变动、不对单季表现作任何评价，亦不给出任何业绩预测数字。\n\n从杠杆与财务结构看，资产负债率 15.2%，同比变动 -1.2pct，为比率变动（百分点）口径。该指标同比下行，指向负债端相对收缩、财务杠杆进一步降低，资产端的稳健程度并未因本期利润同比转负而恶化。综合而言，本期经营质量呈现「收入正增长、杠杆下行，但利润与回报效率同比走弱」的组合：✅ 结构安全边际尚在，💡 但盈利转化效率的边际变化是本轮财报中更值得跟踪的主线，静待后续披露口径给出更完整的费用与现金流信息以验证性质。\n\n🎯 后续关注点集中在三项未获取指标的补全：一是环比口径能否印证同比回落的方向性；二是费用率与现金流质量数据能否区分成本压力与一次性影响；三是毛利率同比下行的幅度能否收敛。\n\n本内容仅供参考，不构成投资建议；市场有风险，投资需谨慎。</p>\n  </div>\n  <div class=\"section\">\n    <h3 style=\"font-size:14px;margin:14px 0 4px;\">证据分层与数据来源</h3>\n    <p>【行情事实】实时快照与日K数据来自 腾讯（Tencent 直连），所有价位、成交量、技术指标均由本地工具库计算，未经人工调整。\n【新闻证据】个股资讯来自 akshare·stock_news_em（东方财富），共引用 10 条，仅作背景参考，不代表本报告立场。\n【公开信息】联网搜索增强未配置（SERPER_API_KEY 缺失）：本报告未引入真实网页搜索证据。如需补充公开信息交叉验证，请在「设置」中填入 Serper API Key。\n【生成来源】模型撰写：业绩快评（基于结构化事实块，凡未出现在事实块中的判断均为定性推断）。本报告不构成投资建议。</p>\n  </div>\n  </section>\n\n  <section>\n    <h2>风险提示</h2>\n<ul class=\"risks\"><li>MACD 死叉（值 -8.296）</li><li>最新一期净利润同比 -2.0%，盈利端承压</li><li>市场有风险，投资需谨慎；本报告不构成任何投资建议。</li></ul>  </section>\n\n  <section>\n    <h2>数据来源</h2>\n<ul class=\"sources\"><li>[新闻证据] 段永平发帖称买了3万股，贵州茅台股价拉升翻红 · http://finance.eastmoney.com/a/202609283885196115.html · 2026-09-28 15:48:00</li><li>[新闻证据] 越跌越买！“十年之约”后，段永平又花近3700万买入茅台 · http://finance.eastmoney.com/a/202609283885221822.html · 2026-09-28 15:10:00</li><li>[新闻证据] 月内股价累计跌超4%，段永平斥资近3700万元买入3万股贵州茅台 · http://finance.eastmoney.com/a/202609283885241190.html · 2026-09-28 16:42:00</li><li>[新闻证据] 贵州茅台600519.SH)：2026年中报净利润为445.17亿元、同比较去年同期下降1.95% · http://finance.eastmoney.com/a/202608153842377958.html · 2026-08-15 10:11:51</li><li>[新闻证据] 8.01亿元主力资金今日抢筹食品饮料板块 · http://finance.eastmoney.com/a/202609233882531294.html · 2026-09-23 17:42:00</li><li>[新闻证据] 百元股数量达216只，一日减少17只 · http://finance.eastmoney.com/a/202609283885257088.html · 2026-09-28 16:48:00</li><li>[行情事实/财务] 贵州茅台 财务分析指标 · akshare · stock_financial_analysis_indicator · </li></ul>  </section>\n\n  <div class=\"disclaimer\">本报告由 AI 辅助生成，所有数值由本地工具库（akshare / pandas-ta-classic）计算并可溯源，仅供研究参考，不构成任何投资建议。市场有风险，决策需谨慎。</div>\n</div>\n</body>\n</html>"}}
+

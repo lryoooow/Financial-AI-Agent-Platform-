@@ -35,12 +35,12 @@ class ResearchTask(Base):
     code: Mapped[str] = mapped_column(String(32), index=True)
     template: Mapped[str] = mapped_column(String(32), default="equity_deep")
     query: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/running/done/error
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/running/succeeded/error
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # 前端选择的模型配置 {base_url, api_key, model}（SSE 是 GET，无法带 body；落库持久化供 stream 取用）
     llm_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     # 可恢复字段（1.2.0）：当前阶段 / 阶段事件流 / 各阶段耗时 / 关联报告 id
-    stage: Mapped[str] = mapped_column(String(32), default="pending")  # pending/entity/research/market/report/done/error
+    stage: Mapped[str] = mapped_column(String(32), default="pending")  # pending/entity/research/market/report/succeeded/error
     progress_events: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)  # [{node,label,timings,ts,gap?}]
     timings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # {entity_ms,research_ms,...,llm_summary_ms}
     report_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)

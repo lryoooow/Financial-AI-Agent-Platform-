@@ -1,536 +1,428 @@
-import { useEffect, useRef, useState, type PointerEvent } from "react";
-import { motion, AnimatePresence } from "motion/react";
-import { ArrowUpRight, ArrowDownRight, TrendingUp, Search, Loader2, AlertTriangle, Database, Globe2, ShieldCheck, RefreshCw } from "lucide-react";
-import { WATCHLIST, type Stock } from "../../data/market";
-import { api, type Book, type Indicator, type IntradayPoint, type MarketDiagnostics, type Quote, type ResolveHit } from "../../api/client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { AlertTriangle, ArrowDownRight, ArrowRight, ArrowUpRight, Loader2, RefreshCw, Search } from "lucide-react";
+import { api, type Book, type ChartBundle, type IndexSummary, type Indicator, type ResolveHit } from "../../api/client";
+import { getFrequent, getRecent, trackUsage } from "../../lib/usage";
+import { WATCHLIST } from "../../data/market";
+import { fmt, signed, trendClass } from "../../lib/format";
 import { AnimatedNumber } from "../AnimatedNumber";
 import { OrderBook } from "../OrderBook";
 import { IntradayChart } from "../charts/IntradayChart";
-import { KLineChart } from "../charts/KLineChart";
-import { fmt, signed, trendClass } from "../../lib/format";
+import { KLineChart, type TechnicalIndicator } from "../charts/KLineChart";
+import { MarketChatPanel } from "./MarketChatPanel";
 
 const EMPTY_BOOK: Book = { asks: [], bids: [] };
-const LEFT_WIDTH_KEY = "finresearch_market_left_width";
-
+/** 大盘指数代码集（与后端 entity.INDEX_CATALOG 对应）。 */
+const INDEX_SET = new Set(["000001.SH", "399001.SZ", "399006.SZ", "000688.SH", "000300.SH"]);
+const isIndexCode = (c: string) => INDEX_SET.has(c);
+// 日 K 区间：短区间同样可选，均线条数随区间长度递增（5日→MA5，10日→MA5/10，20日→MA5/10/20…）
+const RANGE_OPTIONS = [5, 10, 20, 60, 120, 250] as const;
 const signalColor: Record<string, string> = {
   多头: "var(--up)",
   金叉: "var(--up)",
   超买: "var(--up)",
   死叉: "var(--down)",
   空头: "var(--down)",
+  超卖: "var(--down)",
   中性: "var(--muted-foreground)",
 };
 
-function fallbackMeta(code: string): Pick<Stock, "code" | "name" | "exchange" | "industry"> {
-  const s = WATCHLIST.find((x) => x.code === code);
-  return {
-    code,
-    name: s?.name || code,
-    exchange: s?.exchange || "A股",
-    industry: s?.industry || "",
-  };
+interface ActiveModel { provider: string; model: string; accent: string; }
+
+function errorOf(value?: { provenance?: { error?: string | null } } | null): string {
+  return value?.provenance?.error || "";
 }
 
-function isUsableQuote(q: Quote | null): q is Quote {
-  return !!q && !q.provenance?.error && Number.isFinite(q.price) && q.price > 0;
-}
-
-function DataUnavailable({ text }: { text: string }) {
+function Unavailable({ text, onRetry }: { text: string; onRetry: () => void }) {
   return (
-    <div className="h-full grid place-items-center text-center px-6">
+    <div className="grid h-full min-h-[360px] place-items-center px-6 text-center">
       <div className="max-w-sm">
-        <div className="mx-auto grid place-items-center size-10 rounded-lg bg-destructive/10 mb-3">
-          <AlertTriangle className="size-5 text-destructive" />
-        </div>
-        <div className="text-sm text-foreground">真实数据不可用</div>
-        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">{text}</p>
-      </div>
-    </div>
-  );
-}
-
-function DiagnosticsCard({
-  diagnostics,
-  error,
-  onRefresh,
-  refreshing,
-}: {
-  diagnostics: MarketDiagnostics | null;
-  error: string;
-  onRefresh: () => void;
-  refreshing: boolean;
-}) {
-  const sources = diagnostics?.market.sources;
-  const marketOk = diagnostics?.market.available ?? false;
-  const probeShape = !sources && diagnostics?.market.primary; // 手动刷新返回的探测形状
-  const recent = diagnostics?.recent?.slice(0, 3) ?? [];
-  const dot = (st?: string) => st === "ok" ? "var(--down)" : st === "fail" ? "var(--up)" : "var(--muted-foreground)";
-
-  return (
-    <div className="rounded-xl border border-border bg-card p-3">
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <div className="flex items-center gap-2">
-          <Database className={`size-4 ${marketOk ? "text-down" : "text-muted-foreground"}`} />
-          <span className="text-sm text-foreground">数据源状态</span>
-          {diagnostics && <span className={`text-[10px] px-1.5 py-0.5 rounded ${marketOk ? "bg-down/10 text-down" : "bg-up/10 text-up"}`}>{marketOk ? "可用" : "待检查"}</span>}
-        </div>
-        <button onClick={onRefresh} disabled={refreshing} className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-secondary hover:bg-secondary/70 disabled:opacity-50 transition-colors">
-          {refreshing ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-          刷新
+        <AlertTriangle className="mx-auto size-7 text-destructive" />
+        <p className="mt-3 text-sm text-foreground">真实行情暂不可用</p>
+        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{text}</p>
+        <button onClick={onRetry} className="mx-auto mt-3 flex items-center gap-1.5 rounded-md bg-secondary px-3 py-1.5 text-xs hover:bg-secondary/70">
+          <RefreshCw className="size-3.5" /> 重试
         </button>
       </div>
-
-      {error ? (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">诊断接口不可用：{error}</p>
-      ) : sources ? (
-        <div className="space-y-1 text-[11px]">
-          {sources.map((s) => (
-            <div key={s.name} className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5 min-w-0">
-                <span className="size-1.5 rounded-full shrink-0" style={{ background: dot(s.status) }} />
-                <span className="text-muted-foreground truncate">{s.priority}. {s.label}</span>
-              </span>
-              <span className={`shrink-0 ${s.status === "ok" ? "text-down" : s.status === "fail" ? "text-up" : "text-muted-foreground"}`}>
-                {s.status === "ok" ? "可用" : s.status === "fail" ? (s.error?.slice(0, 24) || "失败") : "未探测"}
-              </span>
-            </div>
-          ))}
-          <div className="flex items-center justify-between pt-1 mt-1 border-t border-border">
-            <span className="flex items-center gap-1.5 text-muted-foreground"><ShieldCheck className="size-3.5" /> 代理绕过</span>
-            <span className={diagnostics?.proxy.bypass_enabled ? "text-down" : "text-up"}>{diagnostics?.proxy.bypass_enabled ? "已开启" : "未开启"}</span>
-          </div>
-        </div>
-      ) : probeShape ? (
-        <div className="space-y-1 text-[11px]">
-          <div className="flex items-center justify-between"><span className="text-muted-foreground">主源（AkShare 探测）</span><span className={diagnostics?.market.primary?.ok ? "text-down" : "text-up"}>{diagnostics?.market.primary?.ok ? "可达" : "失败"}</span></div>
-          <div className="flex items-center justify-between"><span className="text-muted-foreground">备用（Sina 探测）</span><span className={diagnostics?.market.backup?.ok ? "text-down" : "text-up"}>{diagnostics?.market.backup?.ok ? "可达" : "失败"}</span></div>
-        </div>
-      ) : (
-        <div className="flex items-center gap-2 text-[11px] text-muted-foreground"><Loader2 className="size-3.5 animate-spin" /> 正在读取数据源状态</div>
-      )}
-
-      {recent.length > 0 && (
-        <div className="mt-2 pt-2 border-t border-border space-y-0.5 text-[10.5px] text-muted-foreground/80">
-          {recent.map((r, i) => (
-            <div key={`${r.ts}-${i}`} className="leading-relaxed flex items-center gap-1">
-              <span className={r.ok ? "text-down" : "text-up"}>{r.source}</span>
-              <span>· {r.kind}</span>
-              <span className="truncate">{r.ok ? "OK" : r.error}</span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
 
 export function MarketView({
   code,
+  active,
+  activeModel,
   onSelect,
-  onResearch,
+  onOpenResearch,
+  onGoSettings,
 }: {
   code: string;
-  onSelect: (c: string) => void;
-  onResearch: (c: string) => void;
+  active: boolean;
+  activeModel: ActiveModel | null;
+  onSelect: (code: string) => void;
+  onOpenResearch: (code: string) => void;
+  onGoSettings: () => void;
 }) {
-  const meta = fallbackMeta(code);
-  const [stock, setStock] = useState<Quote | null>(null);
-  const [quoteLoading, setQuoteLoading] = useState(false);
-  const [quoteError, setQuoteError] = useState("");
+  const [bundleState, setBundleState] = useState<{
+    code: string;
+    range: (typeof RANGE_OPTIONS)[number];
+    data: ChartBundle;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const [tab, setTab] = useState<"intraday" | "kline">("intraday");
-  const [q, setQ] = useState("");
-
-  const [intraday, setIntraday] = useState<IntradayPoint[]>([]);
-  const [kline, setKline] = useState<any[]>([]);
-  const [book, setBook] = useState<Book>(EMPTY_BOOK);
-  const [indicators, setIndicators] = useState<Indicator[]>([]);
-  const [dataAsOf, setDataAsOf] = useState("");
-  const [chartError, setChartError] = useState("");
-  // 分时/日K 的来源元信息（哪个源、哪些源失败、原因、耗时）—— 前端据此显示"腾讯源成功 / AkShare 失败已切换"
-  const [intradayMeta, setIntradayMeta] = useState<{ source?: string; attempts?: { source: string; ok: boolean; error?: string }[]; trading_date?: string; elapsed_ms?: number } | null>(null);
-  const [klineMeta, setKlineMeta] = useState<{ source?: string; attempts?: { source: string; ok: boolean; error?: string }[]; trading_date?: string; elapsed_ms?: number } | null>(null);
-  const [diagnostics, setDiagnostics] = useState<MarketDiagnostics | null>(null);
-  const [diagnosticsError, setDiagnosticsError] = useState("");
-  const [diagRefreshing, setDiagRefreshing] = useState(false);
-
-  const [results, setResults] = useState<ResolveHit[] | null>(null);
+  const [range, setRange] = useState<(typeof RANGE_OPTIONS)[number]>(120);
+  const [indicator, setIndicator] = useState<TechnicalIndicator>("MACD");
+  const [visibleRange, setVisibleRange] = useState<{ start: string; end: string }>({ start: "", end: "" });
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ResolveHit[]>([]);
   const [searching, setSearching] = useState(false);
-  const [favPrices, setFavPrices] = useState<Record<string, { price: number; changePct: number }>>({});
-  const loadSeq = useRef(0);
-  const [leftWidth, setLeftWidth] = useState(() => {
-    try {
-      const saved = Number(window.localStorage.getItem(LEFT_WIDTH_KEY));
-      return Number.isFinite(saved) && saved > 0 ? Math.min(380, Math.max(180, saved)) : 220;
-    } catch {
-      return 220;
-    }
-  });
-
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [indexes, setIndexes] = useState<IndexSummary[]>([]);
+  const [usageTick, setUsageTick] = useState(0); // 选中标的后刷新侧栏常用/最近区
+  const searchBoxRef = useRef<HTMLDivElement>(null);
+  // 点击搜索框外部 / Esc 关闭联想下拉（旧版会一直悬停不消失）
   useEffect(() => {
-    try {
-      window.localStorage.setItem(LEFT_WIDTH_KEY, String(Math.round(leftWidth)));
-    } catch {}
-  }, [leftWidth]);
-
-  const startLeftResize = (event: PointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const startX = event.clientX;
-    const startWidth = leftWidth;
-    const previousCursor = document.body.style.cursor;
-    const previousSelect = document.body.style.userSelect;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-
-    const onMove = (moveEvent: globalThis.PointerEvent) => {
-      const next = startWidth + moveEvent.clientX - startX;
-      setLeftWidth(Math.min(380, Math.max(180, next)));
+    if (!dropdownOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) setDropdownOpen(false);
     };
-    const onUp = () => {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousSelect;
-      window.removeEventListener("pointermove", onMove);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDropdownOpen(false);
     };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
-  };
-
-  useEffect(() => {
-    const seq = ++loadSeq.current;
-    const ac = new AbortController();
-    let cancelled = false;
-    setQuoteLoading(true);
-    setQuoteError("");
-    setChartError("");
-    setStock(null);
-    setDataAsOf("");
-    setIntraday([]);
-    setKline([]);
-    setBook(EMPTY_BOOK);
-    setIndicators([]);
-    setIntradayMeta(null);
-    setKlineMeta(null);
-
-    const timer = window.setTimeout(() => {
-    (async () => {
-      try {
-        const qq = await api.quote(code, ac.signal);
-        if (cancelled || ac.signal.aborted || seq !== loadSeq.current) return;
-        if (!isUsableQuote(qq)) {
-          const reason = qq?.provenance?.error || "行情接口未返回有效价格";
-          setQuoteError(reason);
-          return;
-        }
-        setStock(qq);
-        setDataAsOf(qq.as_of || qq.provenance?.fetched_at || "");
-
-        const [intraRes, klineRes, bookRes, indRes] = await Promise.allSettled([
-          api.intraday(code, ac.signal),
-          api.kline(code, 60, "qfq", ac.signal),
-          api.book(code, ac.signal),
-          api.indicators(code, ac.signal),
-        ]);
-        if (cancelled || ac.signal.aborted || seq !== loadSeq.current) return;
-
-        if (intraRes.status === "fulfilled") {
-          const v = intraRes.value;
-          setIntraday(v.data || []);
-          setIntradayMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
-        }
-        if (klineRes.status === "fulfilled") {
-          const v = klineRes.value;
-          setKline(v.data || []);
-          setKlineMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
-        }
-        if (bookRes.status === "fulfilled") setBook(bookRes.value);
-        if (indRes.status === "fulfilled" && indRes.value.length) setIndicators(indRes.value);
-
-        const missing: string[] = [];
-        if (intraRes.status !== "fulfilled" || !(intraRes.value.data || []).length) missing.push("分时");
-        if (klineRes.status !== "fulfilled" || !(klineRes.value.data || []).length) missing.push("日K");
-        if (missing.length) setChartError(`${missing.join("、")}未返回真实数据，请检查数据源或稍后重试。`);
-      } catch (e) {
-        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current) {
-          setQuoteError(e instanceof Error ? e.message : String(e));
-        }
-      } finally {
-        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current) setQuoteLoading(false);
-      }
-    })();
-    }, 120);
-
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKey);
     return () => {
-      cancelled = true;
-      ac.abort();
-      window.clearTimeout(timer);
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
     };
-  }, [code]);
+  }, [dropdownOpen]);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const requestGeneration = useRef(0);
+  const bundle = bundleState?.code === code && bundleState.range === range ? bundleState.data : null;
 
-  // 诊断：仅挂载时读一次 fast（零网络）；不再随 code/quoteError 重探（避免重试风暴）。手动刷新才探测。
   useEffect(() => {
     let cancelled = false;
-    setDiagnosticsError("");
-    api.marketDiagnostics(false)
-      .then((d) => { if (!cancelled) setDiagnostics(d); })
-      .catch((e) => { if (!cancelled) setDiagnosticsError(e instanceof Error ? e.message : String(e)); });
-    return () => { cancelled = true; };
+    const pull = () => api.marketIndexes()
+      .then((r) => { if (!cancelled) setIndexes(r.indexes || []); })
+      .catch(() => {});
+    void pull();
+    const timer = window.setInterval(pull, 30000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
-  const refreshDiagnostics = async () => {
-    setDiagRefreshing(true);
-    try {
-      await api.marketDiagnostics(true);   // 现场实时探测，结果回写环形缓冲
-      const d = await api.marketDiagnostics(false); // 再读 fast（已含最新状态）
-      setDiagnostics(d);
-      setDiagnosticsError("");
-    } catch (e) {
-      setDiagnosticsError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setDiagRefreshing(false);
+  useEffect(() => {
+    const generation = ++requestGeneration.current;
+    if (!active) {
+      setLoading(false);
+      return;
     }
-  };
+    const controller = new AbortController();
+    const requestedCode = code;
+    const requestedRange = range;
+    setBundleState((current) => current?.code === requestedCode && current.range === requestedRange ? current : null);
+    setLoading(true);
+    setLoadError("");
+    api.chartBundle(requestedCode, requestedRange, "qfq", controller.signal)
+      .then((next) => {
+        if (generation === requestGeneration.current && !controller.signal.aborted) {
+          setBundleState({ code: requestedCode, range: requestedRange, data: next });
+        }
+      })
+      .catch((error) => {
+        if (generation === requestGeneration.current && (error as DOMException)?.name !== "AbortError") {
+          setLoadError(error instanceof Error ? error.message : String(error));
+        }
+      })
+      .finally(() => {
+        if (generation === requestGeneration.current && !controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [active, code, range, refreshTick]);
 
   useEffect(() => {
-    const query = q.trim();
-    if (!query) {
-      setResults(null);
+    if (!active || tab !== "intraday") return;
+    let stopped = false;
+    let controller: AbortController | null = null;
+    const timer = window.setInterval(async () => {
+      controller?.abort();
+      const tickController = new AbortController();
+      controller = tickController;
+      const requestedCode = code;
+      const [quoteResult, intradayResult] = await Promise.allSettled([
+        api.quote(requestedCode, tickController.signal),
+        api.intraday(requestedCode, tickController.signal),
+      ]);
+      if (stopped || tickController.signal.aborted || controller !== tickController) return;
+      setBundleState((current) => {
+        if (!current || current.code !== requestedCode) return current;
+        return {
+          ...current,
+          data: {
+            ...current.data,
+            quote: quoteResult.status === "fulfilled" ? quoteResult.value : current.data.quote,
+            intraday: intradayResult.status === "fulfilled" ? intradayResult.value : current.data.intraday,
+          },
+        };
+      });
+    }, 30_000);
+    return () => {
+      stopped = true;
+      controller?.abort();
+      window.clearInterval(timer);
+    };
+  }, [active, code, tab]);
+
+  useEffect(() => {
+    const keyword = query.trim();
+    if (!keyword) {
+      setResults([]);
+      setDropdownOpen(false);
       setSearching(false);
       return;
     }
+    const controller = new AbortController();
     setSearching(true);
-    let cancelled = false;
-    const ac = new AbortController();
-    const t = setTimeout(async () => {
-      try {
-        const r = await api.resolve(query, 12, ac.signal);
-        if (!cancelled) setResults(r);
-      } catch (e) {
-        if ((e as DOMException)?.name === "AbortError") return;
-        if (!cancelled) setResults([]);
-      } finally {
-        if (!cancelled) setSearching(false);
-      }
-    }, 300);
-    return () => {
-      cancelled = true;
-      ac.abort();
-      clearTimeout(t);
-    };
-  }, [q]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all(
-        WATCHLIST.map(async (s) => {
-          try {
-            const qq = await api.quote(s.code);
-            if (!isUsableQuote(qq)) return null;
-            return [s.code, { price: qq.price, changePct: qq.changePct }] as const;
-          } catch {
-            return null;
-          }
+    const timer = window.setTimeout(() => {
+      api.resolve(keyword, 8, controller.signal)
+        .then((r) => { setResults(r); setDropdownOpen(r.length > 0); })
+        .catch((error) => {
+          if ((error as DOMException)?.name !== "AbortError") setResults([]);
         })
-      );
-      if (cancelled) return;
-      const m: Record<string, { price: number; changePct: number }> = {};
-      for (const e of entries) if (e) m[e[0]] = e[1];
-      setFavPrices(m);
-    })();
+        .finally(() => {
+          if (!controller.signal.aborted) setSearching(false);
+        });
+    }, 220);
     return () => {
-      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
     };
+  }, [query]);
+
+  const selectCode = (nextCode: string, name?: string) => {
+    onSelect(nextCode);
+    if (name) trackUsage(nextCode, name);
+    setUsageTick((v) => v + 1);
+    setQuery("");
+    setResults([]);
+    setDropdownOpen(false);
+  };
+  const setChartVisibleRange = useCallback((start: string, end: string) => {
+    setVisibleRange((current) => current.start === start && current.end === end ? current : { start, end });
   }, []);
 
-  const display = stock ?? ({
-    ...meta,
-    price: 0,
-    change: 0,
-    changePct: 0,
-    open: 0,
-    high: 0,
-    low: 0,
-    prevClose: 0,
-    volume: "—",
-    turnover: "—",
-    marketCap: "—",
-    pe: 0,
-    pb: 0,
-    roe: 0,
-  } as Quote);
+  const quote = bundle?.quote;
+  const intraday = bundle?.intraday.data || [];
+  const kline = bundle?.kline.data || [];
+  const book = bundle?.book || EMPTY_BOOK;
+  const indicators = bundle?.indicators.data || [];
+  const series = bundle?.indicators.series || [];
+  const quoteError = errorOf(quote);
+  const intradayError = errorOf(bundle?.intraday);
+  const klineError = errorOf(bundle?.kline);
+  const price = quote?.price || kline[kline.length - 1]?.close || intraday[intraday.length - 1]?.price || 0;
+  const prevClose = quote?.prevClose || kline[Math.max(0, kline.length - 2)]?.close || intraday[0]?.price || price;
+  const change = quote?.change ?? (price - prevClose);
+  const changePct = quote?.changePct ?? (prevClose ? ((price - prevClose) / prevClose) * 100 : 0);
+  const meta = useMemo(() => WATCHLIST.find((item) => item.code === code), [code]);
+  const name = quote?.name || meta?.name || code;
+  const Arrow = change >= 0 ? ArrowUpRight : ArrowDownRight;
+  const activeResult = tab === "intraday" ? bundle?.intraday : bundle?.kline;
+  const activeError = tab === "intraday" ? intradayError : klineError;
 
-  // 当前图（分时/日K）的数据源 + 失败原因（显示"腾讯源成功 / AkShare 失败已切换"）
-  const activeMeta = tab === "intraday" ? intradayMeta : klineMeta;
-  const chartSrc = activeMeta?.source;
-  const chartSourceLabel = chartSrc === "sina" ? "新浪直连" : chartSrc === "tencent" ? "腾讯直连" : chartSrc === "eastmoney-direct" ? "东财直连" : chartSrc === "akshare" ? "AkShare兜底" : chartSrc ? chartSrc : "";
-  const failedAttempt = activeMeta?.attempts?.find((a) => !a.ok);
-
-  const up = display.change >= 0;
-  const Arrow = up ? ArrowUpRight : ArrowDownRight;
-  const filteredFav = WATCHLIST.filter((s) => s.name.includes(q) || s.code.includes(q.toUpperCase()));
-  const list: { code: string; name: string; exchange?: string; price?: number; changePct?: number }[] =
-    results ?? filteredFav.map((s) => ({ code: s.code, name: s.name, exchange: s.exchange, ...favPrices[s.code] }));
-
-  const chartData = tab === "intraday" ? intraday : kline;
-  const currentChartError = chartData.length ? "" : chartError || `${tab === "intraday" ? "分时" : "日K"}未返回真实数据。`;
+  const isIdx = isIndexCode(code);
+  void usageTick; // 选中标的时自增，驱动下方 frequent/recent 重新读取
+  const frequent = getFrequent(6);
+  const recent = getRecent(5);
 
   return (
-    <div className="h-full min-h-0 flex flex-col lg:flex-row gap-4 p-5 overflow-hidden">
-      <div className="hidden lg:flex flex-col gap-4 min-h-0 overflow-y-auto pr-1 shrink-0" style={{ width: leftWidth }}>
-        <DiagnosticsCard diagnostics={diagnostics} error={diagnosticsError} onRefresh={refreshDiagnostics} refreshing={diagRefreshing} />
-
-        <div className="rounded-xl border border-border bg-card p-3">
-          <p className="text-[10px] tracking-[0.18em] text-muted-foreground uppercase mb-2 px-1">主要指数</p>
-          <div className="rounded-lg bg-secondary/40 px-3 py-4 text-xs text-muted-foreground leading-relaxed">
-            指数实时行情暂未接入真实数据源，本页不展示模拟指数。
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-border bg-card min-h-[260px] flex flex-col overflow-hidden">
-          <div className="p-2.5 border-b border-border">
-            <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
-              <Search className="size-3.5 text-muted-foreground" />
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
+    <div className="flex h-full flex-col overflow-y-auto p-3 lg:overflow-hidden lg:p-4">
+      {/* 大盘条：五指数实时（30s 轮询），点击进入指数走势视图 */}
+      <div className="mb-3 grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
+        {indexes.map((ix) => (
+          <button
+            key={ix.code}
+            onClick={() => selectCode(ix.code, ix.name)}
+            className={`flex items-center justify-between rounded-xl border px-3 py-2.5 text-left transition-colors ${code === ix.code ? "border-gold/50 bg-accent" : "border-border bg-card hover:border-border/80"}`}
+          >
+            <div className="min-w-0">
+              <div className="text-[11px] text-muted-foreground">{ix.name}</div>
+              <div className={`mt-0.5 font-display tabular text-base ${trendClass(ix.changePct)}`}>{fmt(ix.price, 2)}</div>
+            </div>
+            <div className={`shrink-0 text-right text-xs tabular ${trendClass(ix.changePct)}`}>
+              <div>{signed(ix.changePct)}%</div>
+              {ix.turnover && <div className="mt-0.5 text-[9px] text-muted-foreground">{ix.turnover}</div>}
+            </div>
+          </button>
+        ))}
+      </div>
+      <div className="grid min-h-0 flex-1 gap-3 lg:h-full lg:grid-cols-[220px_minmax(0,1fr)_330px]">
+        <aside className="rounded-xl border border-border bg-card p-3 lg:min-h-0 lg:overflow-y-auto">
+          <div className="relative" ref={searchBoxRef}>
+            <div className="flex items-center gap-2 rounded-lg border border-transparent bg-input px-3 py-2 focus-within:border-gold/40">
+              <Search className="size-4 text-muted-foreground" />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} onFocus={() => { if (results.length) setDropdownOpen(true); }} placeholder="代码或股票名称" className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground" />
               {searching && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
             </div>
-            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{results ? `全市场结果 ${list.length} 条` : "常用标的"}</p>
-          </div>
-          <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
-            {list.length === 0 && results && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
-            {list.map((s) => (
-              <button key={s.code} onClick={() => onSelect(s.code)} className={`w-full flex items-center justify-between px-2 py-2 rounded-lg transition-colors ${s.code === display.code ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"}`}>
-                <div className="text-left leading-tight min-w-0">
-                  <div className="text-sm text-foreground truncate">{s.name}</div>
-                  <div className="text-[10px] text-muted-foreground tabular">{s.code}{s.exchange ? ` · ${s.exchange}` : ""}</div>
-                </div>
-                <div className="text-right leading-tight">
-                  <div className={`text-xs tabular ${trendClass(s.changePct ?? 0)}`}>{s.price ? fmt(s.price) : "—"}</div>
-                  <div className={`text-[10px] tabular ${trendClass(s.changePct ?? 0)}`}>{s.changePct == null ? "—" : `${signed(s.changePct)}%`}</div>
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div
-        onPointerDown={startLeftResize}
-        className="hidden lg:flex w-2 -mx-2 cursor-col-resize items-stretch justify-center rounded-full group"
-        title="拖动调整左侧栏宽度"
-      >
-        <div className="my-2 w-1 rounded-full bg-border transition-colors group-hover:bg-gold/60" />
-      </div>
-
-      <div className="flex flex-col gap-4 min-h-0 flex-1 min-w-0">
-        <motion.div layout className="rounded-xl border border-border bg-card p-4">
-          <div className="flex flex-wrap items-end justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2.5">
-                <h1 className="font-display" style={{ fontSize: 22, fontWeight: 600 }}>{display.name || meta.name}</h1>
-                <span className="text-xs text-muted-foreground tabular px-1.5 py-0.5 rounded bg-secondary">{display.code}</span>
-                {display.industry && <span className="text-xs text-muted-foreground px-1.5 py-0.5 rounded bg-secondary">{display.industry}</span>}
-              </div>
-              {quoteLoading ? (
-                <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="size-4 animate-spin" /> 正在获取真实行情
-                </div>
-              ) : quoteError ? (
-                <div className="mt-3 text-sm text-destructive">行情获取失败：{quoteError}</div>
-              ) : (
-                <div className="mt-2 flex items-end gap-3">
-                  <AnimatedNumber value={display.price} className={`${trendClass(display.change)}`} decimals={2} />
-                  <div className={`flex items-center gap-1 ${trendClass(display.change)}`}>
-                    <Arrow className="size-4" />
-                    <span className="tabular text-sm">{signed(display.change)}</span>
-                    <span className="tabular text-sm">({signed(display.changePct)}%)</span>
-                  </div>
-                </div>
+            <AnimatePresence>
+              {dropdownOpen && results.length > 0 && (
+                <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="absolute left-0 right-0 top-[44px] z-30 overflow-hidden rounded-lg border border-border bg-popover shadow-xl">
+                  {results.map((item) => (
+                    <button key={item.code} onClick={() => selectCode(item.code, item.name)} className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left hover:bg-secondary">
+                      <span className="truncate text-xs">{item.name}</span>
+                      <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{item.code}</span>
+                    </button>
+                  ))}
+                </motion.div>
               )}
-            </div>
-            <button onClick={() => onResearch(display.code)} disabled={!!quoteError || quoteLoading} className="flex items-center gap-1.5 rounded-lg bg-gold px-3.5 py-2 text-sm text-[#17140a] hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
-              <TrendingUp className="size-4" strokeWidth={2.4} /> 生成研究报告
-            </button>
-          </div>
-
-          <div className="mt-3 grid grid-cols-4 sm:grid-cols-6 gap-x-4 gap-y-2 text-xs">
-            {[["今开", display.open ? fmt(display.open) : "—"], ["最高", display.high ? fmt(display.high) : "—"], ["最低", display.low ? fmt(display.low) : "—"], ["昨收", display.prevClose ? fmt(display.prevClose) : "—"], ["成交量", display.volume], ["成交额", display.turnover]].map(([k, v]) => (
-              <div key={k} className="flex flex-col">
-                <span className="text-muted-foreground text-[10px]">{k}</span>
-                <span className="tabular text-foreground/90">{v}</span>
-              </div>
-            ))}
-          </div>
-        </motion.div>
-
-        <div className="rounded-xl border border-border bg-card flex-1 min-h-0 flex flex-col overflow-hidden">
-          <div className="flex items-center gap-1 p-2 border-b border-border">
-            {([["intraday", "分时"], ["kline", "日K线"]] as const).map(([id, label]) => (
-              <button key={id} onClick={() => setTab(id)} className="relative px-3.5 py-1.5 text-sm rounded-lg">
-                {tab === id && <motion.div layoutId="chart-tab" className="absolute inset-0 rounded-lg bg-secondary" transition={{ type: "spring", stiffness: 400, damping: 30 }} />}
-                <span className={`relative ${tab === id ? "text-foreground" : "text-muted-foreground"}`}>{label}</span>
-              </button>
-            ))}
-            <span className="ml-auto text-[10px] text-muted-foreground tabular px-2 text-right leading-relaxed">
-              {dataAsOf || activeMeta?.trading_date || chartSourceLabel ? (
-                <>
-                  {activeMeta?.trading_date && <span className="text-foreground/70">{activeMeta.trading_date} · </span>}
-                  <span>{dataAsOf ? `更新 ${dataAsOf}` : "等待真实数据"}</span>
-                  {chartSourceLabel && <span className="ml-1 px-1.5 py-0.5 rounded bg-secondary text-foreground/80">{chartSourceLabel}</span>}
-                  {typeof activeMeta?.elapsed_ms === "number" && <span className="ml-1 text-muted-foreground/60">{activeMeta.elapsed_ms}ms</span>}
-                </>
-              ) : (
-                "等待真实数据"
-              )}
-            </span>
-          </div>
-          <div className="flex-1 min-h-0 p-2">
-            <AnimatePresence mode="wait">
-              <motion.div key={tab + display.code} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.3 }} className="h-full w-full">
-                {quoteLoading ? (
-                  <div className="h-full grid place-items-center text-sm text-muted-foreground"><Loader2 className="size-5 animate-spin" /></div>
-                ) : chartData.length ? (
-                  tab === "intraday" ? <IntradayChart data={intraday} prevClose={display.prevClose} code={display.code} /> : <KLineChart data={kline} code={display.code} />
-                ) : (
-                  <DataUnavailable text={quoteError || failedAttempt?.error || currentChartError} />
-                )}
-              </motion.div>
             </AnimatePresence>
           </div>
-        </div>
-      </div>
-
-      <div className="flex flex-col gap-4 min-h-0 overflow-y-auto lg:w-[288px] lg:shrink-0">
-        {book.asks.length || book.bids.length ? (
-          <OrderBook asks={book.asks} bids={book.bids} prevClose={display.prevClose} />
-        ) : (
-          <div className="rounded-xl border border-border bg-card p-4 text-xs text-muted-foreground">五档盘口未返回真实数据。</div>
-        )}
-
-        <div className="rounded-xl border border-border bg-card overflow-hidden">
-          <div className="px-3 py-2.5 border-b border-border text-sm">技术指标</div>
-          <div className="p-1.5 space-y-0.5">
-            {indicators.length ? indicators.map((ind, i) => (
-              <motion.div key={ind.name} initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.05 * i }} className="flex items-center justify-between px-2 py-1.5 text-xs rounded-lg hover:bg-secondary/50">
-                <span className="text-muted-foreground">{ind.name}</span>
-                <div className="flex items-center gap-2">
-                  <span className="tabular text-foreground/90">{ind.value}</span>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ color: signalColor[ind.signal] ?? "var(--muted-foreground)", background: "var(--secondary)" }}>{ind.signal}</span>
-                </div>
-              </motion.div>
-            )) : <div className="px-2 py-6 text-xs text-muted-foreground text-center">技术指标未返回真实数据。</div>}
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-border bg-card overflow-hidden">
-          <div className="px-3 py-2.5 border-b border-border text-sm">基本面</div>
-          <div className="grid grid-cols-2 gap-px bg-border">
-            {[["市值", display.marketCap], ["市盈率 PE", display.pe ? fmt(display.pe, 1) : "—"], ["市净率 PB", display.pb ? fmt(display.pb, 1) : "—"], ["ROE", display.roe ? fmt(display.roe, 1) + "%" : "—"]].map(([k, v]) => (
-              <div key={k} className="bg-card p-3">
-                <div className="text-[10px] text-muted-foreground">{k}</div>
-                <div className="tabular text-sm text-foreground/90 mt-0.5">{v}</div>
+          {frequent.length > 0 && (
+            <>
+              <p className="mb-2 mt-5 px-1 text-[10px] uppercase tracking-[0.16em] text-muted-foreground">常用 · 按你的使用学习</p>
+              <div className="space-y-1">
+                {frequent.map((item) => (
+                  <button key={item.code} onClick={() => selectCode(item.code, item.name)} className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left transition-colors ${code === item.code ? "bg-accent text-gold" : "hover:bg-secondary"}`}>
+                    <div className="min-w-0">
+                      <div className="truncate text-xs">{item.name}</div>
+                      <div className="font-mono text-[9px] text-muted-foreground">{item.code}</div>
+                    </div>
+                    {code === item.code && <span className="size-1.5 rounded-full bg-gold" />}
+                  </button>
+                ))}
               </div>
+            </>
+          )}
+          {recent.length > 0 && (
+            <>
+              <p className="mb-2 mt-4 px-1 text-[10px] uppercase tracking-[0.16em] text-muted-foreground">最近使用</p>
+              <div className="flex flex-wrap gap-1">
+                {recent.map((item) => (
+                  <button key={item.code} onClick={() => selectCode(item.code, item.name)} className="rounded-md bg-secondary/60 px-1.5 py-1 text-[10px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
+                    {item.name}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          <p className="mb-2 mt-5 px-1 text-[10px] uppercase tracking-[0.16em] text-muted-foreground">快捷标的</p>
+          <div className="space-y-1">
+            {WATCHLIST.map((item) => (
+              <button key={item.code} onClick={() => selectCode(item.code, item.name)} className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left transition-colors ${code === item.code ? "bg-accent text-gold" : "hover:bg-secondary"}`}>
+                <div className="min-w-0">
+                  <div className="truncate text-xs">{item.name}</div>
+                  <div className="font-mono text-[9px] text-muted-foreground">{item.code}</div>
+                </div>
+                {code === item.code && <span className="size-1.5 rounded-full bg-gold" />}
+              </button>
             ))}
           </div>
-        </div>
+          <div className="mt-5 rounded-lg bg-secondary/40 p-3 text-[10.5px] leading-relaxed text-muted-foreground">
+            可搜索全部 A 股；报价、分时、K 线与盘口分别显示真实失败状态，任一来源失败不再阻断其他图表。
+          </div>
+        </aside>
+
+        <section className="flex min-h-[720px] min-w-0 flex-col gap-3 lg:min-h-0">
+          <div className="rounded-xl border border-border bg-card p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="font-display text-xl font-semibold">{name}</h1>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">{code}</span>
+                  {quote?.industry && <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">{quote.industry}</span>}
+                  {quote?.stale && <span className="rounded bg-up/10 px-1.5 py-0.5 text-[10px] text-up">延迟数据</span>}
+                </div>
+                {loading && !bundle ? (
+                  <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" /> 正在加载真实行情</div>
+                ) : price > 0 ? (
+                  <div className="mt-2 flex items-end gap-3">
+                    <AnimatedNumber value={price} decimals={2} className={trendClass(change)} />
+                    <span className={`flex items-center gap-1 text-sm tabular ${trendClass(change)}`}><Arrow className="size-4" />{signed(change)} ({signed(changePct)}%)</span>
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-destructive">{quoteError || "报价未返回；仍可查看历史图表"}</p>
+                )}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => setRefreshTick((value) => value + 1)} disabled={loading} className="flex items-center gap-1.5 rounded-lg bg-secondary px-3 py-2 text-xs hover:bg-secondary/70 disabled:opacity-50">
+                  <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} /> 刷新
+                </button>
+                {!isIdx && (
+                  <button onClick={() => onOpenResearch(code)} className="flex items-center gap-1.5 rounded-lg bg-gold px-3 py-2 text-xs text-[#17140a] hover:brightness-110">
+                    前往研究任务 <ArrowRight className="size-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-xs sm:grid-cols-6">
+              {[["今开", quote?.open], ["最高", quote?.high], ["最低", quote?.low], ["昨收", prevClose], ["成交量", quote?.volume], ["成交额", quote?.turnover]].map(([label, value]) => (
+                <div key={String(label)}><div className="text-[10px] text-muted-foreground">{label}</div><div className="mt-0.5 tabular">{typeof value === "number" ? (value ? fmt(value, 2) : "—") : (value || "—")}</div></div>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex min-h-[580px] flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
+            <div className="flex flex-wrap items-center gap-1 border-b border-border p-2">
+              {(["intraday", "kline"] as const).map((item) => (
+                <button key={item} onClick={() => setTab(item)} className={`rounded-lg px-3 py-1.5 text-xs ${tab === item ? "bg-secondary text-foreground" : "text-muted-foreground"}`}>{item === "intraday" ? "分时" : "日 K 线"}</button>
+              ))}
+              {tab === "kline" && <div className="ml-2 flex gap-1">{RANGE_OPTIONS.map((item) => <button key={item} onClick={() => setRange(item)} className={`rounded px-1.5 py-1 text-[10px] ${range === item ? "bg-gold text-[#17140a]" : "bg-secondary text-muted-foreground"}`}>{item}日</button>)}</div>}
+              <div className="ml-auto text-right text-[10px] text-muted-foreground">
+                <span>{activeResult?.trading_date || "等待数据"}</span>
+                {activeResult?.interval && <span className="ml-1 rounded bg-secondary px-1.5 py-0.5">{activeResult.interval}</span>}
+                {activeResult?.provenance?.source && <span className="ml-1 rounded bg-secondary px-1.5 py-0.5">{activeResult.provenance.source}</span>}
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 p-2">
+              {loading && !bundle ? (
+                <div className="grid h-full place-items-center"><Loader2 className="size-6 animate-spin text-gold" /></div>
+              ) : tab === "intraday" && intraday.length ? (
+                <IntradayChart data={intraday} prevClose={prevClose} code={code} />
+              ) : tab === "kline" && kline.length ? (
+                <KLineChart data={kline} indicators={series} code={code} indicator={indicator} onIndicatorChange={setIndicator} onVisibleRangeChange={setChartVisibleRange} />
+              ) : (
+                <Unavailable text={loadError || activeError || "该标的暂未返回有效数据"} onRetry={() => setRefreshTick((value) => value + 1)} />
+              )}
+            </div>
+          </div>
+        </section>
+
+        <aside className="flex min-h-0 flex-col gap-3 lg:overflow-y-auto lg:pr-1">
+          {book.asks.length || book.bids.length ? <OrderBook asks={book.asks} bids={book.bids} prevClose={prevClose} /> : <div className="rounded-xl border border-border bg-card p-3 text-xs text-muted-foreground">{errorOf(bundle?.book) || "五档盘口暂未返回"}</div>}
+          <IndicatorCard indicators={indicators} />
+          {!isIdx && (
+          <div className="rounded-xl border border-border bg-card p-3">
+            <div className="mb-2 text-sm">基本面快照</div>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              {[["市值", quote?.marketCap], ["市盈率 PE", quote?.pe], ["市净率 PB", quote?.pb], ["ROE", quote?.roe ? `${fmt(quote.roe, 1)}%` : "—"]].map(([label, value]) => <div key={String(label)} className="rounded-lg bg-secondary/40 p-2"><div className="text-[10px] text-muted-foreground">{label}</div><div className="mt-0.5 tabular">{typeof value === "number" ? (value ? fmt(value, 1) : "—") : (value || "—")}</div></div>)}
+            </div>
+          </div>
+          )}
+          <MarketChatPanel
+            code={code}
+            kind={tab}
+            indicator={indicator}
+            visibleRange={visibleRange}
+            activeModel={activeModel}
+            onGoSettings={onGoSettings}
+          />
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+function IndicatorCard({ indicators }: { indicators: Indicator[] }) {
+  return (
+    <div className="rounded-xl border border-border bg-card">
+      <div className="border-b border-border px-3 py-2.5 text-sm">技术指标摘要</div>
+      <div className="max-h-60 space-y-0.5 overflow-y-auto p-1.5">
+        {indicators.length ? indicators.map((item) => (
+          <div key={item.name} className="flex items-center justify-between rounded-lg px-2 py-1.5 text-xs hover:bg-secondary/50">
+            <span className="text-muted-foreground">{item.name}</span>
+            <div className="flex items-center gap-2"><span className="tabular">{item.value}</span><span className="rounded bg-secondary px-1.5 py-0.5 text-[10px]" style={{ color: signalColor[item.signal] || "var(--muted-foreground)" }}>{item.signal}</span></div>
+          </div>
+        )) : <div className="py-6 text-center text-xs text-muted-foreground">指标数据不足</div>}
       </div>
     </div>
   );

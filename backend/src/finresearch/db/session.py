@@ -119,6 +119,8 @@ async def init_db() -> None:
     if _engine is None:
         return
     try:
+        from sqlalchemy import text
+
         from .models import Base  # 延迟导入避免循环
 
         async with _engine.begin() as conn:
@@ -131,6 +133,9 @@ async def init_db() -> None:
             await _add_column_if_missing(conn, "research_task", "progress_events", "JSON")
             await _add_column_if_missing(conn, "research_task", "timings", "JSON")
             await _add_column_if_missing(conn, "research_task", "report_id", "VARCHAR(64)")
+            # 公共任务成功态统一为 succeeded；SSE 终止事件仍保留 type=done。
+            await conn.execute(text("UPDATE research_task SET status='succeeded' WHERE status='done'"))
+            await conn.execute(text("UPDATE research_task SET stage='succeeded' WHERE stage='done'"))
         logger.info("DB 表已就绪（create_all + 迁移）。")
     except Exception as e:  # noqa: BLE001
         logger.warning("init_db 失败（PG 可能未起）：%s", e)

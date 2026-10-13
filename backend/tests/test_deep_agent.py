@@ -53,17 +53,51 @@ def test_execute_tool_never_reaches_model():
     assert "get_realtime_quote" in kept
 
 
-def test_task_tool_never_reaches_model():
-    """task 必须被摘掉。
+def test_task_tool_now_reaches_chat_model_but_not_research():
+    """场景化编排（2.4.0）：chat 侧 task 可达模型（委派场景专家），research 侧仍摘除。
 
-    即便 subagents=None，deepagents 仍默认插一个 general-purpose subagent，从而多出 task。
-    对话是短程任务，不需要上下文隔离；多一层嵌套 agent loop 只会更慢，并给工具调用多一个
-    误触发面。Phase 2 研究链路要挂 subagents 时把 task 从 _EXCLUDED_TOOLS 去掉即可。
+    research 是定向流程（prefetch → compose_report），不需要委派；
+    chat 侧的默认 general-purpose 已被自有同名 spec 压制，task 描述被
+    RewriteToolDescriptionMiddleware 瘦身为中文短版（省约 2000 tok/轮）。
     """
-    mw = ca.ExcludeToolsMiddleware(excluded=ca._EXCLUDED_TOOLS)
-    kept = [t.name for t in mw._filter(_Req(_named("task", "write_todos"))).tools]
-    assert "task" not in kept
+    chat_mw = ca.ExcludeToolsMiddleware(excluded=ca._EXCLUDED_TOOLS)
+    kept = [t.name for t in chat_mw._filter(_Req(_named("task", "write_todos"))).tools]
+    assert "task" in kept  # chat：task 可达（场景委派）
     assert "write_todos" in kept
+    research_mw = ca.ExcludeToolsMiddleware(excluded=ca.RESEARCH_EXCLUDED_TOOLS)
+    rkept = [t.name for t in research_mw._filter(_Req(_named("task", "execute"))).tools]
+    assert "task" not in rkept  # research：仍摘除
+    assert "execute" not in rkept
+
+
+def test_scenario_subagents_are_configured():
+    """五个场景专家 + 各自带轮次帽与超窗转换（父级 middleware 不继承子代理）。"""
+    specs = ca._scenario_subagents()
+    names = [s["name"] for s in specs]
+    # 2.4.0 速度重构：只留多步分析场景，单次调用工具回父级内联
+    assert names == ["market-analysis", "fundamentals-synthesis", "general-purpose"]
+    by_name = {s["name"]: s for s in specs}
+    # 工具分域
+    market_tools = {t.name for t in by_name["market-analysis"]["tools"]}
+    assert "get_kline" in market_tools and "search_memory" not in market_tools
+    fund_tools = {t.name for t in by_name["fundamentals-synthesis"]["tools"]}
+    assert "get_financial_indicators" in fund_tools and "get_kline" not in fund_tools
+    # 子代理内部摘除文件死重
+    sub_mw = by_name["market-analysis"]["middleware"][0]
+    assert "write_file" in sub_mw._excluded and "write_todos" in sub_mw._excluded
+    # 每个 spec 自带保护中间件（子代理不受父 recursion_limit 约束——实测 41+ 轮）
+    from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
+    for s in specs:
+        has_cap = any(isinstance(m, ModelCallLimitMiddleware) for m in s["middleware"])
+        has_overflow = any(isinstance(m, ca.ContextOverflowAdapterMiddleware) for m in s["middleware"])
+        assert has_cap and has_overflow, s["name"]
+
+
+def test_task_description_is_compact():
+    """task 工具描述瘦身：模型看到的不再是库默认的 6.5K 英文长文。"""
+    assert len(ca._TASK_TOOL_DESCRIPTION) < 600
+    assert "market-analysis" in ca._TASK_TOOL_DESCRIPTION
+    assert "自包含" in ca._TASK_TOOL_DESCRIPTION
 
 
 def test_no_compute_tool_is_exposed():
@@ -73,13 +107,21 @@ def test_no_compute_tool_is_exposed():
 
 
 def test_chat_tools_cover_the_data_surface():
-    """取数面不能缺——缺一个，模型就会在那个维度上凭记忆编。"""
+    """取数面不能缺——缺一个，模型就会在那个维度上凭记忆编。
+
+    get_intraday 是实测补上的：行情页问「根据分时线分析当前形势」时，模型答
+    「我没有分时线的专用工具」，随后拿日线 MACD + 快照硬凑出一份完整结论。
+    工具面缺一个维度，模型不会停下来，它会换个口径继续答——这比报错更难发现。
+    """
     names = {t.name for t in dt.CHAT_TOOLS}
     assert names == {
         "resolve_entity",
+        "search_memory",
+        "read_memory",
         "get_realtime_quote",
         "get_technical_indicators",
         "get_kline",
+        "get_intraday",
         "get_company_profile",
         "get_financial_indicators",
         "search_news",
@@ -276,15 +318,17 @@ def test_render_todos_normalizes_shape():
 
 
 def test_history_offload_capability_still_wired():
-    """旧 offload_history/retrieve_history_excerpt 的替代者：文件工具必须真的挂着。
+    """历史卸载的取回链路：read_file 必须可达（2.4.0 起文件管理死重被摘除）。
 
     SummarizationMiddleware 把被驱逐的历史写进 /conversation_history/{thread_id}.md，
-    并把路径嵌进摘要里让 agent 自己 read_file 取回。少了文件工具，历史就是真丢了。
+    并把路径嵌进摘要里让 agent 自己 read_file 取回。read_file 被摘历史就是真丢了；
+    write_file/edit_file/ls/glob/grep 是 agent 自管文件的死重，chat 场景必须摘除。
     """
     mw = ca.ExcludeToolsMiddleware(excluded=ca._EXCLUDED_TOOLS)
-    kept = {t.name for t in mw._filter(_Req(_named("ls", "read_file", "write_file", "execute"))).tools}
-    assert {"ls", "read_file", "write_file"} <= kept
+    kept = {t.name for t in mw._filter(_Req(_named("ls", "read_file", "write_file", "execute", "glob"))).tools}
+    assert "read_file" in kept          # 取回链路在
     assert "execute" not in kept
+    assert not ({"write_file", "edit_file", "ls", "glob", "grep"} & kept)  # 死重已摘
 
 
 def test_entity_recognition_capability_still_available():
@@ -299,6 +343,6 @@ def test_entity_recognition_capability_still_available():
 def test_todo_capability_still_wired(monkeypatch):
     """todo 事件的数据源：write_todos 必须可用（前端实时待办 UI 依赖它）。"""
     mw = ca.ExcludeToolsMiddleware(excluded=ca._EXCLUDED_TOOLS)
-    kept = [t.name for t in mw._filter(_Req(_named("write_todos", "task"))).tools]
+    kept = [t.name for t in mw._filter(_Req(_named("write_todos", "execute"))).tools]
     assert "write_todos" in kept
-    assert "task" not in kept
+    assert "execute" not in kept

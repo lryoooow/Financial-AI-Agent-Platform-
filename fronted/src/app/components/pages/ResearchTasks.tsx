@@ -1,82 +1,116 @@
-import { useState } from "react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
-import { LineChart } from "lucide-react";
-import { MarketView } from "./MarketView";
-import { Workspace } from "./Workspace";
+import { useEffect, useState } from "react";
+import { FileText, Loader2, PlayCircle } from "lucide-react";
+import { api, type ResearchTaskSummary } from "../../api/client";
+import type { TemplateId } from "../../data/report";
+import { Workspace, type AttachRequest } from "./Workspace";
 import type { ReportItem } from "./ReportsLibrary";
 
 interface ActiveModel { provider: string; model: string; accent: string; }
 
-interface Props {
-  activeModel: ActiveModel | null;
-  onGoSettings: () => void;
-  onReportGenerated: (r: ReportItem) => void;
+/** 任务状态徽标：运行中/排队中亮金，完成绿，失败红。 */
+function StatusBadge({ status }: { status: ResearchTaskSummary["status"] }) {
+  const map: Record<string, { label: string; cls: string }> = {
+    running: { label: "运行中", cls: "text-gold bg-gold/10 border-gold/30" },
+    pending: { label: "排队中", cls: "text-gold bg-gold/10 border-gold/30" },
+    done: { label: "已完成", cls: "text-down bg-down/10 border-down/30" },
+    succeeded: { label: "已完成", cls: "text-down bg-down/10 border-down/30" },
+    error: { label: "失败", cls: "text-up bg-up/10 border-up/30" },
+  };
+  const s = map[status] ?? { label: status, cls: "text-muted-foreground bg-secondary/50 border-border" };
+  return <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] leading-none ${s.cls}`}>{s.label}</span>;
 }
 
-/**
- * 研究任务页（1.2.0）：独立的深度研究入口。
- * 上：辅助行情组件 MarketView（可折叠，按需复用）；下：研究工作台 Workspace（搜索标的/选模型/选模板/生成报告/管线+耗时）。
- * 共享 selectedCode：行情图上"生成研究报告"一键带到下方法线跑研究。
- */
-export function ResearchTasks({ activeModel, onGoSettings, onReportGenerated }: Props) {
-  const [code, setCode] = useState("600519.SH");
-  const [trigger, setTrigger] = useState<string | undefined>();
-  const [showMarket, setShowMarket] = useState(true);
+/** 最近研究任务条：断线/刷新后的恢复入口。
+ *
+ * 后端 GET /api/research/tasks 一直存在却从未被前端消费——运行中的任务对用户不可见，
+ * "报告库自己冒出报告"与工作区报错的矛盾状态即源于此。运行中/排队中的任务提供
+ * 「恢复查看」（直连其 SSE，回放 + 续播）；已完成/失败的仅作状态可见。 */
+function RecentTasksStrip({ onAttach }: { onAttach: (t: ResearchTaskSummary) => void }) {
+  const [tasks, setTasks] = useState<ResearchTaskSummary[]>([]);
+  const [loaded, setLoaded] = useState(false);
 
-  // 行情图上"生成研究报告" → 下方法线带同一 code 跑研究
-  const analyze = (c: string) => {
-    setCode(c);
-    setTrigger(c + ":" + Date.now());
-  };
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () =>
+      api.researchTasks()
+        .then((r) => { if (!cancelled) { setTasks(r.tasks.slice(0, 8)); setLoaded(true); } })
+        .catch(() => { if (!cancelled) setLoaded(true); });
+    void refresh();
+    const timer = window.setInterval(refresh, 15000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, []);
+
+  if (!loaded || tasks.length === 0) return null;
+  return (
+    <div className="mx-auto mt-5 mb-0 max-w-[min(100%-2.5rem,1600px)] rounded-xl border border-border bg-card px-3.5 py-2.5">
+      <div className="mb-2 text-[11px] text-muted-foreground">最近研究任务</div>
+      <div className="flex gap-2 overflow-x-auto pb-0.5">
+        {tasks.map((t) => (
+          <div
+            key={t.id}
+            className="flex shrink-0 items-center gap-2 rounded-lg border border-border bg-secondary/30 px-2.5 py-1.5 text-xs"
+            title={t.error ? `失败原因：${t.error}` : `${t.code} · ${t.template}`}
+          >
+            <StatusBadge status={t.status} />
+            <span className="font-mono text-foreground/85">{t.code}</span>
+            {(t.status === "running" || t.status === "pending") && (
+              <button
+                onClick={() => onAttach(t)}
+                className="flex items-center gap-1 rounded-md bg-gold/15 px-1.5 py-0.5 text-[11px] text-gold transition-colors hover:bg-gold/25"
+              >
+                {t.status === "running" ? <PlayCircle className="size-3" /> : <Loader2 className="size-3 animate-spin" />}
+                恢复查看
+              </button>
+            )}
+            {t.status === "succeeded" && t.report_id && (
+              <button
+                onClick={() => onAttach(t)}
+                className="flex items-center gap-1 rounded-md bg-down/10 px-1.5 py-0.5 text-[11px] text-down transition-colors hover:bg-down/20"
+              >
+                <FileText className="size-3" />
+                查看报告
+              </button>
+            )}
+            {t.status === "error" && t.error && (
+              <span className="max-w-40 truncate text-[10px] text-muted-foreground" title={t.error}>{t.error}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function ResearchTasks({
+  activeModel,
+  selectedCode,
+  onSelectCode,
+  onGoSettings,
+  onReportGenerated,
+}: {
+  activeModel: ActiveModel | null;
+  selectedCode: string;
+  onSelectCode: (code: string) => void;
+  onGoSettings: () => void;
+  onReportGenerated: (report: ReportItem) => void;
+}) {
+  const [attach, setAttach] = useState<AttachRequest | undefined>();
 
   return (
-    <div className="h-full min-h-0 flex flex-col overflow-hidden">
-      <div className="flex items-center justify-between px-4 pt-3 pb-1">
-        <h1 className="font-display text-base font-semibold">研究任务</h1>
-        <button
-          onClick={() => setShowMarket((v) => !v)}
-          className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md bg-secondary hover:bg-secondary/70 transition-colors"
-          title="按需显示/隐藏辅助行情"
-        >
-          <LineChart className="size-3.5" />
-          {showMarket ? "隐藏行情" : "行情辅助"}
-        </button>
-      </div>
-      <div className="flex-1 min-h-0 p-3 pt-1">
-        {showMarket ? (
-          <PanelGroup direction="vertical" className="h-full">
-            <Panel defaultSize={46} minSize={22}>
-              <div className="h-full min-h-0 overflow-y-auto">
-                <MarketView code={code} onSelect={setCode} onResearch={analyze} />
-              </div>
-            </Panel>
-            <PanelResizeHandle className="h-1.5 bg-border hover:bg-gold/50 data-[resize-handle-state=drag]:bg-gold transition-colors" />
-            <Panel defaultSize={54} minSize={25}>
-              <div className="h-full min-h-0 overflow-y-auto">
-                <Workspace
-                  key={trigger ?? "idle"}
-                  initialCode={trigger}
-                  selectedCode={code}
-                  activeModel={activeModel}
-                  onGoSettings={onGoSettings}
-                  onReportGenerated={onReportGenerated}
-                />
-              </div>
-            </Panel>
-          </PanelGroup>
-        ) : (
-          <div className="h-full min-h-0 overflow-y-auto">
-            <Workspace
-              key={trigger ?? "idle"}
-              initialCode={trigger}
-              selectedCode={code}
-              activeModel={activeModel}
-              onGoSettings={onGoSettings}
-              onReportGenerated={onReportGenerated}
-            />
-          </div>
-        )}
-      </div>
+    <div className="h-full min-h-0 overflow-y-auto">
+      <RecentTasksStrip
+        onAttach={(t) =>
+          setAttach({ taskId: t.id, code: t.code, template: t.template as TemplateId, nonce: Date.now() })
+        }
+      />
+      <Workspace
+        selectedCode={selectedCode}
+        onSelectCode={onSelectCode}
+        activeModel={activeModel}
+        onGoSettings={onGoSettings}
+        onReportGenerated={onReportGenerated}
+        attachRequest={attach}
+      />
     </div>
   );
 }

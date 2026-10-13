@@ -183,6 +183,55 @@ def yoy_str(vals: list) -> str:
     return f"{y:+.1f}%" if y is not None else MISSING
 
 
+_PERIOD_LABELS = {"03-31": "一季报", "06-30": "中报", "09-30": "三季报", "12-31": "年报"}
+
+
+def _period_tail(period: str) -> str:
+    """报告期日期 '2026-06-30' → 月日 '06-30'；异常输入返回 ''。"""
+    p = str(period or "").strip()
+    return p[5:10] if len(p) >= 10 and p[4] == "-" else ""
+
+
+def periods_comparable(f: dict) -> bool:
+    """最近两期报告期是否同形（可由 levels 重算同比）。
+
+    中报（H1 累计）对上年年报、三季报对年报直接相除都是 -50% 式系统性错误。
+    无 periods 信息（旧形状数据）时保守返回 True 维持旧行为。
+    """
+    periods = [str(p) for p in (f.get("periods") or [])]
+    if len(periods) < 2:
+        return True
+    cur_tail, prev_tail = _period_tail(periods[-1]), _period_tail(periods[-2])
+    if cur_tail and prev_tail and cur_tail != prev_tail:
+        return False
+    return True
+
+
+def yoy_from_fins(f: dict, base_name: str, direct_name: str) -> str:
+    """同比渲染：优先接口原生同比增长率列（对比口径天然正确）。
+
+    原生列缺失才退回 levels 重算，且重算前校验最近两期报告期同形；
+    口径不一致时 MISSING，宁可缺失也不编数。
+    """
+    direct = to_float(val_str(row_vals(f, direct_name)))
+    if direct is not None:
+        return f"{direct:+.1f}%"
+    if not periods_comparable(f):
+        return MISSING
+    return yoy_str(row_vals(f, base_name))
+
+
+def latest_period_label(f: dict) -> str:
+    """最新报告期的披露文案：'2026-06-30（中报）'；无 periods 时退回年份。"""
+    periods = [str(p) for p in (f.get("periods") or [])]
+    tail = _period_tail(periods[-1]) if periods else ""
+    if tail:
+        label = _PERIOD_LABELS.get(tail)
+        return f"{periods[-1]}（{label}）" if label else periods[-1]
+    years = f.get("years") or []
+    return str(years[-1]) if years else "—"
+
+
 def pp_str(vals: list) -> str:
     """同比变动（百分点）的渲染，缺失 → MISSING。"""
     p = delta_pp(vals)
@@ -235,10 +284,11 @@ def render_financial_facts(fins: dict) -> str:
     roe = row_vals(f, "ROE")
     gm = row_vals(f, "毛利率")
     debt = row_vals(f, "资产负债率")
-    latest_year = years[-1] if years else "—"
+    latest_year = latest_period_label(f)
     lines = [
         f"【财务指标】最新一期（{latest_year}）",
-        f"营业收入 {val_str(rev)}（同比 {yoy_str(rev)}）；净利润 {val_str(net)}（同比 {yoy_str(net)}）。",
+        f"营业收入 {val_str(rev)}（同比 {yoy_from_fins(f, '营业收入', '营收同比')}）；"
+        f"净利润 {val_str(net)}（同比 {yoy_from_fins(f, '净利润', '净利润同比')}）。",
         f"ROE {val_str(roe)}（同比变动 {pp_str(roe)}）；毛利率 {val_str(gm)}（同比变动 {pp_str(gm)}）；"
         f"资产负债率 {val_str(debt)}（同比变动 {pp_str(debt)}）。",
         "注：营收/净利润括注为同比增速（%）；ROE/毛利率/资产负债率括注为同比变动（pct=百分点）。",
@@ -282,14 +332,6 @@ def render_indicator_facts(indicators: list) -> str:
         sig = it.get("signal") or "中性"
         lines.append(f"· {it['name']} {val}（{sig}）")
     return "\n".join(lines)
-
-
-def render_chat_facts(quote: dict, news: list = None) -> str:
-    """对话链路事实块：行情 + 资讯精简版（供对话 system 注入），末尾单份【约束】。"""
-    blocks = [render_quote_facts(quote)]
-    if news:
-        blocks.append(render_news_facts(news, None))
-    return compose_facts(*blocks)
 
 
 # ────────────────────────────────────────────────────────────

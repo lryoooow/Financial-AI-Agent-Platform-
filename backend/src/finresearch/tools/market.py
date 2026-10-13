@@ -9,8 +9,10 @@
 
 前端契约（A 股红涨绿跌）：
 - quote：Stock 快照
-- intraday：[{time, price, avg, volume}]（5 分钟一点）
-- kline：[{date:YYYY-MM-DD, open, close, high, low, volume, ma5, ma10, ma20}]
+- intraday：[{time, price, avg, volume}]（优先 1 分钟，备用源可能为 5 分钟）
+- kline：[{date:YYYY-MM-DD, open, close, high, low, volume, ma5, ma10, ...}]
+  （均线周期随区间自适应：只输出 <= 区间长度的周期，5日→ma5，10日→ma5/ma10，20日→ma5/ma10/ma20，
+   60/120/250 日依次追加 ma60/ma120/ma250；并额外预取历史用于均线预热，保证线条覆盖整个窗口）
 - book：{asks:[{label, price, vol}], bids:[...]}
 - indicators：[{name, value(str), signal}]
 """
@@ -21,15 +23,16 @@ import datetime as dt
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import pandas as pd
 
 from ..cache import quote_cache
-from . import make_provenance, now_iso
-from . import market_provider
-from .entity import normalize_ticker, to_market_ticker
-from .market_provider import _fmt_volume, _fmt_amount
+from . import make_provenance, market_provider, now_iso
+from .entity import is_index, is_bj as _is_bj
+from .entity import is_sh, normalize_ticker, to_market_ticker
+from .market_provider import _fmt_amount, _fmt_volume
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +72,8 @@ def _requires_today_kline(now: Optional[dt.datetime] = None) -> bool:
     return is_trading_day(n) and n.time() >= dt.time(15, 10)
 
 
-def _ensure_fresh(result: dict, *, kind: str) -> None:
-    """拒绝明显陈旧的行情数据，避免明日仍画前一日线。"""
+def _ensure_fresh(result: dict, *, kind: str) -> Optional[str]:
+    """返回陈旧提示但保留最后有效数据，适配停牌和数据源延迟。"""
     trading_date = (
         result.get("trading_date")
         or (result.get("provenance") or {}).get("trading_date")
@@ -78,19 +81,20 @@ def _ensure_fresh(result: dict, *, kind: str) -> None:
     )
     got = _parse_date(trading_date)
     if not got:
-        return
+        return None
     today = dt.datetime.now().date()
     if kind == "intraday" and _requires_today_intraday() and got < today:
-        raise ValueError(f"分时数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
+        return f"分时数据停留在 {got.isoformat()}，当前交易日数据尚未更新"
     if kind == "kline" and _requires_today_kline() and got < today:
-        raise ValueError(f"日K数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
+        return f"日K数据停留在 {got.isoformat()}，当前交易日数据尚未更新"
     if kind == "quote" and _requires_today_intraday() and got < today:
-        raise ValueError(f"报价数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
+        return f"报价数据停留在 {got.isoformat()}，当前交易日数据尚未更新"
+    return None
 
 
-def _is_bj(raw: str) -> bool:
-    """北交所代码（东方财富直连 secid 对 BJ 不可靠，需跳过 eastmoney-direct）。"""
-    return raw.startswith(("43", "83", "87", "88"))
+def _supports_eastmoney_direct(raw: str) -> bool:
+    """920 新号段已实测支持 secid=0；旧北交所号段仍走备用链路。"""
+    return raw.startswith("92") or not _is_bj(raw)
 
 
 def _enrich(prov: dict, *, trading_date: str = "", attempts: Optional[list] = None) -> dict:
@@ -115,6 +119,17 @@ def _f(v, default=0.0) -> float:
         return f
     except Exception:  # noqa: BLE001
         return default
+
+
+def _nullable_f(v) -> Optional[float]:
+    """安全转为可空浮点数，指标尚未形成时保留 null。"""
+    try:
+        if v is None:
+            return None
+        value = float(v)
+        return None if math.isnan(value) or math.isinf(value) else value
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _fmt_market_cap(yuan: float) -> str:
@@ -170,34 +185,50 @@ def get_realtime_quote(code: str) -> dict:
     t0 = time.perf_counter()
 
     def finish(result: dict, source: str) -> dict:
-        _ensure_fresh(result, kind="quote")
+        stale_reason = _ensure_fresh(result, kind="quote")
         attempts.append({"source": source, "ok": True})
         _record("quote", source, True)
         result["provenance"] = _enrich(
             result.get("provenance", {}),
-            trading_date=result.get("trading_date") or _today(),
+            # 拿不到真实数据日期就留空，不伪造今天——伪造会击穿 _ensure_fresh 的陈旧检测
+            trading_date=result.get("trading_date") or "",
             attempts=list(attempts),
         )
+        if stale_reason:
+            result["stale"] = True
+            result["provenance"]["stale_reason"] = stale_reason
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
         return result
 
-    # 1) Sina 直连（最快）
-    try:
-        return finish(market_provider.sina_realtime(raw), "sina")
-    except Exception as e:  # noqa: BLE001
-        attempts.append({"source": "sina", "ok": False, "error": str(e)})
-        _record("quote", "sina", False, str(e))
-        logger.debug("sina 实时失败，尝试 Tencent：%s", e)
-
-    # 2) Tencent 直连
+    # 1) Tencent 直连（优先：字段最全——PE/PB/总市值都有）
+    #    实测 Sina hq 只有 34 个基础字段，无估值字段：sina 命中时行情页
+    #    PE/PB/市值恒为"—"。腾讯字段全且速度同级，故提为首选。
     try:
         return finish(market_provider.tencent_realtime(raw), "tencent")
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "tencent", "ok": False, "error": str(e)})
         _record("quote", "tencent", False, str(e))
-        logger.debug("tencent 实时失败，尝试 AkShare：%s", e)
+        logger.debug("tencent 实时失败，尝试 Sina：%s", e)
 
-    # 3) AkShare 兜底（最慢，字段最全：市值/行业）
+    # 2) Sina 直连（快，但无估值字段）
+    try:
+        return finish(market_provider.sina_realtime(raw), "sina")
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "sina", "ok": False, "error": str(e)})
+        _record("quote", "sina", False, str(e))
+        logger.debug("sina 实时失败，尝试 AkShare：%s", e)
+
+    # 3) AkShare 兜底（最慢，字段最全：市值/行业）——指数无此兜底：
+    #    spot 全市场表只含股票，指数去查只会在 3MB 表里白扫一遍然后失败。
+    if is_index(code):
+        chain = " | ".join(a.get("error", "")[:80] for a in attempts if a.get("error"))
+        empty = _empty_stock(
+            raw, code,
+            f"指数行情暂不可用（tencent/sina 均失败）：{chain}",
+            source="none", attempts=list(attempts),
+        )
+        empty["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
+        return empty
     try:
         row = _get_spot_row(raw)
         if not row:
@@ -223,7 +254,8 @@ def get_realtime_quote(code: str) -> dict:
             "roe": 0.0,  # 快照无 ROE，由基本面接口补
             "industry": str(row.get("行业", "") or ""),
             "as_of": now_iso(),
-            "trading_date": _today(),
+            # em 全市场快照无日期列：留空让 _ensure_fresh 如实跳过，绝不伪装成今日数据
+            "trading_date": "",
             "provenance": make_provenance(source="akshare", endpoint="stock_zh_a_spot_em", raw_value=raw),
         }
         return finish(result, "akshare")
@@ -280,19 +312,19 @@ def _classify(code: str) -> str:
 
 
 # ────────────────────────────────────────────────────────────
-# 分时（直连优先：Sina(5min) → Eastmoney(重采样5min) → AkShare 兜底）
+# 分时（直连优先：Eastmoney(1min) → Sina(5min) → AkShare(1min) 兜底）
 # ────────────────────────────────────────────────────────────
 def get_intraday(code: str) -> dict:
-    """分时（09:30–15:00，5 分钟一点聚合，带均价线）。
+    """分时（09:30–15:00，优先 1 分钟，带累计均价线）。
 
-    直连优先：Sina(scale=5) → Eastmoney(1min 重采样 5min，BJ 跳过) → AkShare 兜底。
+    直连优先：Eastmoney(1min) → Sina(scale=5) → AkShare(1min) 兜底。
     """
     raw = normalize_ticker(code)
     attempts: list[dict] = []
     t0 = time.perf_counter()
 
     def finish(result: dict, source: str, trading_date: str = "") -> dict:
-        _ensure_fresh(result, kind="intraday")
+        stale_reason = _ensure_fresh(result, kind="intraday")
         attempts.append({"source": source, "ok": True})
         _record("intraday", source, True)
         result["provenance"] = _enrich(
@@ -300,67 +332,73 @@ def get_intraday(code: str) -> dict:
             trading_date=trading_date or result.get("trading_date", ""),
             attempts=list(attempts),
         )
+        if stale_reason:
+            result["stale"] = True
+            result["provenance"]["stale_reason"] = stale_reason
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
         return result
 
-    # 1) Sina 直连（5 分钟）
-    try:
-        r = market_provider.sina_intraday(raw)
-        return finish(r, "sina", r.get("trading_date", ""))
-    except Exception as e:  # noqa: BLE001
-        attempts.append({"source": "sina", "ok": False, "error": str(e)})
-        _record("intraday", "sina", False, str(e))
-        logger.debug("sina 分时失败，尝试东方财富直连：%s", e)
-
-    # 2) 东方财富直连（1min 重采样 5min；BJ 跳过：secid 不可靠）
-    if not _is_bj(raw):
+    # 1) 东方财富直连（原生 1min；920 新号段可用，旧北交所号段跳过）
+    if _supports_eastmoney_direct(raw):
         try:
             r = market_provider.eastmoney_intraday(raw)
             return finish(r, "eastmoney-direct", r.get("trading_date", ""))
         except Exception as e:  # noqa: BLE001
             attempts.append({"source": "eastmoney-direct", "ok": False, "error": str(e)})
             _record("intraday", "eastmoney-direct", False, str(e))
-            logger.debug("东方财富直连分时失败，尝试 AkShare：%s", e)
+            logger.debug("东方财富直连分时失败，尝试 Sina：%s", e)
 
-    # 3) AkShare 兜底（1min → 5min 桶）
+    # 2) Sina 直连（5 分钟备用）
+    try:
+        r = market_provider.sina_intraday(raw)
+        return finish(r, "sina", r.get("trading_date", ""))
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "sina", "ok": False, "error": str(e)})
+        _record("intraday", "sina", False, str(e))
+        logger.debug("sina 分时失败，尝试 AkShare：%s", e)
+
+    # 3) AkShare 兜底（保留原生 1min）
     try:
         import akshare as ak
-        mkt = "sh" if raw.startswith(("60", "68", "90", "11", "51", "56")) else (
-            "bj" if _is_bj(raw) else "sz"
-        )
+        mkt = "sh" if is_sh(raw) else ("bj" if _is_bj(raw) else "sz")
         df = ak.stock_zh_a_minute(symbol=f"{mkt}{raw}", period="1", adjust="")
         if df is None or df.empty:
-            raise ValueError("stock_zh_a_minute 空数据")
+              raise ValueError("stock_zh_a_minute 空数据")
         df = df.copy()
         df["dt"] = pd.to_datetime(df["day"] if "day" in df else df.iloc[:, 0])
         for col in ("open", "high", "low", "close", "volume"):
-            if col in df:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+              if col in df:
+                  df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.set_index("dt")
         hhmm = df.index.strftime("%H:%M")
         df = df[(hhmm >= "09:30") & (hhmm <= "15:00")]
         trading_date = ""
         if not df.empty:
-            latest_trade_date = df.index.max().date()
-            df = df[df.index.date == latest_trade_date]
-            trading_date = str(latest_trade_date)
-            today = dt.datetime.now().date()
-            if latest_trade_date == today:
-                now = dt.datetime.now()
-                df = df[df.index <= now]
-        bucket = df.resample("5min", label="left", closed="left")
-        agg = bucket.agg(close=("close", "last"), volume=("volume", "sum")).dropna()
+              latest_trade_date = df.index.max().date()
+              df = df[df.index.date == latest_trade_date]
+              trading_date = str(latest_trade_date)
+              today = dt.datetime.now().date()
+              if latest_trade_date == today:
+                  now = dt.datetime.now()
+                  df = df[df.index <= now]
+        agg = df.dropna(subset=["close"])
         agg["price"] = agg["close"]
         agg["time"] = agg.index.strftime("%H:%M")
         cum_p = (agg["price"] * agg["volume"]).cumsum()
         cum_v = agg["volume"].cumsum().replace(0, 1)
         agg["avg"] = (cum_p / cum_v).round(2)
         out = [
-            {"time": str(r["time"]), "price": _f(r["price"]), "avg": _f(r["avg"]), "volume": int(_f(r["volume"]))}
+            # volume /100：stock_zh_a_minute（新浪 getKLineData）返回股，其余分时路径均为手，
+            # 不对齐会导致 summarize_intraday 的量能汇总随命中源跳变 100 倍
+            {"time": str(r["time"]), "price": _f(r["price"]), "avg": _f(r["avg"]), "volume": int(_f(r["volume"]) / 100.0)}
             for _, r in agg.iterrows()
         ]
         prov = make_provenance(source="akshare", endpoint="stock_zh_a_minute", raw_value=raw)
-        return finish({"data": out, "trading_date": trading_date, "provenance": prov}, "akshare", trading_date)
+        return finish(
+            {"data": out, "interval": "1m", "trading_date": trading_date, "provenance": prov},
+            "akshare",
+            trading_date,
+        )
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "akshare", "ok": False, "error": str(e)})
         _record("intraday", "akshare", False, str(e))
@@ -378,18 +416,120 @@ def get_intraday(code: str) -> dict:
     }
 
 
+def summarize_intraday(result: dict, *, max_points: int = 48) -> dict:
+    """把逐分钟分时压成可放进模型上下文的摘要。
+
+    为什么要压：1 分钟粒度一个交易日 241 个点，整段塞给模型要上万 token，而模型判断
+    日内形势需要的是关键位与走势轮廓，不是每一分钟的值。这里只做「挑选」不做「加工」——
+    统计量取自原始序列的极值/首末，降采样点原样保留，不平滑、不插值、不估算。
+
+    prev_close 缺失时（Sina/AkShare 分支的源本身不返回昨收）不编造涨跌幅，
+    相关字段留 None，由调用方如实说明。
+    """
+    rows = [r for r in (result.get("data") or []) if isinstance(r, dict)]
+    base = {
+        "trading_date": result.get("trading_date", ""),
+        "interval": result.get("interval", ""),
+        "point_count": len(rows),
+        "provenance": result.get("provenance", {}),
+    }
+    if not rows:
+        return {**base, "error": (result.get("provenance") or {}).get("error") or "分时数据为空"}
+
+    prices = [_f(r.get("price")) for r in rows]
+    high_index = max(range(len(rows)), key=lambda i: prices[i])
+    low_index = min(range(len(rows)), key=lambda i: prices[i])
+    prev_close = _nullable_f(result.get("prev_close"))
+    last = prices[-1]
+
+    summary = {
+        **base,
+        "prev_close": prev_close,
+        "open": prices[0],
+        "high": prices[high_index],
+        "high_time": str(rows[high_index].get("time", "")),
+        "low": prices[low_index],
+        "low_time": str(rows[low_index].get("time", "")),
+        "last": last,
+        "last_time": str(rows[-1].get("time", "")),
+        "avg": _nullable_f(rows[-1].get("avg")),
+        "volume": sum(_f(r.get("volume")) for r in rows),
+        "amount": sum(_f(r.get("amount")) for r in rows) or None,
+        "change": None,
+        "change_pct": None,
+        "amplitude_pct": None,
+    }
+    if prev_close:
+        summary["change"] = round(last - prev_close, 4)
+        summary["change_pct"] = round((last - prev_close) / prev_close * 100, 2)
+        summary["amplitude_pct"] = round(
+            (prices[high_index] - prices[low_index]) / prev_close * 100, 2
+        )
+
+    # 均匀降采样 + 强制保留首/尾/最高/最低，保证形态判断不丢关键位。
+    keep = {0, len(rows) - 1, high_index, low_index}
+    if len(rows) > max_points:
+        step = (len(rows) - 1) / (max_points - 1)
+        keep.update(round(i * step) for i in range(max_points))
+    else:
+        keep.update(range(len(rows)))
+    summary["points"] = [
+        {"time": str(rows[i].get("time", "")), "price": prices[i], "avg": _nullable_f(rows[i].get("avg"))}
+        for i in sorted(keep)
+        if 0 <= i < len(rows)
+    ]
+    return summary
+
+
 # ────────────────────────────────────────────────────────────
 # 日 K 线（直连优先：Tencent(qfq) → Eastmoney(qfq,BJ跳过) → Sina(不复权) → AkShare 兜底）
 # ────────────────────────────────────────────────────────────
-def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
-    """日 K 线（带 ma5/ma10/ma20）。直连优先，AkShare 兜底。"""
+MA_PERIODS: tuple[int, ...] = (5, 10, 20, 60, 120, 250)
+KLINE_MIN_DAYS = MA_PERIODS[0]
+KLINE_MAX_DAYS = MA_PERIODS[-1]
+# 指标（MACD 26+9 / BOLL 20 / RSI 14 / KDJ 9）预热根数，保证首根可见 K 线的指标已成形
+INDICATOR_WARMUP = 60
+# 单次抓取上限，避免 250 日 + 均线预热 + 指标预热后向数据源请求过长历史
+_MAX_FETCH = 900
+
+
+def ma_periods_for(n: int) -> List[int]:
+    """区间越长均线越多：只保留周期 <= 区间长度的均线。"""
+    count = max(int(n or 0), KLINE_MIN_DAYS)
+    return [period for period in MA_PERIODS if period <= count]
+
+
+def _attach_moving_averages(rows: List[dict], periods: List[int]) -> List[dict]:
+    """在 K 线行上补齐各周期均线；样本不足的位置保持 None，不伪造 0。"""
+    if not rows:
+        return []
+    close = pd.to_numeric(pd.Series([row.get("close") for row in rows]), errors="coerce")
+    averages = {f"ma{period}": close.rolling(period).mean() for period in periods}
+    return [
+        {**row, **{name: _nullable_f(series.iloc[index]) for name, series in averages.items()}}
+        for index, row in enumerate(rows)
+    ]
+
+
+def get_kline(code: str, n: int = 60, adjust: str = "qfq", warmup: int = 0) -> dict:
+    """日 K 线（均线周期随区间自适应）。直连优先，AkShare 兜底。
+
+    n：需要展示的 K 线根数；warmup：额外返回的前置根数（供上层指标预热，默认 0）。
+    内部会多抓 max(周期)-1 根用于均线预热，返回前再截断，保证均线覆盖整个展示窗口。
+    """
     raw = normalize_ticker(code)
     adjust_map = {"qfq": "前复权", "hfq": "后复权", "": ""}
     attempts: list[dict] = []
     t0 = time.perf_counter()
 
+    count = max(KLINE_MIN_DAYS, int(n or KLINE_MIN_DAYS))
+    keep = count + max(0, int(warmup))
+    periods = ma_periods_for(count)
+    fetch = min(keep + max(periods) - 1, _MAX_FETCH)
+
     def finish(result: dict, source: str) -> dict:
-        _ensure_fresh(result, kind="kline")
+        result["data"] = _attach_moving_averages(result.get("data") or [], periods)[-keep:]
+        stale_reason = _ensure_fresh(result, kind="kline")
         attempts.append({"source": source, "ok": True})
         _record("kline", source, True)
         result["provenance"] = _enrich(
@@ -397,21 +537,24 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
             trading_date=result.get("trading_date", ""),
             attempts=list(attempts),
         )
+        if stale_reason:
+            result["stale"] = True
+            result["provenance"]["stale_reason"] = stale_reason
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
         return result
 
     # 1) Tencent 直连（前复权，BJ 正确）
     try:
-        return finish(market_provider.tencent_kline(raw, n=n, adjust=adjust), "tencent")
+        return finish(market_provider.tencent_kline(raw, n=fetch, adjust=adjust), "tencent")
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "tencent", "ok": False, "error": str(e)})
         _record("kline", "tencent", False, str(e))
         logger.debug("tencent 日K 失败，尝试东方财富直连：%s", e)
 
     # 2) 东方财富直连（前复权；BJ 跳过）
-    if not _is_bj(raw):
+    if _supports_eastmoney_direct(raw):
         try:
-            return finish(market_provider.eastmoney_kline(raw, n=n, adjust=adjust), "eastmoney-direct")
+            return finish(market_provider.eastmoney_kline(raw, n=fetch, adjust=adjust), "eastmoney-direct")
         except Exception as e:  # noqa: BLE001
             attempts.append({"source": "eastmoney-direct", "ok": False, "error": str(e)})
             _record("kline", "eastmoney-direct", False, str(e))
@@ -419,7 +562,7 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
 
     # 3) Sina 直连（不复权，明确标注）
     try:
-        r = market_provider.sina_kline(raw, n=n)
+        r = market_provider.sina_kline(raw, n=fetch)
         r["provenance"] = r.get("provenance", {})
         r["provenance"]["note"] = "备用源 Sina 为不复权数据，技术信号仅供参考"
         return finish(r, "sina")
@@ -428,38 +571,35 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
         _record("kline", "sina", False, str(e))
         logger.debug("sina 日K 失败，尝试 AkShare：%s", e)
 
-    # 4) AkShare 兜底（前复权）
-    try:
-        import akshare as ak
-        end = dt.datetime.now().strftime("%Y%m%d")
-        start = (dt.datetime.now() - dt.timedelta(days=int(n) * 3 + 90)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=raw, period="daily", start_date=start, end_date=end, adjust=adjust)
-        if df is None or df.empty:
-            raise ValueError("stock_zh_a_hist 空数据")
-        df = df.copy().tail(int(n)).reset_index(drop=True)
-        df["ma5"] = df["收盘"].rolling(5).mean()
-        df["ma10"] = df["收盘"].rolling(10).mean()
-        df["ma20"] = df["收盘"].rolling(20).mean()
-        dts = pd.to_datetime(df["日期"])
-        out = []
-        for i, row in df.iterrows():
-            d = dts.iloc[i]
-            out.append({
-                "date": d.strftime("%Y-%m-%d"),
-                "open": _f(row["开盘"]), "close": _f(row["收盘"]),
-                "high": _f(row["最高"]), "low": _f(row["最低"]),
-                "volume": int(_f(row["成交量"])),
-                "ma5": _f(row["ma5"]), "ma10": _f(row["ma10"]), "ma20": _f(row["ma20"]),
-            })
-        prov = make_provenance(
-            source="akshare", endpoint="stock_zh_a_hist",
-            raw_value={"code": raw, "n": n, "adjust": adjust_map.get(adjust, adjust)},
-        )
-        return finish({"data": out, "trading_date": out[-1]["date"] if out else "", "provenance": prov}, "akshare")
-    except Exception as e:  # noqa: BLE001
-        attempts.append({"source": "akshare", "ok": False, "error": str(e)})
-        _record("kline", "akshare", False, str(e))
-        logger.debug("akshare 日K 兜底也失败：%s", e)
+    # 4) AkShare 兜底（前复权）——指数跳过：stock_zh_a_hist 只覆盖股票
+    if not is_index(code):
+        try:
+            import akshare as ak
+            end = dt.datetime.now().strftime("%Y%m%d")
+            start = (dt.datetime.now() - dt.timedelta(days=fetch * 3 + 90)).strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(symbol=raw, period="daily", start_date=start, end_date=end, adjust=adjust)
+            if df is None or df.empty:
+                raise ValueError("stock_zh_a_hist 空数据")
+            df = df.copy().tail(fetch).reset_index(drop=True)
+            dts = pd.to_datetime(df["日期"])
+            out = []
+            for i, row in df.iterrows():
+                d = dts.iloc[i]
+                out.append({
+                    "date": d.strftime("%Y-%m-%d"),
+                    "open": _f(row["开盘"]), "close": _f(row["收盘"]),
+                    "high": _f(row["最高"]), "low": _f(row["最低"]),
+                    "volume": int(_f(row["成交量"])),
+                })
+            prov = make_provenance(
+                source="akshare", endpoint="stock_zh_a_hist",
+                raw_value={"code": raw, "n": count, "adjust": adjust_map.get(adjust, adjust)},
+            )
+            return finish({"data": out, "trading_date": out[-1]["date"] if out else "", "provenance": prov}, "akshare")
+        except Exception as e:  # noqa: BLE001
+            attempts.append({"source": "akshare", "ok": False, "error": str(e)})
+            _record("kline", "akshare", False, str(e))
+            logger.debug("akshare 日K 兜底也失败：%s", e)
 
     chain = " | ".join(a.get("error", "")[:80] for a in attempts if a.get("error"))
     return {
@@ -474,52 +614,84 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
 
 
 # ────────────────────────────────────────────────────────────
-# 五档盘口（仅 AkShare；无可靠免费直连 5 档源，失败明确标注）
+# 五档盘口（直连优先：Tencent qt 五档 → AkShare 兜底；失败明确标注）
 # ────────────────────────────────────────────────────────────
 def get_bid_ask(code: str) -> dict:
-    """五档盘口（akshare，无可靠免费备用源；失败明确标注，不伪造）。"""
+    """五档盘口（腾讯 qt 直连优先，akshare 兜底；失败明确标注，不伪造）。
+
+    实测：腾讯 qt 字段 9-28 即买卖五档价量（单位手），收盘后仍保留当日快照；
+    东财 push2 对无 UA 的连接直接掐断、非交易时段五档字段清空，akshare 包装
+    恰好不带 UA——曾长期只有 akshare 一条路，盘口实际从未可用。
+    """
     raw = normalize_ticker(code)
     attempts: list[dict] = []
     t0 = time.perf_counter()
+
+    if is_index(code):
+        # 指数没有五档盘口；不拦截的话 akshare 兜底会把 000001 当平安银行
+        # 返回一只股票的五档——数据张冠李戴。
+        return {
+            "asks": [], "bids": [], "trading_date": "",
+            "elapsed_ms": 0,
+            "provenance": _enrich(
+                make_provenance(source="none", endpoint="bid_ask", error="指数无五档盘口"),
+                attempts=[],
+            ),
+        }
+
+    def _wrap(result: dict, source: str) -> dict:
+        attempts.append({"source": source, "ok": True})
+        _record("book", source, True)
+        result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
+        result["provenance"] = _enrich(
+            result.get("provenance", {}),
+            trading_date=result.get("trading_date", ""),
+            attempts=list(attempts),
+        )
+        return result
+
+    # 1) 腾讯直连（快、收盘后仍有当日快照、量纲就是手）
+    try:
+        return _wrap(market_provider.tencent_bid_ask(raw), "tencent")
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "tencent", "ok": False, "error": str(e)})
+        _record("book", "tencent", False, str(e))
+        logger.debug("tencent 五档失败，尝试 akshare：%s", e)
+
+    # 2) AkShare 兜底（注意：stock_bid_ask_em 要求纯 6 位代码自己拼 secid，
+    #    传 sh600519 会拼出非法 secid 被远端掐断）
     try:
         import akshare as ak
-        mkt = "sh" if raw.startswith(("60", "68", "90", "11", "51", "56")) else (
-            "bj" if _is_bj(raw) else "sz"
-        )
-        df = ak.stock_bid_ask_em(symbol=f"{mkt}{raw}")
+        df = ak.stock_bid_ask_em(symbol=raw)
         if df is None or df.empty:
             raise ValueError("空数据")
-        rec = {str(r.iloc[0]): (r.iloc[1], r.iloc[2] if df.shape[1] > 2 else 0) for r in df.to_dict("index").values()}
+        # 两列 [item, value]：sell_5 / sell_5_vol / buy_1 / buy_1_vol ...
+        # （量字段已 ×100 转为股，前端展示口径是手）
+        rec = {str(k): v for k, v in zip(df.iloc[:, 0], df.iloc[:, 1])}
 
-        def pick(labels):
-            for lab in labels:
-                if lab in rec:
-                    p, v = rec[lab]
-                    return {"label": lab, "price": _f(p), "vol": int(_f(v))}
-            return None
+        def pick(price_key: str, vol_key: str, label: str):
+            if price_key not in rec:
+                return None
+            vol = _f(rec.get(vol_key)) / 100.0  # 股 → 手
+            return {"label": label, "price": _f(rec[price_key]), "vol": int(vol) if vol else 0}
 
-        asks = [pick(x) for x in (["卖五", "卖5"], ["卖四", "卖4"], ["卖三", "卖3"], ["卖二", "卖2"], ["卖一", "卖1"])]
-        bids = [pick(x) for x in (["买一", "买1"], ["买二", "买2"], ["买三", "买3"], ["买四", "买4"], ["买五", "买5"])]
+        asks = [pick(f"sell_{i}", f"sell_{i}_vol", f"卖{cn}") for i, cn in zip(range(5, 0, -1), "五四三二一")]
+        bids = [pick(f"buy_{i}", f"buy_{i}_vol", f"买{cn}") for i, cn in zip(range(1, 6), "一二三四五")]
         asks = [a for a in asks if a]
         bids = [b for b in bids if b]
-        attempts.append({"source": "akshare", "ok": True})
-        _record("book", "akshare", True)
-        prov = make_provenance(source="akshare", endpoint="stock_bid_ask_em", raw_value=f"{mkt}{raw}")
-        return {
-            "asks": asks, "bids": bids, "trading_date": _today(),
-            "elapsed_ms": int((time.perf_counter() - t0) * 1000),
-            "provenance": _enrich(prov, trading_date=_today(), attempts=list(attempts)),
-        }
+        prov = make_provenance(source="akshare", endpoint="stock_bid_ask_em", raw_value=raw)
+        return _wrap({"asks": asks, "bids": bids, "trading_date": "", "provenance": prov}, "akshare")
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "akshare", "ok": False, "error": str(e)})
         _record("book", "akshare", False, str(e))
-        logger.debug("get_bid_ask 失败（无免费直连源）：%s", e)
+        logger.debug("akshare 五档兜底也失败：%s", e)
+        chain = " | ".join(a.get("error", "")[:80] for a in attempts if a.get("error"))
         return {
             "asks": [], "bids": [], "trading_date": "",
             "elapsed_ms": int((time.perf_counter() - t0) * 1000),
             "provenance": _enrich(
-                make_provenance(source="akshare", endpoint="stock_bid_ask_em",
-                                error=f"盘口暂不可用（akshare 失败，无免费直连源）：{e}"),
+                make_provenance(source="none", endpoint="bid_ask",
+                                error=f"五档盘口暂不可用（tencent/akshare 均失败）：{chain}"),
                 attempts=list(attempts),
             ),
         }
@@ -528,91 +700,87 @@ def get_bid_ask(code: str) -> dict:
 # ────────────────────────────────────────────────────────────
 # 技术指标
 # ────────────────────────────────────────────────────────────
+def _frame_ma_periods(df: pd.DataFrame) -> List[int]:
+    """指标序列的均线周期与 K 线保持一致：K 线里有哪几条就算哪几条。"""
+    present = [period for period in MA_PERIODS if f"ma{period}" in df.columns]
+    return present or [5, 10, 20]
+
+
+def _compute_indicator_frame(df: pd.DataFrame, periods: Optional[List[int]] = None) -> pd.DataFrame:
+    """一次性计算前端绘图与摘要共用的完整指标序列。"""
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df.get("high", close), errors="coerce")
+    low = pd.to_numeric(df.get("low", close), errors="coerce")
+    frame = pd.DataFrame(index=df.index)
+    for period in (periods if periods is not None else _frame_ma_periods(df)):
+        frame[f"ma{period}"] = close.rolling(period).mean()
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    frame["dif"] = ema12 - ema26
+    frame["dea"] = frame["dif"].ewm(span=9, adjust=False).mean()
+    frame["macd"] = 2 * (frame["dif"] - frame["dea"])
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    relative_strength = gain / loss.where(loss != 0)
+    frame["rsi14"] = 100 - 100 / (1 + relative_strength)
+    frame.loc[(loss == 0) & gain.notna(), "rsi14"] = 100.0
+
+    low9 = low.rolling(9).min()
+    high9 = high.rolling(9).max()
+    spread = (high9 - low9).where(high9 != low9)
+    rsv = ((close - low9) / spread * 100).fillna(50.0)
+    frame["k"] = rsv.ewm(com=2, adjust=False).mean()
+    frame["d"] = frame["k"].ewm(com=2, adjust=False).mean()
+    frame["j"] = 3 * frame["k"] - 2 * frame["d"]
+
+    frame["bollMid"] = close.rolling(20).mean()
+    standard_deviation = close.rolling(20).std()
+    frame["bollUpper"] = frame["bollMid"] + 2 * standard_deviation
+    frame["bollLower"] = frame["bollMid"] - 2 * standard_deviation
+    return frame
+
+
+def _indicator_series(df: pd.DataFrame) -> List[dict]:
+    frame = _compute_indicator_frame(df)
+    dates = df["date"] if "date" in df else df.index.astype(str)
+    fields = tuple(frame.columns)
+    return [
+        {"date": str(dates.iloc[index])[:10], **{field: _nullable_f(row[field]) for field in fields}}
+        for index, (_, row) in enumerate(frame.iterrows())
+    ]
+
+
 def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
-    """对日 K DataFrame 计算 MA/MACD/RSI/KDJ/BOLL，返回指标列表。
+    """从完整指标序列生成最新摘要，保证摘要与图表数值同源。"""
+    frame = _compute_indicator_frame(df)
+    if frame.empty:
+        return []
+    last = frame.iloc[-1]
+    last_close = _f(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
+    # 短区间（如 5 日）不会计算 MA20，取值需容忍列缺失
+    ma5 = _nullable_f(last["ma5"]) if "ma5" in frame.columns else None
+    ma20 = _nullable_f(last["ma20"]) if "ma20" in frame.columns else None
+    macd = _nullable_f(last["macd"])
+    rsi = _nullable_f(last["rsi14"])
+    kdj_j = _nullable_f(last["j"])
+    boll_mid = _nullable_f(last["bollMid"])
+    boll_lower = _nullable_f(last["bollLower"])
 
-    df 需有列：close, high, low（中文或英文均可）。
-    pandas-ta-classic 优先；缺失则纯 pandas 兜底。
-    """
-    out: List[dict] = []
-    close = df["close"]
-    high = df.get("high", close)
-    low = df.get("low", close)
-
-    def _ma(n: int) -> float:
-        s = close.tail(n)
-        return _f(s.mean()) if len(s) else 0.0
-
-    ma5, ma20 = _ma(5), _ma(20)
-    last_close = _f(close.iloc[-1]) if len(close) else 0.0
-
-    # MA
-    out.append({"name": "MA5", "value": f"{ma5:.2f}", "signal": "多头" if last_close > ma5 > 0 else "空头"})
-    out.append({"name": "MA20", "value": f"{ma20:.2f}", "signal": ("多头" if ma5 > ma20 else "空头") if ma5 and ma20 else "中性"})
-
-    macd_hist = rsi_v = kdj_j = None
-    try:
-        import pandas_ta_classic as ta  # noqa: F401
-        macd_df = close.ta.macd() if hasattr(close, "ta") else None
-        if macd_df is not None and not macd_df.empty:
-            macd_hist = _f(macd_df.iloc[-1].get(f"MACDh_12_26_9"))
-        rsi_s = close.ta.rsi()
-        if rsi_s is not None and len(rsi_s):
-            rsi_v = _f(rsi_s.iloc[-1])
-        hldf = pd.DataFrame({"high": high, "low": low, "close": close})
-        stoch = hldf.ta.stoch()
-        if stoch is not None and not stoch.empty:
-            _k = _f(stoch.iloc[-1].get("STOCHk_14_3_3"))
-            _d = _f(stoch.iloc[-1].get("STOCHd_14_3_3"))
-            kdj_j = 3 * _k - 2 * _d  # J = 3K - 2D
-    except Exception as e:  # noqa: BLE001
-        logger.debug("pandas-ta-classic 不可用，回退纯 pandas：%s", e)
-
-    if macd_hist is None:
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        dif = ema12 - ema26
-        dea = dif.ewm(span=9, adjust=False).mean()
-        macd_hist = _f((dif - dea).iloc[-1])
-    if rsi_v is None:
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean().replace(0, 1e-9)
-        rs = gain / loss
-        rsi_v = _f((100 - 100 / (1 + rs)).iloc[-1]) if len(rs) else 50.0
-    if kdj_j is None:
-        low9 = low.rolling(9).min()
-        high9 = high.rolling(9).max().replace(0, 1e-9)
-        rsv = (close - low9) / (high9 - low9) * 100
-        rsv = rsv.fillna(50.0)
-        k = rsv.ewm(com=2, adjust=False).mean()
-        d = k.ewm(com=2, adjust=False).mean()
-        kdj_j = _f((3 * k - 2 * d).iloc[-1]) if len(d) else 50.0
-
-    out.append({"name": "MACD", "value": f"{macd_hist:.2f}", "signal": "金叉" if macd_hist > 0 else "死叉"})
-    out.append({"name": "RSI(14)", "value": f"{rsi_v:.1f}", "signal": "超买" if rsi_v >= 70 else ("超卖" if rsi_v <= 30 else "中性")})
-    out.append({"name": "KDJ-J", "value": f"{kdj_j:.1f}", "signal": "超买" if kdj_j >= 90 else ("超卖" if kdj_j <= 10 else "中性")})
-
-    try:
-        mid = close.rolling(20).mean()
-        std = close.rolling(20).std()
-        up = mid + 2 * std
-        lo = mid - 2 * std
-        lc = last_close
-        if len(mid) and not math.isnan(mid.iloc[-1]):
-            mid_v = _f(mid.iloc[-1])
-            lo_v = _f(lo.iloc[-1])
-            sig = "多头" if lc > mid_v else ("空头" if lc < lo_v else "中性")
-            out.append({"name": "BOLL", "value": f"{mid_v:.2f}", "signal": sig})
-    except Exception:  # noqa: BLE001
-        out.append({"name": "BOLL", "value": "—", "signal": "中性"})
-
-    return out
+    return [
+        {"name": "MA5", "value": f"{ma5:.2f}" if ma5 is not None else "—", "signal": "多头" if ma5 is not None and last_close > ma5 else "空头"},
+        {"name": "MA20", "value": f"{ma20:.2f}" if ma20 is not None else "—", "signal": "多头" if ma5 is not None and ma20 is not None and ma5 > ma20 else ("空头" if ma20 is not None else "中性")},
+        {"name": "MACD", "value": f"{macd:.3f}" if macd is not None else "—", "signal": "金叉" if macd is not None and macd > 0 else ("死叉" if macd is not None else "中性")},
+        {"name": "RSI(14)", "value": f"{rsi:.1f}" if rsi is not None else "—", "signal": "超买" if rsi is not None and rsi >= 70 else ("超卖" if rsi is not None and rsi <= 30 else "中性")},
+        {"name": "KDJ-J", "value": f"{kdj_j:.1f}" if kdj_j is not None else "—", "signal": "超买" if kdj_j is not None and kdj_j >= 90 else ("超卖" if kdj_j is not None and kdj_j <= 10 else "中性")},
+        {"name": "BOLL", "value": f"{boll_mid:.2f}" if boll_mid is not None else "—", "signal": "多头" if boll_mid is not None and last_close > boll_mid else ("空头" if boll_lower is not None and last_close < boll_lower else "中性")},
+    ]
 
 
 def get_indicators(code: str) -> dict:
     """技术指标汇总（基于近 120 日 K 线）。K 线来源在 provenance 透传。"""
-    raw = normalize_ticker(code)
     try:
         kl = get_kline(code, n=120, adjust="qfq")
         data = kl.get("data") or []
@@ -638,6 +806,7 @@ def compute_indicators_from_kline(code: str, data: list[dict], kline_result: Opt
             raise ValueError("K 线数据不足")
         df = pd.DataFrame(data)
         out = _compute_indicators_df(df)
+        series = _indicator_series(df)
         kl = kline_result or {}
         kl_prov = kl.get("provenance", {}) or {}
         src = kl_prov.get("source", "local-kline")
@@ -651,6 +820,7 @@ def compute_indicators_from_kline(code: str, data: list[dict], kline_result: Opt
             prov["note"] = kl_prov["note"]
         return {
             "data": out,
+            "series": series,
             "trading_date": kl.get("trading_date", ""),
             "elapsed_ms": kl.get("elapsed_ms"),
             "provenance": _enrich(
@@ -663,6 +833,7 @@ def compute_indicators_from_kline(code: str, data: list[dict], kline_result: Opt
         logger.warning("compute_indicators_from_kline 失败：%s", e)
         return {
             "data": [],
+            "series": [],
             "trading_date": (kline_result or {}).get("trading_date", ""),
             "elapsed_ms": (kline_result or {}).get("elapsed_ms"),
             "provenance": _enrich(
@@ -670,3 +841,30 @@ def compute_indicators_from_kline(code: str, data: list[dict], kline_result: Opt
                 attempts=[{"source": "kline", "ok": False, "error": str(e)}],
             ),
         }
+
+
+def get_chart_bundle(code: str, n: int = 120, adjust: str = "qfq") -> dict:
+    """返回行情分析页所需数据；K 线只抓取一次并复用于指标计算。"""
+    count = max(KLINE_MIN_DAYS, min(int(n or 120), KLINE_MAX_DAYS))
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="chart-bundle") as executor:
+        quote_future = executor.submit(get_realtime_quote, code)
+        intraday_future = executor.submit(get_intraday, code)
+        # 多取 INDICATOR_WARMUP 根用于 MACD/BOLL/RSI 预热，算完指标后再裁到展示区间
+        kline_future = executor.submit(get_kline, code, count, adjust, INDICATOR_WARMUP)
+        book_future = executor.submit(get_bid_ask, code)
+        quote = quote_future.result()
+        intraday = intraday_future.result()
+        kline = kline_future.result()
+        book = book_future.result()
+    warmed = kline.get("data") or []
+    indicators = compute_indicators_from_kline(code, warmed, kline)
+    if indicators.get("series"):
+        indicators = {**indicators, "series": indicators["series"][-count:]}
+    return {
+        "code": to_market_ticker(code),
+        "quote": quote,
+        "intraday": intraday,
+        "kline": {**kline, "data": warmed[-count:]},
+        "book": book,
+        "indicators": indicators,
+    }

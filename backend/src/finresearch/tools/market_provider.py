@@ -21,7 +21,7 @@ from typing import Any, List, Optional
 from urllib.parse import urlencode
 
 from . import now_iso
-from .entity import normalize_ticker, to_market_ticker, _classify_exchange
+from .entity import is_index, _classify_exchange, is_bj, is_sh, normalize_ticker, to_market_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -136,17 +136,34 @@ def configure_market_network() -> dict:
 # 市场前缀（Sina/Sina kline 用 sh/sz/bj 前缀）
 # ────────────────────────────────────────────────────────────
 def _sina_symbol(raw: str) -> str:
-    """纯 6 位代码 → Sina 前缀（sh/sz/bj）。"""
-    if raw.startswith(("60", "68", "90", "11", "51", "56")):
+    """代码 → Sina 前缀（sh/sz/bj）。
+
+    指数必须先于号段判断：上证指数 000001 落在深市号段（00 开头），
+    不查目录会拼成 sz000001——那是平安银行，数据张冠李戴且无任何提示。
+    """
+    if is_index(raw):
+        pure, _, market = str(raw).strip().upper().partition(".")
+        prefix = (market or "SH").lower()
+        if len(pure) == 6 and pure.isdigit():
+            return f"{prefix}{pure}"
+        # 前缀形式（sh000001）：原样
+        if str(raw).strip().upper().startswith(("SH", "SZ")):
+            return str(raw).strip().lower()
+    if is_sh(raw):
         return f"sh{raw}"
-    if raw.startswith(("43", "83", "87", "88")):
+    if is_bj(raw):
         return f"bj{raw}"
     return f"sz{raw}"
 
 
 def _eastmoney_secid(raw: str) -> str:
-    """Eastmoney secid: 1.SH, 0.SZ/BJ."""
-    return f"1.{raw}" if raw.startswith(("60", "68", "90", "11", "51", "56")) else f"0.{raw}"
+    """Eastmoney secid: 1.SH, 0.SZ/BJ；指数按目录市场位。"""
+    if is_index(raw):
+        pure, _, market = str(raw).strip().upper().partition(".")
+        market = market or "SH"
+        if len(pure) == 6 and pure.isdigit():
+            return f"{'1' if market == 'SH' else '0'}.{pure}"
+    return f"1.{raw}" if is_sh(raw) else f"0.{raw}"
 
 
 def _http_get(url: str, headers: Optional[dict] = None, timeout: float = 3.0) -> str:
@@ -183,35 +200,14 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     if not rows:
         raise ValueError("Eastmoney 日K 空数据")
 
-    import pandas as pd
-
-    parsed = []
+    out = []
     for line in rows:
         p = str(line).split(",")
         if len(p) < 6:
             continue
-        parsed.append({"date": p[0], "open": _n(p[1]), "close": _n(p[2]), "high": _n(p[3]), "low": _n(p[4]), "volume": int(_n(p[5]))})
-    if not parsed:
+        out.append({"date": str(p[0])[:10], "open": _n(p[1]), "close": _n(p[2]), "high": _n(p[3]), "low": _n(p[4]), "volume": int(_n(p[5]))})
+    if not out:
         raise ValueError("Eastmoney 日K 字段异常")
-    df = pd.DataFrame(parsed)
-    df["ma5"] = df["close"].rolling(5).mean()
-    df["ma10"] = df["close"].rolling(10).mean()
-    df["ma20"] = df["close"].rolling(20).mean()
-    out = []
-    for _, r in df.iterrows():
-        out.append(
-            {
-                "date": str(r["date"])[:10],
-                "open": _n(r["open"]),
-                "close": _n(r["close"]),
-                "high": _n(r["high"]),
-                "low": _n(r["low"]),
-                "volume": int(_n(r["volume"])),
-                "ma5": _n(r["ma5"]),
-                "ma10": _n(r["ma10"]),
-                "ma20": _n(r["ma20"]),
-            }
-        )
     return {
         "data": out,
         "trading_date": out[-1]["date"],
@@ -231,7 +227,10 @@ def eastmoney_intraday(code: str) -> dict:
     qs = urlencode(
         {
             "secid": _eastmoney_secid(raw),
-            "fields1": "f1,f2,f3,f4,f5,f6",
+            # f1..f6 只回 code/market/type/status/decimal，拿不到昨收（实测）。
+            # 补到 f13 才有 preClose/prePrice——没有昨收就算不出涨跌幅与振幅，
+            # 分时摘要会退化成一串没有参照系的价格。
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
             "ndays": "1",
             "iscr": "0",
@@ -247,12 +246,22 @@ def eastmoney_intraday(code: str) -> dict:
 
     import pandas as pd
 
+    # 字段序：f51时间 f52开 f53现价 f54高 f55低 f56量 f57额 f58均价。
+    # f58 是东财官方累计均价，比自己按分钟累乘更准（成交笔与分钟聚合口径不完全一致）。
     parsed = []
     for line in rows:
         p = str(line).split(",")
         if len(p) < 7:
             continue
-        parsed.append({"dt": p[0], "price": _n(p[2]), "volume": _n(p[5]), "amount": _n(p[6])})
+        parsed.append(
+            {
+                "dt": p[0],
+                "price": _n(p[2]),
+                "volume": _n(p[5]),
+                "amount": _n(p[6]),
+                "official_avg": _nullable_n(p[7]) if len(p) >= 8 else None,
+            }
+        )
     df = pd.DataFrame(parsed)
     if df.empty:
         raise ValueError("Eastmoney 分时字段异常")
@@ -267,20 +276,32 @@ def eastmoney_intraday(code: str) -> dict:
         df = df[df["dt"] <= dt.datetime.now()]
     hhmm = df["dt"].dt.strftime("%H:%M")
     df = df[(hhmm >= "09:30") & (hhmm <= "15:00")]
-    # 1 分钟 → 5 分钟桶（与 akshare/sina 分时 5 分钟契约一致；avg 用累计均价）
-    df = df.set_index("dt")
-    bucket = df.resample("5min", label="left", closed="left")
-    agg = bucket.agg(price=("price", "last"), volume=("volume", "sum")).dropna(subset=["price"])
+    # 保留免费源原生 1 分钟粒度；仅当源本身是 5 分钟时由 provenance.interval 标注。
+    agg = df.set_index("dt")
     agg["time"] = agg.index.strftime("%H:%M")
-    cum_p5 = (agg["price"] * agg["volume"]).cumsum()
-    cum_v5 = agg["volume"].cumsum().replace(0, 1)
-    agg["avg"] = (cum_p5 / cum_v5).round(2)
+    cumulative_price = (agg["price"] * agg["volume"]).cumsum()
+    cumulative_volume = agg["volume"].cumsum().replace(0, 1)
+    fallback_avg = (cumulative_price / cumulative_volume).round(2)
+    # 官方均价缺失（旧接口只回 7 个字段）时才退回累乘近似。
+    agg["avg"] = agg["official_avg"].fillna(fallback_avg).round(2)
     out = [
-        {"time": str(r["time"]), "price": _n(r["price"]), "avg": _n(r["avg"]), "volume": int(_n(r["volume"]))}
+        {
+            "time": str(r["time"]),
+            "price": _n(r["price"]),
+            "avg": _n(r["avg"]),
+            "volume": int(_n(r["volume"])),
+            "amount": _n(r["amount"]),
+        }
         for _, r in agg.iterrows()
     ]
     return {
         "data": out,
+        "interval": "1m",
+        # preClose 偶有为 0 的情况（新股首日/停牌），此时退回 prePrice。
+        "prev_close": (
+            _nullable_n((payload.get("data") or {}).get("preClose"))
+            or _nullable_n((payload.get("data") or {}).get("prePrice"))
+        ),
         "trading_date": str(latest),
         "provenance": {
             "source": "eastmoney-direct",
@@ -383,6 +404,165 @@ def sina_realtime(code: str) -> dict:
     }
 
 
+def index_overview(codes: Optional[list[str]] = None) -> dict:
+    """大盘指数批量快照（行情页顶部大盘条）。
+
+    主源：新浪 s_ 简版一次批量（字段：名称,点位,涨跌,涨跌幅,量(手),额(万元)）；
+    备源：腾讯 qt 批量。任一源成功即返回；全失败显式 error，不伪造。
+    """
+    from .entity import INDEX_CATALOG
+
+    wanted = codes or list(INDEX_CATALOG.keys())
+    syms = [_sina_symbol(normalize_ticker(c)) for c in wanted]
+    attempts: list[dict] = []
+
+    # 1) 新浪 s_ 简版批量
+    try:
+        import urllib.request as _u
+
+        url = "https://hq.sinajs.cn/list=" + ",".join(f"s_{s}" for s in syms)
+        req = _u.Request(url, headers={
+            "Referer": "https://finance.sina.com.cn",
+            "User-Agent": "Mozilla/5.0 JingYuan/1.0",
+        })
+        with _u.urlopen(req, timeout=4) as resp:
+            body = resp.read().decode("gbk", errors="replace")
+        out = []
+        for sym, line in zip(syms, body.strip().split(";")):
+            m = re.search(r'="([^"]*)"', line)
+            if not m or not m.group(1).strip():
+                continue
+            parts = m.group(1).split(",")
+            if len(parts) < 6:
+                continue
+            out.append({
+                "code": next((c for c in wanted if _sina_symbol(normalize_ticker(c)) == sym), sym),
+                "name": parts[0],
+                "price": _n(parts[1]),
+                "change": _n(parts[2]),
+                "changePct": _n(parts[3]),
+                "volume": int(_n(parts[4])),
+                "turnover": _fmt_amount_wan(_n(parts[5])),
+                "trading_date": "",
+            })
+        if out:
+            attempts.append({"source": "sina-s", "ok": True, "count": len(out)})
+            return {"indexes": out, "provenance": {
+                "source": "sina-s", "endpoint": "hq.sinajs.cn/list=s_*",
+                "fetched_at": now_iso(), "raw_value": ",".join(syms), "error": None,
+                "attempts": attempts,
+            }}
+        raise ValueError("新浪 s_ 批量返回空")
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "sina-s", "ok": False, "error": str(e)})
+
+    # 2) 腾讯 qt 批量
+    try:
+        import urllib.request as _u
+
+        url = "https://qt.gtimg.cn/q=" + ",".join(syms)
+        req = _u.Request(url, headers={
+            "Referer": "https://stockapp.finance.qq.com/",
+            "User-Agent": "Mozilla/5.0 JingYuan/1.0",
+        })
+        with _u.urlopen(req, timeout=4) as resp:
+            body = resp.read().decode("gbk", errors="replace")
+        out = []
+        for sym, chunk in zip(syms, body.strip().split(";")):
+            if "~" not in chunk:
+                continue
+            parts = chunk.split("~")
+            if len(parts) < 38:
+                continue
+            out.append({
+                "code": next((c for c in wanted if _sina_symbol(normalize_ticker(c)) == sym), sym),
+                "name": parts[1],
+                "price": _n(parts[3]),
+                "change": _n(parts[31]),
+                "changePct": _n(parts[32]),
+                "volume": int(_n(parts[36])),
+                "turnover": _fmt_amount_wan(_n(parts[37])),
+                "trading_date": parts[30][:4] + "-" + parts[30][4:6] + "-" + parts[30][6:8] if len(parts[30]) >= 8 else "",
+            })
+        if out:
+            attempts.append({"source": "tencent", "ok": True, "count": len(out)})
+            return {"indexes": out, "provenance": {
+                "source": "tencent", "endpoint": "qt.gtimg.cn/q",
+                "fetched_at": now_iso(), "raw_value": ",".join(syms), "error": None,
+                "attempts": attempts,
+            }}
+        raise ValueError("腾讯批量返回空")
+    except Exception as e:  # noqa: BLE001
+        attempts.append({"source": "tencent", "ok": False, "error": str(e)})
+
+    chain = " | ".join(a.get("error", "")[:80] for a in attempts if a.get("error"))
+    return {"indexes": [], "provenance": {
+        "source": "none", "endpoint": "index_overview",
+        "fetched_at": now_iso(), "error": f"大盘指数暂不可用：{chain}",
+        "attempts": attempts,
+    }}
+
+
+def _fmt_amount_wan(wan: float) -> str:
+    """万元 → 中文单位（大盘成交额常为百万万元级）。"""
+    if wan >= 1e8:
+        return f"{wan / 1e8:.2f}万亿"
+    if wan >= 1e4:
+        return f"{wan / 1e4:.2f}亿"
+    return f"{wan:.0f}万"
+
+
+def tencent_bid_ask(code: str) -> dict:
+    """Tencent qt.gtimg.cn 五档盘口（qt 协议字段 9-28 = 买卖五档价量）。
+
+    实测收盘后仍保留当日最后一次盘口快照——比东财 push2（非交易时段五档字段清空、
+    且对无 UA 连接直接掐断）可靠。量单位为手，与本项目口径一致，无需换算。
+    """
+    raw = normalize_ticker(code)
+    sym = _sina_symbol(raw)
+    import urllib.request as _u
+
+    req = _u.Request(
+        f"http://qt.gtimg.cn/q={sym}",
+        headers={"Referer": "https://stockapp.finance.qq.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"},
+    )
+    with _u.urlopen(req, timeout=3) as resp:
+        body = resp.read().decode("gbk", errors="replace")
+    if "~" not in body:
+        raise ValueError(f"Tencent 未返回盘口（{sym}）：{body[:60]}")
+    parts = body.split("~")
+    if len(parts) < 29:
+        raise ValueError(f"Tencent 盘口字段数异常（{sym}）：{len(parts)}")
+
+    def _level(i: int, label: str):
+        price, vol = _n(parts[i]), _n(parts[i + 1])
+        if price <= 0:
+            return None
+        return {"label": label, "price": price, "vol": int(vol) if vol > 0 else 0}
+
+    bids = [_level(i, f"买{cn}") for i, cn in ((9, "一"), (11, "二"), (13, "三"), (15, "四"), (17, "五"))]
+    # 卖档按展示约定倒序（卖五在上、卖一贴近买一），与旧 akshare 路径一致
+    asks = [_level(i, f"卖{cn}") for i, cn in ((27, "五"), (25, "四"), (23, "三"), (21, "二"), (19, "一"))]
+    bids = [b for b in bids if b]
+    asks = [a for a in asks if a]
+    if not bids and not asks:
+        raise ValueError(f"Tencent 五档为空（{sym}）")
+    ts = parts[30]
+    trading_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ""
+    return {
+        "asks": asks,  # 卖一 → 卖五
+        "bids": bids,  # 买一 → 买五
+        "trading_date": trading_date,  # 来自数据本身（快照时间戳），不伪造
+        "provenance": {
+            "source": "tencent",
+            "endpoint": "qt.gtimg.cn/q",
+            "fetched_at": now_iso(),
+            "raw_value": sym,
+            "error": None,
+        },
+    }
+
+
 def tencent_realtime(code: str) -> dict:
     """Tencent qt.gtimg.cn 实时快照，国内免费兜底源。"""
     raw = normalize_ticker(code)
@@ -441,11 +621,15 @@ def tencent_realtime(code: str) -> dict:
 
 
 def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
-    """Tencent qfq/day K line, domestic free fallback."""
+    """Tencent day/qfq/hfq K line, domestic free fallback."""
     raw = normalize_ticker(code)
     sym = _sina_symbol(raw)
-    key = "qfqday" if adjust != "" else "day"
-    fq = "qfq" if adjust != "" else ""
+    # 严格映射：hfq 必须走 hfqday/hfq，此前 hfq 被当成 qfq 静默降级，口径错误且 provenance 失真
+    # 指数强制不复权（qfq 请求对指数返回 0 行 qfqday，不复权数据在 day 键里）
+    if is_index(code):
+        adjust = ""
+    key = {"qfq": "qfqday", "hfq": "hfqday"}.get(adjust, "day")
+    fq = adjust if adjust in ("qfq", "hfq") else ""
     url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{int(n)},{fq}"
     body = _http_get(
         url,
@@ -459,13 +643,11 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     if not rows:
         raise ValueError("Tencent 日K 空数据")
 
-    import pandas as pd
-
-    parsed = []
+    out = []
     for r in rows:
         if len(r) < 6:
             continue
-        parsed.append(
+        out.append(
             {
                 "date": str(r[0])[:10],
                 "open": _n(r[1]),
@@ -475,27 +657,8 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "volume": int(_n(r[5])),
             }
         )
-    if not parsed:
+    if not out:
         raise ValueError("Tencent 日K 字段异常")
-    df = pd.DataFrame(parsed)
-    df["ma5"] = df["close"].rolling(5).mean()
-    df["ma10"] = df["close"].rolling(10).mean()
-    df["ma20"] = df["close"].rolling(20).mean()
-    out = []
-    for _, r in df.iterrows():
-        out.append(
-            {
-                "date": str(r["date"]),
-                "open": _n(r["open"]),
-                "close": _n(r["close"]),
-                "high": _n(r["high"]),
-                "low": _n(r["low"]),
-                "volume": int(_n(r["volume"])),
-                "ma5": _n(r["ma5"]),
-                "ma10": _n(r["ma10"]),
-                "ma20": _n(r["ma20"]),
-            }
-        )
     return {
         "data": out,
         "trading_date": out[-1]["date"],
@@ -534,9 +697,6 @@ def sina_kline(code: str, n: int = 60) -> dict:
     for col in ("open", "high", "low", "close"):
         df[col] = pd.to_numeric(df.get(col), errors="coerce")
     df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0) / 100.0  # 股→手
-    df["ma5"] = df["close"].rolling(5).mean()
-    df["ma10"] = df["close"].rolling(10).mean()
-    df["ma20"] = df["close"].rolling(20).mean()
     out = []
     for _, r in df.iterrows():
         out.append(
@@ -547,9 +707,6 @@ def sina_kline(code: str, n: int = 60) -> dict:
                 "high": _n(r.get("high")),
                 "low": _n(r.get("low")),
                 "volume": int(r.get("volume") or 0),
-                "ma5": _n(r.get("ma5")),
-                "ma10": _n(r.get("ma10")),
-                "ma20": _n(r.get("ma20")),
             }
         )
     return {
@@ -612,6 +769,7 @@ def sina_intraday(code: str) -> dict:
     ]
     return {
         "data": out,
+        "interval": "5m",
         "trading_date": str(latest),
         "provenance": {
             "source": "sina",
@@ -632,6 +790,15 @@ def _n(v, d=0.0) -> float:
         return d if (x != x or x in (float("inf"), float("-inf"))) else x
     except Exception:
         return d
+
+
+def _nullable_n(v) -> Optional[float]:
+    """用于均线等可缺失值，避免把 rolling NaN 伪造成 0。"""
+    try:
+        value = float(v)
+        return None if (value != value or value in (float("inf"), float("-inf"))) else value
+    except Exception:
+        return None
 
 
 def _fmt_volume(vol_hand: float) -> str:

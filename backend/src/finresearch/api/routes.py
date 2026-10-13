@@ -17,39 +17,55 @@ import asyncio
 import datetime as dt
 import json
 import logging
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 
-from ..agents.deep.research_agent import build_research_agent
-from ..agents.deep.research_tools import clear_task as research_clear_task, get_stored as research_get_stored
-from ..agents.deep.stream import stream_agent_sse
+from ..agents.deep.research_tools import clear_task as research_clear_task
+from ..agents.deep.research_tools import get_stored as research_get_stored
 from ..agents.graph import get_checkpointer
 from ..agents.prompts import CHART_SYSTEM
-from ..tools import export, now_iso
-from ..tools.secrets import decrypt_config, encrypt_config
-from ..tools.context import build_chart_context, recent_diagnostics as context_diagnostics
-from ..tools.context_store import delete_conversation_data, media_path, offload_message_media
 from ..config import settings
 from ..db.models import ChatContextSummary, ChatConversation, ChatDelta, LocalSetting, Report, ResearchTask
 from ..db.session import db_ping, session_scope
-from ..llm import build_chart_llm, build_llm, llm_available, resolved_chart_model
+from ..llm import build_chart_llm, build_llm, llm_available, model_window_tokens, resolved_chart_model
+from ..tools import export, now_iso
+from ..tools.context import build_chart_context
+from ..tools.context import recent_diagnostics as context_diagnostics
+from ..tools.context_store import (
+    delete_conversation_data,
+    image_asset_data_urls,
+    image_asset_path,
+    image_asset_urls,
+    media_path,
+    offload_message_media,
+    save_image_asset,
+    validate_legacy_images,
+)
 from ..tools.entity import resolve_entity
 from ..tools.market import (
     get_bid_ask,
+    get_chart_bundle,
     get_indicators,
     get_intraday,
     get_kline,
     get_realtime_quote,
 )
+from ..cache import quote_cache
+from ..tools import kb as tools_kb
+from ..tools import memory as tools_memory
+from ..agents.deep.research_agent import build_research_agent
+from ..agents.deep.stream import stream_agent_sse, tool_label
+from ..tools.market_provider import index_overview
 from ..tools.report import DISCLAIMER
+from ..tools.secrets import decrypt_config, encrypt_config
+from ..tools.text import strip_md
 from . import sse
 
 logger = logging.getLogger(__name__)
@@ -84,6 +100,61 @@ class _ResearchRuntime:
 _RESEARCH_RUNS: dict[str, _ResearchRuntime] = {}
 
 
+def _coalesce_history_append(history: list, frame: str, cap: int = 600) -> None:
+    """研究流回放历史的段级折叠：同段连续的 section_token 合并为一帧。
+
+    直播订阅者仍逐帧收到（打字机效果不受影响），折叠只作用于重连回放：
+    真流式下 section_token 逐 chunk 一帧，3000 字报告即数千帧，600 帧上限
+    必然先裁掉最早的段——刷新后前几段丢失，直到末尾 done 才补齐。
+    折叠后每段至多占 1-2 帧，600 帧足以覆盖完整报告。
+    """
+
+    def _parse(item: str):
+        try:
+            payload = json.loads(item[6:].strip()) if item.startswith("data: ") else None
+        except Exception:  # noqa: BLE001
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    payload = _parse(frame)
+    if payload is not None and payload.get("type") == "section_token" and history:
+        last = _parse(history[-1])
+        if (
+            isinstance(last, dict)
+            and last.get("type") in ("section_token", "summary_token")
+            and (last.get("title") == payload.get("title") or (last.get("type") == "summary_token" and payload.get("type") == "summary_token"))
+        ):
+            merged = {
+                **last,
+                "text": str(last.get("text", "")) + str(payload.get("text", "")),
+            }
+            history[-1] = sse.sse(merged)
+            return
+    history.append(frame)
+    if len(history) > cap:
+        del history[: len(history) - cap]
+
+# 每会话串行锁：send_chat_message 全程持有（请求体开始 → 流式生成器结束）。
+# 同一会话并发请求会因 _chat_next_seq 读最大值+1 且无唯一约束而写出重复 seq，
+# 并以同一 thread_id 并发写 LangGraph 检查点——历史乱序/回复串台的根源。
+# 家用单进程场景锁常驻内存（数量 = 会话数），不做淘汰。
+_CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+
+# 对话流心跳间隔：与 research_stream 的 10s 对齐。前端 dispatch 未识别的类型直接忽略。
+_CHAT_HEARTBEAT_S = 10.0
+
+# 研究运行时终态后的保留时长（秒）：供断线重连回放，到期回收防内存无限增长。
+_RUNTIME_TTL_S = 30 * 60
+
+
+def _chat_lock(conversation_id: str) -> asyncio.Lock:
+    lock = _CHAT_LOCKS.get(conversation_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAT_LOCKS[conversation_id] = lock
+    return lock
+
+
 async def _mark_research_interrupted(task_id: str, message: str) -> None:
     async with session_scope() as s:
         if s is None:
@@ -108,9 +179,7 @@ def _start_research_runtime(
     async def pump() -> None:
         try:
             async for frame in factory():
-                runtime.history.append(frame)
-                if len(runtime.history) > 600:
-                    del runtime.history[: len(runtime.history) - 600]
+                _coalesce_history_append(runtime.history, frame)
                 for queue in tuple(runtime.subscribers):
                     queue.put_nowait(frame)
         except asyncio.CancelledError:
@@ -127,6 +196,17 @@ def _start_research_runtime(
             runtime.terminal = True
             for queue in tuple(runtime.subscribers):
                 queue.put_nowait(None)
+            # 终态延迟回收：留 TTL 窗口供断线重连回放（history 尾部含 done 帧），
+            # 到期后从 _RESEARCH_RUNS/_TASK_LLM 移除——曾经完成的运行时永不回收，
+            # 每个任务连 history 与明文模型配置一起常驻内存，长期使用无限累积。
+            # 回收后重连走 DB 路径（done 任务读库返回终态帧，不会重跑）。
+            async def _reap_later() -> None:
+                await asyncio.sleep(_RUNTIME_TTL_S)
+                if _RESEARCH_RUNS.get(task_id) is runtime:
+                    _RESEARCH_RUNS.pop(task_id, None)
+                    _TASK_LLM.pop(task_id, None)
+
+            asyncio.create_task(_reap_later(), name=f"research-reap:{task_id}")
 
     runtime.task = asyncio.create_task(pump(), name=f"research:{task_id}")
     return runtime
@@ -179,6 +259,9 @@ async def intraday(code: str) -> dict:
 @router.get("/quote/{code}/kline")
 async def kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     """日K：返回 {data, provenance{...,attempts[]}, trading_date, elapsed_ms}（含来源/失败原因/耗时）。"""
+    # 与 agent 工具层同理设防：n 无上界时单次可抓 900 根（响应数 MB），请求量与
+    # 返回量静默不符（_MAX_FETCH 截断）。图表页正常用量 ≤250。
+    n = max(5, min(int(n or 60), 250))
     return await _market_call(get_kline, code, n, adjust)
 
 
@@ -192,9 +275,124 @@ async def indicators(code: str) -> list:
     return (await _market_call(get_indicators, code)).get("data", [])
 
 
+@router.get("/quote/{code}/chart-bundle")
+async def chart_bundle(code: str, n: int = 120, adjust: str = "qfq") -> dict:
+    """行情分析页聚合数据；一次 K 线计算蜡烛与完整指标序列。"""
+    return await _market_call(get_chart_bundle, code, n, adjust)
+
+
 # ────────────────────────────────────────────────────────────
 # 诊断（默认零网络快速；?refresh=1 才现场探测）
 # ────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
+# 知识库（用户文档上传 → 解析 → 分块 → 嵌入 rag.db）
+# ────────────────────────────────────────────────────────────
+@router.post("/kb/documents")
+async def kb_upload_document(request: Request) -> dict:
+    """上传用户文档（txt/md/pdf/docx，≤20MB）。文件名经 X-Filename 头传递（URL 编码）。"""
+    from urllib.parse import unquote
+
+    try:
+        content_length = int(request.headers.get("content-length") or 0)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid content-length") from exc
+    if content_length > 20 * 1024 * 1024:
+        raise HTTPException(413, "文档不能超过 20MB")
+    filename = unquote(request.headers.get("x-filename") or "").strip()
+    if not filename:
+        raise HTTPException(400, "缺少 X-Filename 头（URL 编码的文件名）")
+    if "/" in filename or "\\" in filename:
+        raise HTTPException(400, "文件名不能包含路径分隔符")
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(400, "文档内容为空")
+    if not tools_memory.memory_available():
+        raise HTTPException(503, "记忆/知识库未启用（向量库不可用）")
+    try:
+        meta = await asyncio.to_thread(tools_kb.ingest_document_sync, filename, raw)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("知识库文档入库失败")
+        raise HTTPException(500, f"文档解析失败：{exc}") from exc
+    return {"document": meta}
+
+
+@router.get("/kb/documents")
+async def kb_list_documents() -> dict:
+    return {"documents": await asyncio.to_thread(tools_kb.list_documents_sync)}
+
+
+@router.delete("/kb/documents/{doc_id}")
+async def kb_delete_document(doc_id: str) -> dict:
+    ok = await asyncio.to_thread(tools_kb.delete_document_sync, doc_id)
+    if not ok:
+        raise HTTPException(404, "document not found")
+    return {"ok": True}
+
+
+@router.get("/memory/embedding")
+async def memory_embedding_config() -> dict:
+    """当前记忆嵌入配置（模式/模型/维度/向量数）。"""
+    return await tools_memory.get_embedding_config()
+
+
+class EmbeddingConfigRequest(BaseModel):
+    base_url: str
+    api_key: str
+    model: str
+
+
+@router.post("/memory/embedding")
+async def memory_embedding_save(req: EmbeddingConfigRequest) -> dict:
+    """保存供应商嵌入配置：探测连通性 → 加密落库 → 重建向量库。"""
+    if not tools_memory.memory_available():
+        raise HTTPException(503, "记忆/知识库未启用")
+    try:
+        return await tools_memory.save_embedding_config(req.base_url, req.api_key, req.model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        # 探测失败（401/模型名错/网络）——给可操作的报文，不泄漏完整堆栈
+        msg = str(exc)
+        if "401" in msg or "Unauthorized" in msg:
+            friendly = "认证失败（401）：API Key 无效"
+        elif "404" in msg or "Not Found" in msg:
+            friendly = "接口不存在（404）：请检查 Base URL 与向量模型名"
+        elif "429" in msg:
+            friendly = "请求过于频繁（429）：请稍后重试"
+        else:
+            friendly = f"嵌入接口调用失败：{msg[:120]}"
+        raise HTTPException(400, friendly) from exc
+
+
+@router.delete("/memory/embedding")
+async def memory_embedding_clear() -> dict:
+    """清除供应商嵌入，回到本地哈希档并重建。"""
+    if not tools_memory.memory_available():
+        raise HTTPException(503, "记忆/知识库未启用")
+    return await tools_memory.clear_embedding_config()
+
+
+@router.get("/kb/search")
+async def kb_search(q: str, limit: int = 5) -> dict:
+    """知识库检索测试（agent 对话走全域 search_memory，这里供 UI 验证）。"""
+    if not q.strip():
+        return {"items": []}
+    return await asyncio.to_thread(tools_kb.search_documents_sync, q, limit)
+
+
+@router.get("/market/indexes")
+async def market_indexes() -> dict:
+    """大盘指数条（上证/深成/创业板/科创50/沪深300 一次批量）。3 秒缓存供多卡轮询共享。"""
+    cached = quote_cache.get("index_overview")
+    if cached is not None:
+        return cached
+    result = await asyncio.to_thread(index_overview)
+    quote_cache.set("index_overview", result, ttl=3)
+    return result
+
+
 @router.get("/market/diagnostics")
 async def market_diagnostics(refresh: bool = False) -> dict:
     from ..tools.diagnostics import get_market_diagnostics, get_market_diagnostics_fast
@@ -278,10 +476,21 @@ class ChatCreateRequest(BaseModel):
     snapshot_interval: int = 8
 
 
+class MarketContextRequest(BaseModel):
+    code: str = Field(pattern=r"^\d{6}\.(?:SH|SZ|BJ)$")
+    kind: Literal["intraday", "kline"]
+    adjust: Literal["qfq", "hfq", ""] = "qfq"
+    visible_start: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    visible_end: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    indicator: Optional[Literal["MACD", "RSI", "KDJ", "BOLL"]] = None
+
+
 class ChatSendRequest(BaseModel):
-    message: str
+    message: str = ""
     llm: Optional[dict] = None
-    images: list[str] = []  # base64 data URL（多模态图片，持久化到 delta payload）
+    images: list[str] = Field(default_factory=list)  # 旧版 data URL，只读兼容
+    image_asset_ids: list[str] = Field(default_factory=list)
+    market_context: Optional[MarketContextRequest] = None
 
 
 class ChatArchiveRequest(BaseModel):
@@ -317,6 +526,34 @@ async def _probe_vision(llm, images: list) -> bool:
         return True
 
 
+def _trim_seed_history(history: list, budget_chars: int) -> tuple[list, int]:
+    """播种历史按预算从最新往回保留；返回 (新列表, 被裁掉的条数)。
+
+    空线程播种是一次性把全量 DB 历史塞给 agent：近似 token 计数对中文正文
+    低估约 2 倍，首字前就可能打爆小窗口模型（且播种消息无 usage_metadata，
+    reported-token 触发不可用）。丢最老的历史（DB 仍在），补一条省略说明。
+    """
+    items = list(history or [])
+    kept: list = []
+    used = 0
+    dropped = 0
+    for m in reversed(items):
+        size = len(str(m.get("content") or ""))
+        size += sum(len(str(x)) for x in (m.get("images") or []))
+        if kept and used + size > budget_chars:
+            dropped = len(items) - len(kept)
+            break
+        kept.append(m)
+        used += size
+    if not dropped:
+        return items, 0
+    kept.append({
+        "role": "user",
+        "content": f"（更早的 {dropped} 条历史已省略；如需关键背景可请用户重述。）",
+    })
+    return list(reversed(kept)), dropped
+
+
 async def _deepagent_chat_stream(
     *,
     conv_id: str,
@@ -326,6 +563,8 @@ async def _deepagent_chat_stream(
     llm_cfg: Optional[dict],
     images: Optional[list] = None,
     user_msg: Optional[dict] = None,
+    market_context: Optional[dict] = None,
+    memory_note: str = "",
 ):
     """deepagents 对话链路：产出 (sse_line, text_piece)。
 
@@ -335,7 +574,28 @@ async def _deepagent_chat_stream(
     from ..tools.context import _to_lc_content
 
     checkpointer, _kind = get_checkpointer()
-    agent = build_chat_agent(llm_config=llm_cfg, profile=profile, checkpointer=checkpointer)
+    context_note = ""
+    if memory_note:
+        # 归档会话继续对话时以摘要恢复上下文（"很久之前聊了什么"）
+        context_note = memory_note.strip() + chr(10) * 2
+    if market_context:
+        # 拼接而非覆盖——曾经 if market_context: context_note = (...)
+        # 直接整体重写，两者同现时归档摘要被静默丢弃
+        context_note += (
+            "【当前行情页面上下文】\n"
+            f"用户正在查看标的 {market_context.get('code')}，图表类型 {market_context.get('kind')}，"
+            f"复权 {market_context.get('adjust') or 'qfq'}，可见区间 "
+            f"{market_context.get('visible_start') or '未指定'} 至 {market_context.get('visible_end') or '未指定'}，"
+            f"所选指标 {market_context.get('indicator') or '未指定'}。\n"
+            "这些字段只描述界面选择，不包含可信行情数值。回答任何价格、涨跌、指标或趋势问题前，"
+            "必须调用对应行情工具重新核验，不得根据界面上下文猜测数值。"
+        )
+    agent = build_chat_agent(
+        llm_config=llm_cfg,
+        profile=profile,
+        context_note=context_note,
+        checkpointer=checkpointer,
+    )
     if agent is None:
         return
 
@@ -353,6 +613,8 @@ async def _deepagent_chat_stream(
         if probe_llm is not None and not await _probe_vision(probe_llm, images):
             note = f"（当前模型不支持图片识别，已忽略 {len(images)} 张图片，仅根据文字回复。）\n\n"
             images = None
+            if not text.strip():
+                text = "用户仅发送了图片；当前模型不支持视觉，请提示用户补充文字描述后再分析。"
 
     def _content(msg: dict):
         """带图消息 → 多模态 content blocks；无图 → 纯字符串。复用既有转换，不另造。"""
@@ -363,6 +625,7 @@ async def _deepagent_chat_stream(
     # 一无所知——而界面上明明白白显示着历史，用户会觉得"它失忆了"。
     # 所以线程为空时用 DB 历史播种一次，之后每轮只发增量（history 末条就是本轮提问，不会重复）。
     this_turn = dict(user_msg or {"role": "user", "content": text})
+    this_turn["content"] = text
     if images:
         this_turn["images"] = images
     else:
@@ -378,20 +641,33 @@ async def _deepagent_chat_stream(
     if seeded:
         msgs = [{"role": "user", "content": _content(this_turn)}]
     else:
+        seed_history = [*list(history or [])[:-1], this_turn] if history else [this_turn]
+        # 播种预算：窗口的 40% token 折成字符（中文按 1.5 字符/token 保守估）。
+        # 无模型名信息时 model_window_tokens 回落 32K 最保守档。
+        seed_model = (llm_cfg or {}).get("model") or settings.llm_model or ""
+        seed_budget = int(model_window_tokens(seed_model) * 0.4 * 1.5)
+        seed_history, _dropped = _trim_seed_history(seed_history, seed_budget)
+        if images is None:
+            seed_history = [{key: value for key, value in message.items() if key != "images"} for message in seed_history]
         msgs = [
             {"role": m.get("role") or "user", "content": _content(m)}
-            for m in (history or [])
+            for m in seed_history
             if (m.get("content") or "").strip() or m.get("images")
         ] or [{"role": "user", "content": _content(this_turn)}]
 
     if note:
-        yield sse.ev_token(note), note
+        yield sse.ev_warning(note.strip()), ""
 
     async for line, piece in stream_agent_sse(agent, {"messages": msgs}, config):
         yield line, piece
 
 
-def _chat_msg(role: str, content: str, images: Optional[list[str]] = None) -> dict:
+def _chat_msg(
+    role: str,
+    content: str,
+    images: Optional[list[str]] = None,
+    image_asset_ids: Optional[list[str]] = None,
+) -> dict:
     msg = {
         "id": uuid.uuid4().hex,
         "role": role,
@@ -400,6 +676,8 @@ def _chat_msg(role: str, content: str, images: Optional[list[str]] = None) -> di
     }
     if images:
         msg["images"] = images
+    if image_asset_ids:
+        msg["image_asset_ids"] = image_asset_ids
     return msg
 
 
@@ -498,15 +776,64 @@ async def context_media(conversation_id: str, filename: str):
     return FileResponse(path)
 
 
+@router.post("/assets/images")
+async def upload_image_asset(request: Request) -> dict:
+    """保存受控图片资产；响应只暴露 asset_id 与同源 URL。"""
+    try:
+        content_length = int(request.headers.get("content-length") or 0)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid content-length") from exc
+    if content_length > 5 * 1024 * 1024:
+        raise HTTPException(413, "单张图片不能超过 5MB")
+    raw = await request.body()
+    try:
+        return await asyncio.to_thread(
+            save_image_asset,
+            raw,
+            request.headers.get("content-type", ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/assets/images/{asset_id}")
+async def get_image_asset(asset_id: str):
+    try:
+        path, mime = await asyncio.to_thread(image_asset_path, asset_id)
+    except ValueError as exc:
+        raise HTTPException(400, "invalid asset_id") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "asset not found") from exc
+    return FileResponse(path, media_type=mime)
+
+
+def _utc_iso(v) -> str:
+    """DB 时间戳 → 带时区 ISO 串。
+
+    SQLite 的 CURRENT_TIMESTAMP 是 UTC naive，裸 isoformat() 出来的串没有时区，
+    前端 new Date() 会按本地时区解析（中国差 8 小时：晚上创建的会话显示成下午）。
+    统一按 UTC 解释并补上时区再输出。
+    """
+    if v is None:
+        return ""
+    d = v if v.tzinfo is not None else v.replace(tzinfo=dt.UTC)
+    return d.astimezone(dt.UTC).isoformat()
+
+
 def _chat_meta(conv: ChatConversation, messages: Optional[list[dict]] = None) -> dict:
+    stored_model = conv.model_config or {}
     return {
         "id": conv.id,
         "title": conv.title,
         "snapshot_interval": conv.snapshot_interval,
-        "model_config": conv.model_config,
-        "archived_at": conv.archived_at.isoformat() if conv.archived_at else None,
-        "created_at": conv.created_at.isoformat() if conv.created_at else "",
-        "updated_at": conv.updated_at.isoformat() if conv.updated_at else "",
+        "model_config": {
+            "model": stored_model.get("model", ""),
+            "reasoning_effort": stored_model.get("reasoning_effort", "low"),
+            "configured": bool(stored_model.get("api_key")),
+        } if stored_model else None,
+        "archived_at": _utc_iso(conv.archived_at) or None,
+        "created_at": _utc_iso(conv.created_at),
+        "updated_at": _utc_iso(conv.updated_at),
         "message_count": len(messages) if messages is not None else None,
     }
 
@@ -559,18 +886,33 @@ async def archive_chat_conversation(conversation_id: str, req: ChatArchiveReques
 
 @router.delete("/chat/conversations/{conversation_id}")
 async def delete_chat_conversation(conversation_id: str) -> dict:
-    async with session_scope() as s:
-        if s is None:
-            raise HTTPException(503, "local database unavailable")
-        conv = await s.get(ChatConversation, conversation_id)
-        if not conv:
-            raise HTTPException(404, "conversation not found")
-        await s.execute(delete(ChatDelta).where(ChatDelta.conversation_id == conversation_id))
-        await s.execute(delete(ChatContextSummary).where(ChatContextSummary.conversation_id == conversation_id))
-        await s.delete(conv)
-        await s.commit()
-        await asyncio.to_thread(delete_conversation_data, conversation_id)
-        return {"ok": True, "channel": "deltachannel"}
+    # 持会话锁删除：若该会话还有流式回复在跑，等它结束再删，避免删掉历史后
+    # 流末尾的落库又把助手回复写回来（复活出半个会话）
+    async with _chat_lock(conversation_id):
+        async with session_scope() as s:
+            if s is None:
+                raise HTTPException(503, "local database unavailable")
+            conv = await s.get(ChatConversation, conversation_id)
+            if not conv:
+                raise HTTPException(404, "conversation not found")
+            await s.execute(delete(ChatDelta).where(ChatDelta.conversation_id == conversation_id))
+            await s.execute(delete(ChatContextSummary).where(ChatContextSummary.conversation_id == conversation_id))
+            await s.execute(
+                delete(LocalSetting).where(LocalSetting.key == f"context-diag:chat:{conversation_id}")
+            )
+            await s.delete(conv)
+            await s.commit()
+        # 检查点线程也删（报告链路 delete_report 早就做了，这里补齐）：
+        # 每轮对话都向 finresearch.db 写含完整消息日志的检查点，不删则
+        # 删掉的会话数据永久残留，SQLite 文件无限膨胀
+        cp, _kind = get_checkpointer()
+        if cp is not None and hasattr(cp, "adelete_thread"):
+            try:
+                await cp.adelete_thread(conversation_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("删除会话检查点线程失败 conversation=%s：%s", conversation_id, e)
+    await asyncio.to_thread(delete_conversation_data, conversation_id)
+    return {"ok": True, "channel": "deltachannel"}
 
 
 @router.get("/chat/conversations/{conversation_id}")
@@ -585,44 +927,9 @@ async def get_chat_conversation(conversation_id: str) -> dict:
         return {"conversation": _chat_meta(conv, messages), "messages": messages, "channel": "deltachannel"}
 
 
-# Markdown 清洗：只删「处在语法位置」的符号，不做无差别字符删除。
-#
-# 旧实现最后三行是 text.replace("*","").replace("`","").replace("#","")——
-# 它把 3*5 变成 35、把「排名 #1」变成「排名 1」。之所以敢这么写，是因为它被**逐 token**
-# 调用：`**` 可能被切成两个 token，成对的正则永远匹配不上，只好按字符删。
-#
-# 正确的做法是不要逐 token 清洗：流式原样透传，前端 StructuredText 每次渲染都对
-# 「已累积的完整文本」做一次防御性清洗，成对标记因此总是完整的；后端只在落库前清洗一次。
-_MD_FENCE = re.compile(r"```[A-Za-z0-9_+-]*\n?")          # 代码块围栏（含语言标注）
-_MD_INLINE_CODE = re.compile(r"`([^`\n]+)`")              # `code` → code
-_MD_BOLD = re.compile(r"\*\*(?=\S)([\s\S]+?)(?<=\S)\*\*")  # **粗** → 粗
-_MD_BOLD_U = re.compile(r"__(?=\S)([\s\S]+?)(?<=\S)__")
-# 斜体：两侧不能紧邻单词字符，避免吃掉 3*5 与 snake_case
-_MD_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
-_MD_ITALIC_U = re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
-# 标题：行首 #，后接空格或非数字（保住「#1 排名」）
-_MD_HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}(?:[ \t]+|(?=[^\s\d#]))")
-_MD_BULLET = re.compile(r"(?m)^[ \t]*[-*+][ \t]+")        # 行首 - / * / + 列表
-# 流式尾部的半截标记（连同它前面的空白一起裁掉）。不含 #，否则会吃掉结尾的「C#」
-_MD_TRAILING = re.compile(r"[ \t]*(?:\*{1,2}|_{1,2}|`{1,3})[ \t]*$")
-
-
-def _strip_md(text: str) -> str:
-    """把 Markdown 语法转成纯文本（"杜绝 .md"），但不误伤正文里的 * # _ ` 字符。
-
-    只在**完整文本**上调用（落库前）。逐 token 调用会让成对标记匹配不上。
-    """
-    if not text:
-        return text
-    text = _MD_FENCE.sub("", text)
-    text = _MD_INLINE_CODE.sub(r"\1", text)
-    text = _MD_BOLD.sub(r"\1", text)
-    text = _MD_BOLD_U.sub(r"\1", text)
-    text = _MD_ITALIC.sub(r"\1", text)
-    text = _MD_ITALIC_U.sub(r"\1", text)
-    text = _MD_HEADING.sub("", text)
-    text = _MD_BULLET.sub("· ", text)
-    return _MD_TRAILING.sub("", text)
+# Markdown 清洗实现搬到 tools/text.py：报告链路也要用同一份，
+# 否则"杜绝 .md"只在对话链路生效（报告正文里的 **加粗** 会原样显示成字面符号）。
+_strip_md = strip_md
 
 
 @router.post("/chat/conversations/{conversation_id}/messages")
@@ -630,124 +937,234 @@ async def send_chat_message(conversation_id: str, req: ChatSendRequest):
     """流式对话：POST 返回 text/event-stream。
 
     事件序列：stage(understanding/thinking/composing) → 多个 token → done(含 conversation/messages/reply)。
-    用户消息在流式开始前持久化（独立 session 提交）；助手回复在流式结束后持久化。
+    用户消息在流式开始前持久化（独立 session 提交）；助手回复在流式结束后持久化；
+    流式中断/异常时把已流出的半截回复也落库，保证 DB 与 LangGraph 检查点不分叉。
     前端用 fetch + ReadableStream 解析（EventSource 仅支持 GET，无法带 llm body）。
     """
+    # 每会话串行锁：同一会话并发两条消息会各算出相同 seq（_chat_next_seq 读最大值+1，
+    # (conversation_id, seq) 无唯一约束）并以同一 thread_id 并发写检查点——
+    # 历史乱序、回复串台的根源。锁在请求体开始前获取、gen() 结束时释放（全程串行）。
+    lock = _chat_lock(conversation_id)
+    # 有界等待：曾经无限等待——锁泄漏（SSE 流从未被迭代时 finally 不执行）会让
+    # 该会话的下一条消息永久挂起，前端 fetch 无超时 → loading 永远 true → 输入被锁
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=180)
+    except asyncio.TimeoutError:
+        raise HTTPException(409, "上一条回复仍在处理中（超过 3 分钟），请稍后重试或刷新页面。")
     text = (req.message or "").strip()
-    if not text:
-        raise HTTPException(400, "message is empty")
+    try:
+        asset_ids = list(dict.fromkeys(req.image_asset_ids or []))
+        if len(asset_ids) + len(req.images or []) > 4:
+            raise HTTPException(400, "每条消息最多上传 4 张图片")
+        try:
+            validate_legacy_images(req.images)
+            await asyncio.to_thread(image_asset_urls, asset_ids)
+            asset_data_urls = await asyncio.to_thread(image_asset_data_urls, asset_ids)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        model_images = [*(req.images or []), *asset_data_urls]
+        if not text and not model_images:
+            raise HTTPException(400, "message is empty")
 
-    # 1) 持久化用户消息（独立 session，提交后才进入流式，确保即使流式中断也保留提问）
-    async with session_scope() as s:
-        if s is None:
-            raise HTTPException(503, "local database unavailable")
-        conv = await s.get(ChatConversation, conversation_id)
-        if not conv:
-            raise HTTPException(404, "conversation not found")
-        history = await _chat_history(s, conversation_id)
-        user_msg = _chat_msg("user", text, images=req.images)
-        history = await _chat_append(s, conv, user_msg, history)
-        if req.llm is not None:
-            conv.model_config = encrypt_config(req.llm)
-        if conv.title == "新对话":
-            conv.title = text[:36]
-        conv.updated_at = dt.datetime.now(dt.UTC)
-        await s.commit()
-        conv_id = conv.id
-        llm_cfg = req.llm or decrypt_config(conv.model_config)
-        history_snapshot = list(history)
-        # 数据库存引用，当前这一轮仍把原始 data URL 交给视觉模型。
-        if req.images and history_snapshot:
-            history_snapshot[-1] = user_msg
-        # 加载本地用户画像（默认稳健研究型），供上下文治理注入 system prompt
-        # or {}（而非 or None）：缺行或空 payload 时交给 render_profile_block 逐字段回填 DEFAULT_PROFILE
-        prof_row = await s.get(LocalSetting, "user-profile")
-        user_profile = (prof_row.payload if prof_row else None) or {}
-        summary_row = await s.get(ChatContextSummary, conv_id)
-        summary_snapshot = ({
-            "cutoff_count": summary_row.cutoff_count,
-            "summary": summary_row.summary,
-            "history_path": summary_row.history_path,
-        } if summary_row else None)
+        # 1) 持久化用户消息（独立 session，提交后才进入流式，确保即使流式中断也保留提问）
+        async with session_scope() as s:
+            if s is None:
+                raise HTTPException(503, "local database unavailable")
+            conv = await s.get(ChatConversation, conversation_id)
+            if not conv:
+                raise HTTPException(404, "conversation not found")
+            history = await _chat_history(s, conversation_id)
+            user_msg = _chat_msg(
+                "user",
+                text,
+                images=req.images or None,
+                image_asset_ids=asset_ids or None,
+            )
+            history = await _chat_append(s, conv, user_msg, history)
+            if req.llm is not None:
+                conv.model_config = encrypt_config(req.llm)
+            if conv.title == "新对话":
+                conv.title = text[:36] or "图片分析"
+            conv.updated_at = dt.datetime.now(dt.UTC)
+            await s.commit()
+            conv_id = conv.id
+            llm_cfg = req.llm or decrypt_config(conv.model_config)
+            history_snapshot = list(history)
+            # 数据库存 asset_id，进入模型前才按需读取为 data URL；公共消息不暴露真实路径。
+            for index, stored_message in enumerate(history_snapshot):
+                stored_asset_ids = list(stored_message.get("image_asset_ids") or [])
+                if not stored_asset_ids:
+                    continue
+                model_message = dict(stored_message)
+                try:
+                    model_message["images"] = await asyncio.to_thread(
+                        image_asset_data_urls,
+                        stored_asset_ids,
+                    )
+                except (ValueError, FileNotFoundError):
+                    model_message["images"] = []
+                history_snapshot[index] = model_message
+            if model_images and history_snapshot:
+                model_message = dict(history_snapshot[-1])
+                model_message["images"] = model_images
+                history_snapshot[-1] = model_message
+            # 加载本地用户画像（默认稳健研究型），供上下文治理注入 system prompt
+            # or {}（而非 or None）：缺行或空 payload 时交给 render_profile_block 逐字段回填 DEFAULT_PROFILE
+            prof_row = await s.get(LocalSetting, "user-profile")
+            user_profile = (prof_row.payload if prof_row else None) or {}
+        # 行级消息为空且存在归档摘要 → 以摘要恢复上下文（会话被生命周期归档后继续聊）
+        memory_note = ""
+        if not history:
+            summary = await tools_memory.archived_summary(conversation_id)
+            if summary:
+                memory_note = "【本会话更早内容的机器摘要（原文已归档压缩）】" + chr(10) + summary
+    except BaseException:
+        lock.release()
+        raise
 
     # 只判"有没有配模型"，不在这里构造模型：真正要用的那个由 build_chat_agent 内部建，
     # 这里再建一个只为判空是白白多造一套 httpx 客户端。
     has_model = llm_available(llm_cfg)
 
-    async def gen():
-        nonlocal summary_snapshot
-        # 统一闭环：无论是否有模型/是否出错，都最终持久化助手回复并发 done。
-        reply_text = ""
+    async def _persist_assistant_reply(content: str) -> None:
+        """把助手回复（含中断/失败时已流出的半截）落库。独立 session，尽力而为，绝不向上抛。"""
+        content = (content or "").strip()
+        if not content:
+            return
+        try:
+            async with session_scope() as s:
+                if s is None:
+                    return
+                conv2 = await s.get(ChatConversation, conv_id)
+                if conv2 is not None:
+                    history2 = await _chat_history(s, conv_id)
+                    await _chat_append(s, conv2, _chat_msg("assistant", content), history2)
+                    await s.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("助手回复落库失败（conversation=%s）", conv_id, exc_info=True)
 
-        if not has_model:
-            # 无模型：不是 transient error，给出可操作提示并正常闭环（发 token + 持久化 + done）
-            reply_text = (
-                "⚠️ 当前还没有可用模型。\n\n"
-                "请在「模型配置」中保存 API Key 与模型，再回到对话继续提问。"
-            )
-            yield sse.ev_chat_stage("composing", "正在组织回复")
-            await asyncio.sleep(0.1)
-            yield sse.ev_token(reply_text)
-        else:
-            # deepagents 是唯一实现。原先这里还有一条 legacy 分支（detect_ticker 预取行情 +
-            # build_chat_context 手写上下文 + 裸 llm.astream），已整体移除——它的每一项能力
-            # 都在 agent 链路里有对应实现，且更强：
-            #   detect_ticker 单标的预取  → agent 按需自己调 resolve_entity/get_realtime_quote，
-            #                               且能一轮里查多个标的（"茅台和五粮液比一下"）
-            #   build_chat_context 手写摘记 → SummarizationMiddleware（含历史卸载到文件系统）
-            #   offload/retrieve 原文取回   → FilesystemMiddleware，agent 按需自己 read_file
-            #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
-            try:
-                async for _line, _piece in _deepagent_chat_stream(
+    async def gen():
+        reply_text = ""
+        try:
+
+            if not has_model:
+                # 无模型：不是 transient error，给出可操作提示并正常闭环（发 token + 持久化 + done）
+                reply_text = (
+                    "⚠️ 当前还没有可用模型。\n\n"
+                    "请在「模型配置」中保存 API Key 与模型，再回到对话继续提问。"
+                )
+                yield sse.ev_chat_stage("composing", "正在组织回复")
+                await asyncio.sleep(0.1)
+                yield sse.ev_token(reply_text)
+            else:
+                # deepagents 是唯一实现。原先这里还有一条 legacy 分支（detect_ticker 预取行情 +
+                # build_chat_context 手写上下文 + 裸 llm.astream），已整体移除——它的每一项能力
+                # 都在 agent 链路里有对应实现，且更强：
+                #   detect_ticker 单标的预取  → agent 按需自己调 resolve_entity/get_realtime_quote，
+                #                               且能一轮里查多个标的（"茅台和五粮液比一下"）
+                #   build_chat_context 手写摘记 → SummarizationMiddleware（含历史卸载到文件系统）
+                #   offload/retrieve 原文取回   → FilesystemMiddleware，agent 按需自己 read_file
+                #   含图 try-with-fallback      → _probe_vision（先探再跑，见其 docstring）
+                stream = _deepagent_chat_stream(
                     conv_id=conv_id,
                     text=text,
                     history=history_snapshot,
                     profile=user_profile,
                     llm_cfg=llm_cfg,
-                    images=req.images,
+                    images=model_images,
                     user_msg=history_snapshot[-1] if history_snapshot else None,
-                ):
-                    yield _line
-                    reply_text += _piece
-            except Exception as e:  # noqa: BLE001
-                logger.exception("对话链路失败")
-                # 已流式输出的部分保留；补失败说明后照常持久化 + done（闭环）
-                note = f"\n\n⚠️ 模型调用失败：{e}"
-                reply_text = (reply_text + note).strip() or note.strip()
-                yield sse.ev_error(str(e))
-            if not reply_text:
-                reply_text = "⚠️ 模型返回为空。可以换一个模型或把问题拆得更具体。"
-                yield sse.ev_token(reply_text)
+                    market_context=(
+                        req.market_context.model_dump(exclude_none=True)
+                        if req.market_context
+                        else None
+                    ),
+                    memory_note=memory_note,
+                )
+                # 手动迭代以注入心跳：模型首字静默期（推理模型可达分钟级）若无字节下发，
+                # 代理/网关会按空闲超时掐断连接。不能用 wait_for 包 __anext__——超时会
+                # 取消掉底层流；改为挂 task + asyncio.wait(timeout)，超时只补心跳不动流。
+                nxt: Optional[asyncio.Task] = None
+                try:
+                    while True:
+                        if nxt is None:
+                            nxt = asyncio.ensure_future(stream.__anext__())
+                        done, _pending = await asyncio.wait({nxt}, timeout=_CHAT_HEARTBEAT_S)
+                        if not done:
+                            yield sse.sse({"type": "heartbeat"})
+                            continue
+                        try:
+                            item = nxt.result()
+                        except StopAsyncIteration:
+                            break
+                        nxt = None
+                        _line, _piece = item
+                        yield _line
+                        reply_text += _piece
+                except (asyncio.CancelledError, GeneratorExit):
+                    # 客户端断开（刷新/关窗/断网）：已流出的半截回复必须落库——
+                    # 检查点已按轮持久化这轮对话，DB 若缺这条，界面与模型记忆将永久分叉
+                    # （下一轮模型说"如我刚才所说"，界面上却没有那条回答）。
+                    try:
+                        await _persist_assistant_reply(_strip_md(reply_text) + "…（回复被中断）")
+                    finally:
+                        raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("对话链路失败")
+                    # 已流出的半截同样落库，刷新后问题不再悬空无答
+                    await _persist_assistant_reply(_strip_md(reply_text) + "…（回复中断）")
+                    yield sse.ev_error("模型调用失败，请检查模型配置或稍后重试。")
+                    return
+                finally:
+                    # 客户端断开时终止挂起的流读取，避免后台继续消费模型输出
+                    if nxt is not None and not nxt.done():
+                        nxt.cancel()
+                if not reply_text:
+                    reply_text = "⚠️ 模型返回为空。可以换一个模型或把问题拆得更具体。"
+                    yield sse.ev_token(reply_text)
 
-        # 落库前对完整文本再清洗一次（状态安全网：兜住逐 token 清洗无法处理的跨 token 拼接，如 ** 重组）
-        reply_text = _strip_md(reply_text)
+            # 落库前对完整文本再清洗一次（状态安全网：兜住逐 token 清洗无法处理的跨 token 拼接，如 ** 重组）
+            reply_text = _strip_md(reply_text)
 
-        # 2) 持久化助手回复（独立 session）——统一闭环
-        assistant_msg = _chat_msg("assistant", reply_text)
-        final_meta = None
-        final_messages: list = []
-        async with session_scope() as s:
-            if s is not None:
-                conv2 = await s.get(ChatConversation, conv_id)
-                if conv2 is not None:
-                    history2 = await _chat_history(s, conv_id)
-                    history2 = await _chat_append(s, conv2, assistant_msg, history2)
-                    await s.commit()
-                    await s.refresh(conv2)
-                    final_meta = _chat_meta(conv2, history2)
-                    final_messages = history2
-        yield sse.sse({
-            "type": "done",
-            "conversation": final_meta,
-            "messages": final_messages,
-            "reply": assistant_msg,
-            "channel": "deltachannel",
-        })
+            # 2) 持久化助手回复（独立 session）——统一闭环
+            assistant_msg = _chat_msg("assistant", reply_text)
+            final_meta = None
+            final_messages: list = []
+            async with session_scope() as s:
+                if s is not None:
+                    conv2 = await s.get(ChatConversation, conv_id)
+                    if conv2 is not None:
+                        history2 = await _chat_history(s, conv_id)
+                        history2 = await _chat_append(s, conv2, assistant_msg, history2)
+                        await s.commit()
+                        await s.refresh(conv2)
+                        final_meta = _chat_meta(conv2, history2)
+                        final_messages = history2
+            yield sse.sse({
+                "type": "done",
+                "conversation": final_meta,
+                "messages": final_messages,
+                "reply": assistant_msg,
+                "channel": "deltachannel",
+            })
+            if tools_memory.memory_available():
+                # 记忆摄入放后台：本轮问答入本地知识库（哈希去重幂等）
+                _title = (final_meta or {}).get("title") or ""
+                asyncio.create_task(asyncio.to_thread(
+                    tools_memory.ingest_exchange_sync, conv_id, _title, text, reply_text
+                ))
+        finally:
+            # 请求全程持有会话锁：gen 正常结束/异常/被取消都在此释放
+            lock.release()
+
+    from starlette.background import BackgroundTask
 
     return StreamingResponse(
         gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        # 兜底释放：Starlette 在客户端断开时不一定拉取 body_iterator，
+        # 从未被迭代的 async generator 的 finally 不会执行 → 锁泄漏到进程结束
+        background=BackgroundTask(lambda: lock.locked() and lock.release()),
     )
 
 
@@ -764,12 +1181,12 @@ def _research_task_meta(t: ResearchTask) -> dict:
         "code": t.code,
         "template": t.template,
         "query": t.query,
-        "status": t.status,        # pending/running/done/error
-        "stage": t.stage,          # pending/entity/research/market/report/done/error
+        "status": "succeeded" if t.status == "done" else t.status,
+        "stage": "succeeded" if t.stage == "done" else t.stage,
         "report_id": t.report_id,
         "error": t.error,
-        "created_at": t.created_at.isoformat() if t.created_at else "",
-        "updated_at": t.updated_at.isoformat() if t.updated_at else "",
+        "created_at": _utc_iso(t.created_at),
+        "updated_at": _utc_iso(t.updated_at),
     }
 
 
@@ -831,8 +1248,12 @@ async def create_research(req: ResearchRequest) -> dict:
                 runtime = _RESEARCH_RUNS.get(existing.id)
                 is_active = bool(runtime and runtime.task and not runtime.task.done())
                 updated = existing.updated_at or existing.created_at
-                now = dt.datetime.now(updated.tzinfo) if updated and updated.tzinfo else dt.datetime.now()
-                age_s = (now - updated).total_seconds() if updated else 9999
+                # SQLite 的 CURRENT_TIMESTAMP 是 UTC naive（PG 是 aware）：统一按 UTC 解释，
+                # 再与 UTC now 相减。曾经 naive-UTC 对本地 naive now 相减，UTC+8 机器上
+                # age_s 恒 ≥28800，pending 30 秒复用窗口永不生效（双击提交即误报"遗留任务"）
+                if updated is not None and updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=dt.UTC)
+                age_s = (dt.datetime.now(dt.UTC) - updated).total_seconds() if updated is not None else 9999.0
                 if is_active or (existing.status == "pending" and age_s <= 30):
                     _remember_task_llm(existing.id, req.llm or decrypt_config(existing.llm_config))
                     return {"task_id": existing.id, "reused": True}
@@ -873,10 +1294,11 @@ async def research_stream(
     """
     # 已结束任务直接回放终态；进程重启后遗留的 running 任务不能凭同一个 checkpoint 暗中重跑。
     terminal_frame: Optional[str] = None
+    existing: Optional[ResearchTask] = None  # 无 DB（s=None）时下面的回放分支引用它，必须先定义
     async with session_scope() as s:
         if s is not None:
             existing = await s.get(ResearchTask, task_id)
-            if existing and existing.status == "done" and existing.report_id:
+            if existing and existing.status in ("done", "succeeded") and existing.report_id:
                 saved = await s.get(Report, existing.report_id)
                 if saved:
                     terminal_frame = sse.sse({
@@ -884,6 +1306,7 @@ async def research_stream(
                     })
             elif existing and existing.status == "error":
                 terminal_frame = sse.ev_error(existing.error or "研究任务失败")
+            # 终态回放时补发 tool_call ok 帧：断线重连后左侧轨迹不再留转圈孤儿
             elif existing and existing.status == "running":
                 runtime = _RESEARCH_RUNS.get(task_id)
                 if not runtime or not runtime.task or runtime.task.done():
@@ -894,7 +1317,28 @@ async def research_stream(
                     terminal_frame = sse.ev_error(existing.error)
 
     if terminal_frame is not None:
+        # 从已持久化的 progress_events 合成 tool_call start+ok 帧（回放真实执行轨迹）。
+        # 只发 ok 不发 start 的话，前端配不上就不渲染芯片——重连后轨迹面板是空的；
+        # start+ok 成对回放，断线重连/切页回来能看到完整的绿色轨迹。
+        replay_frames: list[str] = []
+        if existing is not None:
+            for evt in (existing.progress_events or []):
+                node = evt.get("node") or ""
+                if node and node not in ("_task",):
+                    replay_frames.append(sse.sse({
+                        "type": "tool_call", "name": node,
+                        "label": evt.get("label") or tool_label(node),
+                        "status": "start", "call_id": "",
+                    }))
+                    replay_frames.append(sse.sse({
+                        "type": "tool_call", "name": node,
+                        "label": evt.get("label") or tool_label(node),
+                        "status": "ok", "call_id": "",
+                    }))
+
         async def terminal_gen():
+            for frame in replay_frames:
+                yield frame
             yield terminal_frame
         return StreamingResponse(
             terminal_gen(), media_type="text/event-stream",
@@ -919,6 +1363,19 @@ async def research_stream(
             t.timings = dict(merged)
             await s.commit()
 
+    async def _fail_task(message: str) -> None:
+        """早退路径把任务行标 error——曾经早退只发 ev_error 不回写 DB，任务永久卡 running，
+        列表永远显示'运行中'，重开 stream 还会被误判为'应用重启而中断'。"""
+        async with session_scope() as s:
+            if s is None:
+                return
+            t = await s.get(ResearchTask, task_id)
+            if t is not None and t.status not in ("done", "succeeded", "error"):
+                t.status = "error"
+                t.stage = "error"
+                t.error = message
+                await s.commit()
+
     async def pipeline():
         # 解析任务参数 + LLM 配置（DB 行优先，回退内存）
         code_, tpl_, q_ = code, template, query
@@ -941,11 +1398,12 @@ async def research_stream(
                 prof_row = await s.get(LocalSetting, "user-profile")
                 user_profile = (prof_row.payload if prof_row else None) or {}
         if not code_:
+            await _fail_task("缺少 code（DB 无此任务且未传 code 查询参数）")
             yield sse.ev_error("缺少 code（DB 无此任务且未传 code 查询参数）")
             return
 
-        yield sse.ev_tool(f"开始研究 {code_}")
         await asyncio.sleep(0)
+        from ..agents.deep.research_agent import build_research_agent  # 延迟导入
         agent = build_research_agent(
             task_id=task_id,
             template=tpl_ or "equity_deep",
@@ -954,6 +1412,7 @@ async def research_stream(
             checkpointer=get_checkpointer()[0],
         )
         if agent is None:
+            await _fail_task("模型未配置：请在「模型配置」中保存 API Key 与模型后重试。")
             yield sse.ev_error("模型未配置：请在「模型配置」中保存 API Key 与模型后重试。")
             return
 
@@ -997,15 +1456,18 @@ async def research_stream(
             merged_timings.update(research_get_stored(task_id, "timings", {}) or {})
 
             if not draft:
+                # 取数工具失败时会把真实原因写进 fatal_error。没有它才退回笼统文案——
+                # 只报"数据源可能不可用"的话，用户不知道是哪一步挂了、该重试还是换个说法。
+                reason = research_get_stored(task_id, "fatal_error", "") or "未生成报告草稿（数据源可能不可用）"
                 async with session_scope() as s:
                     if s is not None:
                         t = await s.get(ResearchTask, task_id)
                         if t:
                             t.status = "error"
                             t.stage = "error"
-                            t.error = "未生成报告草稿（数据源可能不可用）"
+                            t.error = reason
                             await s.commit()
-                yield sse.ev_error("未生成报告草稿（数据源可能不可用）")
+                yield sse.ev_error(reason)
                 return
 
             # 1) 先落库报告 + 任务 done/report_id（done 必须在落库后发送）
@@ -1028,11 +1490,18 @@ async def research_stream(
                     )
                     t = await s.get(ResearchTask, task_id)
                     if t:
-                        t.status = "done"
-                        t.stage = "done"
+                        t.status = "succeeded"
+                        t.stage = "succeeded"
                         t.report_id = report_id
                         t.timings = dict(merged_timings)
                     await s.commit()
+
+            if tools_memory.memory_available():
+                # 报告入用户知识库（后台执行；报告是用户成果资产，永久保留可被回忆）
+                asyncio.create_task(asyncio.to_thread(
+                    tools_memory.ingest_report_sync,
+                    report_id, draft, draft.get("ticker", code_), draft.get("name", ""),
+                ))
 
             await _persist_context_diagnostics(
                 "research",
@@ -1045,7 +1514,6 @@ async def research_stream(
             if not summary_streamed:
                 yield sse.sse({"type": "summary", "text": summary})
 
-            yield sse.ev_tool(f"研究任务总耗时 {int((time.perf_counter() - graph_t0) * 1000)}ms")
             # 3) done（落库后），携带真实 report_id
             yield sse.sse({"type": "done", "report_id": report_id, "report": draft})
         except Exception as e:  # noqa: BLE001
@@ -1111,7 +1579,7 @@ async def list_reports(limit: int = 100) -> dict:
             "template": r.template,
             "summary": (r.summary or "")[:300],
             "as_of": r.as_of or "",
-            "created_at": r.created_at.isoformat() if r.created_at else "",
+            "created_at": _utc_iso(r.created_at),
         } for r in rows]}
 
 
@@ -1246,6 +1714,25 @@ async def delete_report(report_id: str) -> dict:
         rt = getattr(runtime, "task", None) if runtime is not None else None
         if rt is not None and not rt.done():
             rt.cancel()
+        # 进程内残留一并清掉，"真删除"不能只删 DB：
+        # _STORE 存着被删报告的完整正文/K线/新闻素材；_TASK_LLM 存着含明文 api_key
+        # 的模型配置；context-diag 行是诊断环形缓冲快照
+        research_clear_task(task_id)
+        _TASK_LLM.pop(task_id, None)
+        # 同步清理向量库中的报告块（防死块）
+        if tools_memory.memory_available():
+            tools_memory.purge_report_chunks(rid)
+        try:
+            async with session_scope() as s:
+                if s is not None:
+                    await s.execute(
+                        delete(LocalSetting).where(
+                            LocalSetting.key == f"context-diag:research:{task_id}"
+                        )
+                    )
+                    await s.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("清理诊断行失败 task_id=%s：%s", task_id, e)
         # 删检查点线程（清中间状态，真正不留痕）；用检查点自己的连接，不占主库写锁
         cp, _kind = get_checkpointer()
         if cp is not None and hasattr(cp, "adelete_thread"):
@@ -1281,8 +1768,9 @@ class ChartAnalyzeRequest(BaseModel):
 
 @router.post("/chart/analyze")
 async def chart_analyze(req: ChartAnalyzeRequest) -> dict:
-    from ..tools import make_provenance
     from urllib.parse import urlparse
+
+    from ..tools import make_provenance
 
     target_host = urlparse((req.llm or {}).get("base_url") or settings.llm_base_url).netloc
 
@@ -1346,6 +1834,12 @@ async def list_models(req: ModelsRequest) -> dict:
     """代理调用厂商 OpenAI 兼容 /models，返回当前可用模型 id 列表。"""
     import json as _json
     import urllib.request as _u
+
+    from urllib.parse import urlparse
+
+    scheme = urlparse(req.base_url).scheme
+    if scheme not in ("http", "https"):
+        raise HTTPException(400, f"不支持的协议：{scheme or '(空)'}，仅允许 http/https")
 
     def _fetch():
         url = req.base_url.rstrip("/") + "/models"
