@@ -10,11 +10,13 @@ export const TEMPLATES: { id: TemplateId; label: string; desc: string }[] = [
 export interface ReportSection { title: string; body: string; }
 export interface ReportDoc {
   summary: string;
-  catalyst: string;
+  catalyst?: string;
   financials: { years: string[]; rows: { name: string; values: string[] }[] };
   sections: ReportSection[];
   risks: string[];
   sources: { title: string; url: string; date: string }[];
   disclaimer: string;
   as_of?: string;
+  llm_degraded?: boolean;
+  llm_fallback_reason?: string;
 }

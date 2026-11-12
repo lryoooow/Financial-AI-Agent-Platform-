@@ -4,6 +4,7 @@ import {
   ArchiveRestore,
   Bot,
   Brain,
+  Check,
   ChevronDown,
   Image as ImageIcon,
   Loader2,
@@ -11,6 +12,8 @@ import {
   Plus,
   Send,
   Sparkles,
+  FlaskConical,
+  Layers,
   Square,
   Trash2,
   UserRound,
@@ -19,26 +22,28 @@ import {
 import { api, isReasoningModelLike, type ChatConversation, type ChatMessage, type LlmConfig } from "../../api/client";
 import { ModelPicker } from "../ModelPicker";
 import { StructuredText } from "../../lib/markdown";
+import { ResearchCard } from "../research/ResearchCard";
 
-/** 图片压缩：canvas resize 到 maxDim、JPEG quality，单图 ~150KB。
- *  控制体积避免 base64 撑爆对话预算；多模态模型对 1280px 已足够清晰。 */
-async function compressImage(file: File, maxDim = 1280, quality = 0.82): Promise<string> {
+/** 图片压缩：canvas 限宽 maxWidth=1280、限高 maxHeight=4096（长财报/长表格截图不压扁宽度导致字迹模糊）。 */
+async function compressImage(file: File, maxWidth = 1280, quality = 0.84, maxHeight = 4096): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
         let { width, height } = img;
-        if (width > maxDim || height > maxDim) {
-          const ratio = Math.min(maxDim / width, maxDim / height);
-          width = Math.round(width * ratio);
-          height = Math.round(height * ratio);
+        const ratio = Math.min(1, maxWidth / Math.max(1, width), maxHeight / Math.max(1, height));
+        if (ratio < 1) {
+          width = Math.max(1, Math.round(width * ratio));
+          height = Math.max(1, Math.round(height * ratio));
         }
         const canvas = document.createElement("canvas");
         canvas.width = width;
         canvas.height = height;
         const ctx = canvas.getContext("2d");
         if (!ctx) { reject(new Error("canvas 不可用")); return; }
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, width, height);
         ctx.drawImage(img, 0, 0, width, height);
         resolve(canvas.toDataURL("image/jpeg", quality));
       };
@@ -103,10 +108,17 @@ interface ActiveModel { provider: string; model: string; accent: string; }
 export function ChatDesk({
   activeModel,
   onGoSettings,
+  onGoResearch,
+  draftPrompt,
+  onReportGenerated,
 }: {
   activeModel: ActiveModel | null;
   onGoSettings: () => void;
+  onGoResearch?: () => void;
+  draftPrompt?: { text: string; nonce: number } | null;
+  onReportGenerated?: (r: { id: string; name: string; code: string; template: string; date: string; summary: string }) => void;
 }) {
+  const [notice, setNotice] = useState("");
   const [conversations, setConversations] = useState<ChatConversation[]>([]);
   const [current, setCurrent] = useState<ChatConversation | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -117,15 +129,15 @@ export function ChatDesk({
   const [showArchived, setShowArchived] = useState(false);
   const [stage, setStage] = useState("");
   const [streamingId, setStreamingId] = useState<string | null>(null);
+  const [chatTools, setChatTools] = useState<{ name: string; label: string; status: "start" | "ok" | "error" }[]>([]);
   // v1.7.0：思维链瞬态展示（reasoning SSE）——不进 messages、不落库，流结束即清。
   const [reasoning, setReasoning] = useState("");          // CoT 文本（尾部 6000 字截断，防长 CoT 撑爆渲染）
   const [thinkSecs, setThinkSecs] = useState(0);           // 已等待秒数
   const [reasoningLive, setReasoningLive] = useState(false); // CoT 仍在更新（多轮工具调用间复现面板）
   const scrollRef = useRef<HTMLDivElement>(null);
-  // v1.6.0（审计 C1）：会话守卫与流控制。
-  // activeConvIdRef —— 流回调据此判断"用户是否已切走"，防止旧流 onDone 覆盖新会话；
-  // openSeqRef —— 会话打开请求序号，防乱序返回；
-  // stopRef —— 当前流的 AbortController（停止按钮/看门狗触发）。
+  const stickToBottomRef = useRef(true);
+  const sendingRef = useRef(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const activeConvIdRef = useRef<string | null>(null);
   const openSeqRef = useRef(0);
   const stopRef = useRef<AbortController | null>(null);
@@ -134,10 +146,32 @@ export function ChatDesk({
     activeConvIdRef.current = current?.id ?? null;
   }, [current]);
 
+  const handledDraftNonceRef = useRef(0);
+  useEffect(() => {
+    if (!draftPrompt || handledDraftNonceRef.current === draftPrompt.nonce) return;
+    handledDraftNonceRef.current = draftPrompt.nonce;
+    if (showArchived) setShowArchived(false);
+    setInput(draftPrompt.text);
+    window.setTimeout(() => {
+      const el = inputRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    }, 60);
+  }, [draftPrompt, showArchived]);
+
   // 图片上传状态
   const [pendingImages, setPendingImages] = useState<string[]>([]); // 待发送的 base64 data URL
   const [lightbox, setLightbox] = useState<string | null>(null);   // 全屏预览的图片 URL
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setLightbox(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox]);
 
   async function handleFiles(files: FileList | File[]) {
     const imgs: string[] = [];
@@ -166,11 +200,18 @@ export function ChatDesk({
   }, [showArchived]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, loading]);
+    const el = scrollRef.current;
+    if (!el || !stickToBottomRef.current) return;
+    if (streamingId) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }
+  }, [messages, loading, streamingId]);
 
   async function openConversation(id: string) {
     setError("");
+    stickToBottomRef.current = true;
     // v1.6.0（审计 C1）：请求序号守卫 —— 快速切换会话时，旧请求的返回不得覆盖新会话
     const seq = ++openSeqRef.current;
     try {
@@ -229,14 +270,18 @@ export function ChatDesk({
   }
 
   async function send() {
+    if (sendingRef.current) return;
     const text = input.trim();
     const imgs = [...pendingImages];
     if ((!text && !imgs.length) || loading || showArchived || current?.archived_at) return;
+    sendingRef.current = true;
+    stickToBottomRef.current = true;
     setInput("");
     setPendingImages([]);
     setError("");
     setLoading(true);
     setStage("正在理解问题");
+    setChatTools([]);
     const optimistic: ChatMessage = {
       id: `local-${Date.now()}`,
       role: "user",
@@ -281,6 +326,7 @@ export function ChatDesk({
     document.addEventListener("visibilitychange", onVisible);
     // v1.7.0：已等待秒数计时（与看门狗同生命周期，finally 统一清理）
     const thinkTimer = window.setInterval(() => setThinkSecs((s) => s + 1), 1_000);
+    let streamOpened = false;
     try {
       let conv = current;
       if (!conv) {
@@ -292,32 +338,62 @@ export function ChatDesk({
       convId = conv.id;
       await api.sendChatMessageStream(convId, text, llm, imgs.length ? imgs : undefined, {
         signal: ac.signal,
-        onStage: (_s, label) => {
+        onStage: (_s, label, heartbeat) => {
+          streamOpened = true;
           if (isStale()) return;
-          lastAct = Date.now();
+          // 后端 15s 合成保活帧仅用于保活代理/连接，不刷新看门狗 lastAct（否则上游模型真挂死时看门狗永不触发）
+          if (!heartbeat) lastAct = Date.now();
           setStage(label);
         },
+        onToolCall: (ev) => {
+          streamOpened = true;
+          if (isStale()) return;
+          lastAct = Date.now();
+          setChatTools((prev) => {
+            if (ev.status === "start") {
+              return [...prev, { name: ev.name, label: ev.label || ev.name, status: "start" }];
+            }
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i].name === ev.name && next[i].status === "start") {
+                next[i] = { ...next[i], status: ev.status };
+                return next;
+              }
+            }
+            return next;
+          });
+        },
         onReasoning: (piece) => {
+          streamOpened = true;
           if (isStale()) return;
           // 思维链活跃 = 真实的看门狗续命信号（比 stage 心跳更强的证据），且面板置 live
           lastAct = Date.now();
           setReasoningLive(true);
           setReasoning((r) => (r + piece).slice(-6000));
         },
+        onCompacted: (info) => {
+          streamOpened = true;
+          if (isStale()) return;
+          lastAct = Date.now();
+          setNotice(`较早的对话已自动压缩为要点摘要（第 ${info.generation} 次），后续回答基于摘要与最近几轮继续。`);
+        },
         onToken: (piece) => {
+          streamOpened = true;
           if (isStale()) return;
           lastAct = Date.now();
           setReasoningLive(false); // 正文开始流：折叠思考面板（下一轮工具调用的 CoT 会再点亮）
           setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
         },
         onDone: (payload) => {
+          streamOpened = true;
+          refreshList(false).catch(() => {});
           if (isStale()) return; // 用户已切走：旧流的完成态不得覆盖当前会话
           if (payload.conversation) setCurrent(payload.conversation);
           setMessages(payload.messages?.length ? payload.messages : (m) => m);
           setStreamingId(null);
-          refreshList(false);
         },
         onError: (msg) => {
+          streamOpened = true;
           if (isStale()) return;
           setError(msg);
           setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
@@ -327,22 +403,34 @@ export function ChatDesk({
     } catch (e) {
       // 会话已删/已切走时不落无关的错误横幅（用 send 域 convId 判定，闭包 current 已过期）
       const stale = isStale();
-      if ((e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出") {
+      const isAbort = (e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出";
+      if (isAbort) {
         // 用户停止/看门狗：已生成部分保留（后端会把部分回复落库并标注「生成中断」）
         if (!stale) setError("已停止生成");
       } else if (!stale) {
         setError(e instanceof Error ? e.message : String(e));
       }
-      // 后端在流开始前已持久化用户消息：只移除空的助手占位，不再回删提问
-      setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
+      if (!streamOpened && !isAbort) {
+        // 流尚未建立即失败（如网络断连 / 409 / 422）：后端尚未落库提问，自动恢复输入框与待发图片，不丢用户输入
+        setMessages((m) => m.filter((x) => x.id !== optimistic.id && !(x.id === assistantId && !x.content)));
+        if (!stale) {
+          setInput((cur) => cur || text);
+          if (imgs.length) setPendingImages((cur) => (cur.length ? cur : imgs));
+        }
+      } else {
+        // 后端在流开始时已持久化用户消息：只移除空的助手占位
+        setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
+      }
       setStreamingId(null);
     } finally {
       window.clearInterval(watchdog);
       window.clearInterval(thinkTimer);
       document.removeEventListener("visibilitychange", onVisible);
       if (stopRef.current === ac) stopRef.current = null;
+      sendingRef.current = false;
       setLoading(false);
       setStage("");
+      setChatTools([]);
       // 思维链面板随流结束清空（done/error/中止/看门狗统一走这里）
       setReasoning("");
       setThinkSecs(0);
@@ -353,14 +441,14 @@ export function ChatDesk({
   const starters = [
     "这家公司最值得追问的利润质量问题是什么？",
     "从估值、现金流、竞争格局给出下一步研究清单",
-    "如果我要写深度报告，哪些证据最关键？",
+    "我之前研究过的标的里，哪些估值处于低位？",
   ];
   const readOnly = showArchived || !!current?.archived_at;
   const canSend = (!!input.trim() || pendingImages.length > 0) && !loading && !readOnly;
 
   return (
     <div className="h-full min-h-0 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4 p-5 overflow-hidden">
-      <aside className="rounded-xl border border-border bg-card min-h-0 flex flex-col">
+      <aside className="rounded-xl border border-border bg-card max-h-44 lg:max-h-none min-h-0 flex flex-col">
         <div className="p-3 border-b border-border space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm">
@@ -435,13 +523,32 @@ export function ChatDesk({
       <section className="rounded-xl border border-border bg-card min-h-0 flex flex-col overflow-hidden">
         <div className="p-3 border-b border-border flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="truncate text-sm">{current?.title || (showArchived ? "归档对话" : "新对话")}</div>
-            <div className="text-[10px] text-muted-foreground">DeltaChannel · 本地 SQLite</div>
+            <div className="truncate text-sm">{current?.title || (showArchived ? "归档对话" : "投研问答")}</div>
+            <div className="text-[10px] text-muted-foreground">多轮问股 · 看图解盘 · 本地知识库联动</div>
           </div>
-          <ModelPicker active={activeModel} onChange={setLlm} onGoSettings={onGoSettings} />
+          <div className="flex items-center gap-2 shrink-0">
+            {onGoResearch && (
+              <button
+                type="button"
+                onClick={onGoResearch}
+                className="flex items-center gap-1.5 rounded-lg border border-gold/35 bg-gold/10 hover:bg-gold/20 px-2.5 py-1.5 text-xs text-gold transition-colors"
+                title="切换到独立「深度研究」工作台一键生成完整研报"
+              >
+                <FlaskConical className="size-3.5" /> 深度研究台
+              </button>
+            )}
+            <ModelPicker active={activeModel} onChange={setLlm} onGoSettings={onGoSettings} />
+          </div>
         </div>
 
-        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+          }}
+          className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4"
+        >
           {!messages.length && !loading && !showArchived && (
             <div className="h-full grid place-items-center">
               <div className="max-w-xl w-full">
@@ -458,6 +565,19 @@ export function ChatDesk({
                       {s}
                     </button>
                   ))}
+                  {onGoResearch && (
+                    <button
+                      type="button"
+                      onClick={onGoResearch}
+                      className="mt-1 flex items-center justify-between rounded-lg border border-gold/35 bg-gold/[0.08] px-3.5 py-2.5 text-left text-xs text-gold hover:bg-gold/[0.14] transition-colors"
+                    >
+                      <span className="flex items-center gap-2">
+                        <FlaskConical className="size-4 shrink-0" />
+                        <span>需要生成完整的个股 / 行业 / 财报 / 风险研报？前往独立「深度研究」工作台</span>
+                      </span>
+                      <span className="font-medium shrink-0">去发起 →</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -470,6 +590,18 @@ export function ChatDesk({
           )}
 
           {messages.map((m) => {
+            if (m.kind === "research" && m.research) {
+              return (
+                <div key={m.id} className="flex gap-3">
+                  <div className="grid place-items-center size-8 rounded-lg bg-gold/15 text-gold shrink-0">
+                    <FlaskConical className="size-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <ResearchCard research={m.research} onDone={onReportGenerated} />
+                  </div>
+                </div>
+              );
+            }
             const isStreaming = m.id === streamingId;
             const showThinking = isStreaming && !m.content;
             return (
@@ -487,6 +619,25 @@ export function ChatDesk({
                       {/* v1.7.0：思维链面板——正文未出或新一轮 CoT 进行中时显示（带已等待秒数） */}
                       {isStreaming && reasoning && (showThinking || reasoningLive) && (
                         <ThinkingPanel text={reasoning} secs={thinkSecs} live={reasoningLive} />
+                      )}
+                      {isStreaming && chatTools.length > 0 && (
+                        <div className="mb-2 flex flex-wrap gap-1.5">
+                          {chatTools.map((tc, ti) => (
+                            <span
+                              key={`${tc.name}-${ti}`}
+                              className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-background/60 px-2 py-0.5 text-[11px] text-muted-foreground"
+                            >
+                              {tc.status === "start" ? (
+                                <Loader2 className="size-3 animate-spin text-gold" />
+                              ) : tc.status === "ok" ? (
+                                <Check className="size-3 text-down" />
+                              ) : (
+                                <X className="size-3 text-up" />
+                              )}
+                              <span>{tc.label}</span>
+                            </span>
+                          ))}
+                        </div>
                       )}
                       {showThinking ? (
                       <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
@@ -509,7 +660,12 @@ export function ChatDesk({
                     </>
                   ) : (
                     <>
-                      {m.content && <span className="whitespace-pre-wrap">{m.content}</span>}
+                      {m.kind === "research_request" && (
+                        <span className="mr-1.5 inline-flex items-center gap-1 rounded bg-black/10 px-1.5 py-0.5 text-[10px] align-middle">
+                          <FlaskConical className="size-3" /> 深度研究
+                        </span>
+                      )}
+                      {m.content && <span className="whitespace-pre-wrap">{m.kind === "research_request" ? m.content.replace(/^深度研究：/, "") : m.content}</span>}
                       {m.images?.length ? (
                         <div className={`grid grid-cols-2 gap-1.5 ${m.content ? "mt-2" : ""} max-w-[280px]`}>
                           {m.images.map((img, i) => (
@@ -517,6 +673,10 @@ export function ChatDesk({
                               key={i}
                               src={img}
                               loading="lazy"
+                              alt="上传附图"
+                              onError={(e) => {
+                                e.currentTarget.style.display = "none";
+                              }}
                               className="w-full max-h-32 object-cover rounded-lg border border-black/10 cursor-pointer hover:opacity-90 transition-opacity"
                               onClick={() => setLightbox(img)}
                             />
@@ -543,6 +703,13 @@ export function ChatDesk({
           )}
         </div>
 
+        {notice && (
+          <div className="px-4 py-1.5 border-t border-border text-[11px] text-muted-foreground flex items-center gap-2">
+            <Layers className="size-3.5 text-gold shrink-0" />
+            <span className="flex-1">{notice}</span>
+            <button onClick={() => setNotice("")} className="hover:text-foreground"><X className="size-3" /></button>
+          </div>
+        )}
         {error && <div className="px-4 py-2 border-t border-border text-xs text-destructive">{error}</div>}
         <div className="p-3 border-t border-border">
           <div className="rounded-xl border border-border bg-input p-2">
@@ -588,10 +755,12 @@ export function ChatDesk({
                 <ImageIcon className="size-4" />
               </button>
               <textarea
+                ref={inputRef}
                 value={input}
                 disabled={readOnly}
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={(e) => {
+                  if (readOnly) return;
                   const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
                   if (files.length) {
                     e.preventDefault();
@@ -599,6 +768,7 @@ export function ChatDesk({
                   }
                 }}
                 onDrop={(e) => {
+                  if (readOnly) return;
                   const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
                   if (files.length) {
                     e.preventDefault();
@@ -611,7 +781,9 @@ export function ChatDesk({
                   e.preventDefault();
                   void send();
                 }}
-                placeholder={readOnly ? "归档对话仅供查看，恢复后可继续提问" : "输入问题，可上传 K线/走势图等进行分析（支持粘贴/拖拽）"}
+                placeholder={readOnly
+                  ? "归档对话仅供查看，恢复后可继续提问"
+                  : "输入投研问题，可上传 K 线/财报截图分析（支持粘贴/拖拽），也可追问已生成的深度研报…"}
                 rows={2}
                 className="min-h-[44px] flex-1 resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60"
               />

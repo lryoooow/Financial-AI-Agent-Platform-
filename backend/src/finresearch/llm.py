@@ -34,20 +34,34 @@ logger = logging.getLogger(__name__)
 # v1.6.5 补 thinking —— 中转站常以 *-thinking 后缀暴露思考模型（gemini-3-pro-thinking、
 # qwen3-thinking），且这类名字几乎从不命中其余模式（自定义模型名不受厂商命名约束）。
 _REASONING_PATTERNS = re.compile(
-    r"(?:\bo[134](?:-|\b)|qwq|deepseek-r|reasoning|\brt\b|thinking)", re.IGNORECASE
+    r"(?:"
+    r"\bo[134](?:-|\b)"
+    r"|\bgpt-5(?:\b|[.-])"
+    r"|qwq"
+    r"|deepseek-r"
+    r"|gemini-(?:2\.5-pro|3(?:\.\d+)?-pro)"
+    r"|glm-5(?:\.\d+|\b)"
+    r"|hunyuan-t1"
+    r"|grok-4(?:\.20|-reasoning|\b)"
+    r"|doubao-seed-2-0-pro"
+    r"|minimax-m3"
+    r"|kimi-k2\.7"
+    r"|reasoning|\brt\b|thinking|seed-thinking"
+    r")",
+    re.IGNORECASE,
 )
 
 # 第二层：Kimi / Moonshot —— API 强制 temperature=1，传 0.7 会 400
 _KIMI_PATTERNS = re.compile(r"(?:kimi|moonshot)", re.IGNORECASE)
 
 # 第三层：经实测支持温度调节的普通模型白名单 → 用 0.7（写作更稳）
-# 注意：用具体模型族前缀，避免误伤。新增模型时按需在此扩充。
+# 注意：用具体模型族前缀，避免误伤 gpt-5* 等强制默认温度的推理模型。
 _TEMP_07_WHITELIST = re.compile(
     r"(?:"
-    r"deepseek"          # deepseek-chat / deepseek-v3 / deepseek-coder
-    r"|qwen"             # qwen-plus / qwen-max / qwen-turbo
-    r"|glm|chatglm|glm-4"  # 智谱 GLM
-    r"|\bgpt-|gpt-3|gpt-4"  # OpenAI GPT（注意 \b- 前缀，不误伤 gpt-4o-mini 这类仍可调）
+    r"deepseek"          # deepseek-chat / deepseek-v3 / deepseek-v4-flash（v4-pro 已由第一层拦为 1.0）
+    r"|qwen"             # qwen-plus / qwen-max / qwen-turbo / qwen3-max
+    r"|glm|chatglm"      # 智谱 GLM-4 系列（glm-5 已由第一层拦为 1.0）
+    r"|\bgpt-(?:3\.5|4(?:\b|[o.-]))"  # OpenAI GPT-3.5 / GPT-4 / GPT-4o / GPT-4.1（严禁匹配 gpt-5*）
     r"|claude"           # Anthropic Claude（经兼容层）
     r"|baichuan"
     r"|yi-"              # 零一万物
@@ -144,13 +158,18 @@ class ReasoningChatOpenAI(ChatOpenAI):
     def _convert_chunk_to_generation_chunk(  # noqa: D102（签名与 1.6.0/1.3.3 逐参一致）
         self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
     ):
+        safe_chunk = (
+            {**chunk, "choices": []}
+            if isinstance(chunk, dict) and chunk.get("choices") is None
+            else chunk
+        )
         gen = super()._convert_chunk_to_generation_chunk(
-            chunk, default_chunk_class, base_generation_info
+            safe_chunk, default_chunk_class, base_generation_info
         )
         try:
-            choices = chunk.get("choices") or []
-            delta = choices[0].get("delta") if choices else None
-            rc = (delta or {}).get("reasoning_content")
+            choices = (safe_chunk.get("choices") if isinstance(safe_chunk, dict) else None) or []
+            delta = choices[0].get("delta") if choices and isinstance(choices[0], dict) else None
+            rc = (delta or {}).get("reasoning_content") or (delta or {}).get("reasoning")
         except Exception:  # noqa: BLE001  chunk 形状异常：宁丢思维链不炸流
             rc = None
         if not isinstance(rc, str) or not rc:
@@ -166,28 +185,51 @@ class ReasoningChatOpenAI(ChatOpenAI):
 _THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
 
 
+def _hold_close_prefix(s: str) -> tuple[str, str]:
+    """若字符串末尾是 </think> 的前缀（如 '<'、'</th'），拆分为 (安全前缀, 待定尾巴)。"""
+    if not s:
+        return "", ""
+    max_k = min(len(_THINK_CLOSE) - 1, len(s))
+    for k in range(max_k, 0, -1):
+        if _THINK_CLOSE.startswith(s[-k:]):
+            return s[:-k], s[-k:]
+    return s, ""
+
+
 class ThinkTagSplitter:
-    """把正文里内联的 <think>…</think> 拆成思维链（v1.7.1）。
+    """把正文里内联的 <think>…</think>（含网关预填 <think> 仅输出 </think>）拆成思维链。
 
     部分中转站 / 自部署推理端（DeepSeek-R1、QwQ、Qwen3 经 vLLM 等）不走
-    delta.reasoning_content，而是把思维链直接塞进 content 开头的 <think> 标签里。
-    不拆的话：研究分段的 420 字上限被思维链吃满（整段正文变成一截思考过程），
-    对话里思考过程被当成答案流给用户并落库。
-
-    只认**正文开头**（忽略前导空白）的 <think>，正文中间出现的同名字符串按原文处理，
-    避免误伤。标签可能被拆在相邻两个 chunk 里，按尾部缓冲处理。
+    delta.reasoning_content，而是把思维链塞进 content 开头的 <think> 标签，或由网关预填
+    prompt 末尾的 <think>、响应流直接输出思考并在中途以裸 </think> 收口。
     """
 
     def __init__(self) -> None:
         self._buf = ""
+        self._close_tail = ""
         self._mode = "detect"  # detect → think → content
+        self.orphan_think_closed = False  # 网关预填 <think> 导致 content 态遇到裸 </think>
+
+    def _filter_orphan_close(self, text: str) -> str:
+        if not text and not self._close_tail:
+            return ""
+        s = self._close_tail + text
+        self._close_tail = ""
+        if _THINK_CLOSE in s:
+            idx = s.find(_THINK_CLOSE)
+            if _THINK_OPEN not in s[:idx]:
+                self.orphan_think_closed = True
+                after = s[idx + len(_THINK_CLOSE):].lstrip("\r\n ")
+                s = s[:idx] + after
+        emit, self._close_tail = _hold_close_prefix(s)
+        return emit
 
     def feed(self, text: str) -> tuple[str, str]:
         """喂入一段增量，返回 (正文增量, 思维链增量)。"""
         if not text:
             return "", ""
         if self._mode == "content":
-            return text, ""
+            return self._filter_orphan_close(text), ""
         self._buf += text
         content, reasoning = "", ""
         if self._mode == "detect":
@@ -200,9 +242,16 @@ class ThinkTagSplitter:
             elif not head:
                 return "", ""  # 纯前导空白：等下一块再判定
             else:
+                close_idx = self._buf.find(_THINK_CLOSE)
+                if close_idx >= 0 and _THINK_OPEN not in self._buf[:close_idx]:
+                    reasoning = self._buf[:close_idx]
+                    rest = self._buf[close_idx + len(_THINK_CLOSE):].lstrip()
+                    self._buf = ""
+                    self._mode = "content"
+                    return self._filter_orphan_close(rest), reasoning
                 self._mode = "content"
                 out, self._buf = self._buf, ""
-                return out, ""
+                return self._filter_orphan_close(out), ""
         if self._mode == "think":
             idx = self._buf.find(_THINK_CLOSE)
             if idx >= 0:
@@ -210,7 +259,7 @@ class ThinkTagSplitter:
                 rest = self._buf[idx + len(_THINK_CLOSE):].lstrip()
                 self._buf = ""
                 self._mode = "content"
-                content = rest
+                content = self._filter_orphan_close(rest)
             else:
                 keep = len(_THINK_CLOSE) - 1  # 尾部可能是被拆开的 "</thi"
                 if len(self._buf) > keep:
@@ -220,15 +269,20 @@ class ThinkTagSplitter:
     def flush(self) -> tuple[str, str]:
         """流结束：把缓冲按当前模式吐出（未闭合的 <think> 整段算思维链）。"""
         buf, self._buf = self._buf, ""
+        tail, self._close_tail = self._close_tail, ""
         if self._mode == "think":
-            return "", buf
-        return buf, ""
+            return "", buf + tail
+        return buf + tail, ""
 
 
 def strip_think(text: str) -> str:
-    """非流式结果的同口径清洗：去掉开头的 <think>…</think>。"""
+    """非流式结果的同口径清洗：去掉开头的 <think>…</think> 或预填 <think> 留下的前缀…</think>。"""
+    raw = text or ""
+    close_idx = raw.find(_THINK_CLOSE)
+    if close_idx >= 0 and _THINK_OPEN not in raw[:close_idx]:
+        return raw[close_idx + len(_THINK_CLOSE):].lstrip()
     sp = ThinkTagSplitter()
-    content, _ = sp.feed(text or "")
+    content, _ = sp.feed(raw)
     tail, _ = sp.flush()
     return content + tail
 
@@ -304,12 +358,13 @@ def build_chart_llm(override: Optional[dict] = None) -> Optional[ChatOpenAI]:
     # 旧实现先取全局 chart_model（其默认值永远是 deepseek-chat），会把 Moonshot 的
     # URL/Key 与 DeepSeek 模型拼在一起，稳定触发 404。
     model = ((override or {}).get("model") or "").strip() or settings.chart_model or fallback
+    effort = reasoning_effort_of(override)
     timeout = 120.0
-    if reasoning_effort_of(override) or is_reasoning_model(model):
+    if effort or is_reasoning_model(model):
         timeout = max(timeout, 300.0)
     return ChatOpenAI(
         model=model,
-        temperature=_resolve_temperature(model),
+        temperature=1.0 if effort else _resolve_temperature(model),
         streaming=False,
         base_url=base_url,
         api_key=api_key,
@@ -326,3 +381,50 @@ def resolved_chart_model(override: Optional[dict] = None) -> str:
         return settings.chart_model or ""
     _api, _base, fallback = resolved
     return ((override or {}).get("model") or "").strip() or settings.chart_model or fallback
+
+
+# ────────────────────────────────────────────────────────────
+# v1.8.0：上下文窗口推断（自动压缩的预算基准）
+# ────────────────────────────────────────────────────────────
+# 中转站 / 国产模型走 ChatOpenAI 时没有 model.profile，deepagents 的内置摘要会回落到
+# 固定 170k token 才触发 —— 远超 DeepSeek 64k / 多数 128k 窗口，长对话先撞窗口报错，
+# 压缩从不发生。这里按模型名给出保守窗口（宁小勿大：压缩早一点只多一次摘要调用，
+# 估大了就是直接报错），设置页可手动覆盖。
+_CONTEXT_WINDOWS: tuple[tuple[tuple[str, ...], int], ...] = (
+    (("qwen-long",), 500_000),
+    (("deepseek-v4",), 256_000),
+    (("claude-fable", "claude-opus-4-8", "claude-sonnet-5"), 256_000),
+    (("claude",), 200_000),
+    (("gemini-2.5", "gemini-3"), 256_000),
+    (("gemini",), 200_000),
+    (("kimi-k2",), 256_000),
+    (("kimi", "moonshot"), 128_000),
+    (("qwen3", "qwen-plus", "qwen-flash"), 256_000),
+    (("qwen", "qwq"), 128_000),
+    (("glm-5",), 200_000),
+    (("glm", "zhipu"), 128_000),
+    (("doubao-seed-2", "hunyuan", "minimax-m3"), 256_000),
+    (("minimax-m2",), 200_000),
+    (("doubao", "minimax", "abab"), 128_000),
+    (("grok-4",), 256_000),
+    (("mistral-large", "mistral-small"), 256_000),
+    (("mistral",), 128_000),
+    (("baichuan4",), 192_000),
+    (("deepseek",), 64_000),
+    (("ernie", "yi-", "baichuan"), 32_000),
+    (("gpt-4o", "gpt-4-turbo", "llama", "gpt-oss"), 128_000),
+    # 厂商名都没命中才看 OpenAI 系列（"o1/o3" 这类短串放最后，避免误命中其他模型名）
+    (("gpt-5", "gpt-4.1", "o1", "o3", "o4"), 200_000),
+)
+DEFAULT_CONTEXT_WINDOW = 64_000
+
+
+def context_window_tokens(model: str, override_k: int = 0) -> int:
+    """模型上下文窗口（token）。override_k>0 时以设置页手动值为准。"""
+    if override_k and int(override_k) > 0:
+        return int(override_k) * 1000
+    name = (model or "").strip().lower()
+    for keys, size in _CONTEXT_WINDOWS:
+        if any(k in name for k in keys):
+            return size
+    return DEFAULT_CONTEXT_WINDOW

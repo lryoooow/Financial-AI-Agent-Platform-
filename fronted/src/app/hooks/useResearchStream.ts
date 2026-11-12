@@ -53,6 +53,10 @@ export function useResearchStream() {
           try { es.close(); } catch { /* noop */ }
           if (esRef.current === es) esRef.current = null;
           if (!wasOurs || !lastRef.current) return;
+          if (retryTimerRef.current !== null) {
+            window.clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = null;
+          }
           // v1.6.3：有限次自动重连（后端 history 回放恢复进度），耗尽才判死
           if (retryRef.current < MAX_RETRIES) {
             retryRef.current += 1;

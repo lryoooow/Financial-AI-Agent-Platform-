@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import math
 import re
+import threading
 from typing import List
 from urllib.parse import quote
 
@@ -18,19 +21,40 @@ from .market_provider import record
 
 logger = logging.getLogger(__name__)
 
-# 核验补（B6 遗漏侧）：直连会话复用（连接池 + 统一 UA），不再每次裸 requests.get
-# 新建 TCP+TLS。与 fundamentals._direct_session 同款模式。
+# 线程局部直连会话（requests.Session 非线程安全；并发线程下各自独立复用连接池 + 统一 UA）。
+# 保留 _DIRECT_SESSION 作为测试/覆盖注入点（默认 None 时走线程局部实例）。
 _DIRECT_SESSION = None
+_DIRECT_SESSION_LOCAL = threading.local()
 
 
 def _direct_session():
-    global _DIRECT_SESSION
-    if _DIRECT_SESSION is None:
+    if _DIRECT_SESSION is not None:
+        return _DIRECT_SESSION
+    sess = getattr(_DIRECT_SESSION_LOCAL, "session", None)
+    if sess is None:
         import requests
 
-        _DIRECT_SESSION = requests.Session()
-        _DIRECT_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-    return _DIRECT_SESSION
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        _DIRECT_SESSION_LOCAL.session = sess
+    return sess
+
+
+def _s(val: object) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, float) and not math.isfinite(val):
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none", "<na>") else s
+
+
+def _clean_news_text(val: object, max_len: int = 0) -> str:
+    raw = _s(val)
+    txt = html.unescape(re.sub(r"</?[^>]+>", "", raw))
+    txt = re.sub(r"\(\s*\)|（\s*）", "", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:max_len] if max_len > 0 else txt
 
 
 def _news_direct(raw: str, limit: int) -> List[dict]:
@@ -54,8 +78,6 @@ def _news_direct(raw: str, limit: int) -> List[dict]:
     resp = _direct_session().get(
         "https://search-api-web.eastmoney.com/search/jsonp",
         params={"cb": callback, "param": json.dumps(inner, ensure_ascii=True), "_": "1"},
-        # HTTP 头只允许 latin-1：中文关键词必须 percent-encode，否则 UnicodeEncodeError
-        #（行业研究固定用中文行业名调本接口，不编码则直连路径 100% 失败）。
         headers={"Referer": f"https://so.eastmoney.com/news/s?keyword={quote(raw)}"},
         timeout=6,
     )
@@ -64,11 +86,11 @@ def _news_direct(raw: str, limit: int) -> List[dict]:
     payload = json.loads(match.group(1) if match else resp.text)
     rows = ((payload.get("result") or {}).get("cmsArticleWebOld") or [])[:limit]
     return [{
-        "title": re.sub(r"</?em>", "", str(row.get("title") or "")),
-        "content": re.sub(r"</?em>", "", str(row.get("content") or ""))[:300],
+        "title": _clean_news_text(row.get("title")),
+        "content": _clean_news_text(row.get("content"), 300),
         "time": str(row.get("date") or ""),
-        "url": str(row.get("url") or (f"http://finance.eastmoney.com/a/{row.get('code')}.html" if row.get("code") else "")),
-        "source": str(row.get("mediaName") or "东方财富"),
+        "url": str(row.get("url") or (f"https://finance.eastmoney.com/a/{row.get('code')}.html" if row.get("code") else "")),
+        "source": _clean_news_text(row.get("mediaName")) or "东方财富",
     } for row in rows]
 
 
@@ -91,11 +113,11 @@ def search_news(code: str, limit: int = 12) -> dict:
             import akshare as ak
             df = ak.stock_news_em(symbol=raw)
             items = [] if df is None else [{
-                "title": str(r.get("新闻标题", "") or ""),
-                "content": str(r.get("新闻内容", "") or "")[:300],
-                "time": str(r.get("发布时间", "") or ""),
-                "url": str(r.get("新闻链接", "") or ""),
-                "source": str(r.get("文章来源", "") or "东方财富"),
+                "title": _clean_news_text(r.get("新闻标题")),
+                "content": _clean_news_text(r.get("新闻内容"), 300),
+                "time": _s(r.get("发布时间")),
+                "url": _s(r.get("新闻链接")),
+                "source": _clean_news_text(r.get("文章来源")) or "东方财富",
             } for _, r in df.head(int(limit)).iterrows()]
         if not items:
             raise ValueError("无新闻")

@@ -205,6 +205,11 @@ def _start_parent_watchdog(server: "uvicorn.Server") -> None:
         return
 
     ppid = os.getppid()
+    parent_ctime = None
+    try:
+        parent_ctime = psutil.Process(ppid).create_time()
+    except Exception:  # noqa: BLE001
+        pass
 
     def _watch() -> None:
         while True:
@@ -214,6 +219,16 @@ def _start_parent_watchdog(server: "uvicorn.Server") -> None:
                     print(f"parent {ppid} gone, exiting sidecar", flush=True)
                     server.should_exit = True
                     return
+                if parent_ctime is not None:
+                    proc = psutil.Process(ppid)
+                    if not proc.is_running() or abs(proc.create_time() - parent_ctime) > 1.0:
+                        print(f"parent {ppid} recycled, exiting sidecar", flush=True)
+                        server.should_exit = True
+                        return
+            except psutil.NoSuchProcess:
+                print(f"parent {ppid} gone, exiting sidecar", flush=True)
+                server.should_exit = True
+                return
             except Exception:  # noqa: BLE001
                 continue  # 瞬时异常（权限/临时错误）不退出看门狗，继续轮询
 

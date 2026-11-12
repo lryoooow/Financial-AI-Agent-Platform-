@@ -54,10 +54,17 @@
 
   <section class="summary">
     <h2>摘要</h2>
-    {% block summary %}<p>{{ doc.summary }}</p>{% endblock %}
+    {% block summary %}
+    {% for para in (doc.summary or "").split("\n") if para.strip() %}
+      <p>{{ para.strip() }}</p>
+    {% endfor %}
+    {% endblock %}
     {% block catalyst %}{% if doc.catalyst %}<div class="catalyst"><b>催化剂：</b>{{ doc.catalyst }}</div>{% endif %}{% endblock %}
   </section>
 
+  {% block snapshot %}{% endblock %}
+
+  {% if doc.financials and doc.financials.rows and doc.financials.years %}
   <section>
     <h2>财务概览</h2>
     {% block financials %}
@@ -71,6 +78,7 @@
     </table>
     {% endblock %}
   </section>
+  {% endif %}
 
   {% block valuation %}{% endblock %}
 
@@ -78,7 +86,12 @@
     <h2>分析</h2>
     {% block body %}
     {% for s in doc.sections %}
-      <div class="section"><h3 style="font-size:14px;margin:14px 0 4px;">{{ s.title }}</h3><p>{{ s.body }}</p></div>
+      <div class="section">
+        <h3 style="font-size:14px;margin:14px 0 4px;">{{ s.title }}</h3>
+        {% for para in (s.body or "").split("\n") if para.strip() %}
+          <p>{{ para.strip() }}</p>
+        {% endfor %}
+      </div>
     {% endfor %}
     {% endblock %}
   </section>

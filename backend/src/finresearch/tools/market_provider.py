@@ -20,13 +20,14 @@ from threading import Lock
 from typing import Any, List, Optional
 from urllib.parse import urlencode
 
-from . import now_iso
-from .entity import normalize_ticker, to_market_ticker, _classify_exchange
+from . import now_cst, now_iso
+from .entity import BJ_PREFIXES, SH_PREFIXES, _classify_exchange, normalize_ticker, to_market_ticker
 
 logger = logging.getLogger(__name__)
+_NET_LOCK = Lock()
 
 # 行情域名白名单：默认对这些主机绕过代理（requests/urllib 读 NO_PROXY）。
-# 东方财富（akshare 主源）、Sina（备用源）、腾讯（预留）。
+# 东方财富（akshare 主源）、Sina（备用源）、腾讯（预留）、乐咕乐股（申万估值）。
 MARKET_HOSTS = [
     # 东方财富（akshare push 接口）
     "push2.eastmoney.com",
@@ -41,13 +42,17 @@ MARKET_HOSTS = [
     # Sina（备用源）
     "hq.sinajs.cn",
     "hq.sinajs.com.cn",
+    "quotes.sina.cn",
     "money.finance.sina.com.cn",
     "finance.sina.com.cn",
     "vip.stock.finance.sina.com.cn",
-    # 腾讯（预留）
+    # 腾讯
     "qt.gtimg.cn",
     "web.ifzq.gtimg.cn",
     "web.sqt.gtimg.cn",
+    "stock.gtimg.cn",
+    # 乐咕乐股（申万行业估值底层源）
+    "legulegu.com",
 ]
 
 # 诊断环形缓冲（进程内单例，家用单进程足够）
@@ -77,15 +82,19 @@ def recent_diagnostics(limit: int = 20) -> List[dict]:
 
 
 def proxy_status() -> dict:
-    """只读返回当前行情代理策略（不修改环境）。"""
+    """只读返回当前行情代理策略（脱敏：不直接回显用户原始 NO_PROXY 环境变量内容）。"""
     import os
 
     from ..config import settings
 
+    raw_np = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    items = [h.strip() for h in raw_np.split(",") if h.strip()]
+    bypass_on = bool(settings.market_bypass_proxy)
     return {
-        "bypass_enabled": bool(settings.market_bypass_proxy),
+        "bypass_enabled": bypass_on,
         "market_proxy_set": bool(settings.market_proxy),
-        "no_proxy": os.environ.get("NO_PROXY", ""),
+        "no_proxy": f"已启用（覆盖 {len(MARKET_HOSTS)} 个行情直连源，共 {len(items)} 项）" if bypass_on else "(未启用)",
+        "no_proxy_count": len(items),
         "monitored_hosts": list(MARKET_HOSTS),
     }
 
@@ -96,85 +105,67 @@ def clear_diagnostics() -> None:
 
 
 def configure_market_network() -> dict:
-    """在进程启动早期（uvicorn/akshare 首次请求前）配置行情网络代理策略。
-
-    - 默认（market_bypass_proxy=True）：把行情域名追加进 NO_PROXY，绕过坏系统/环境代理。
-      与已有 NO_PROXY 合并去重，保留用户既有的设置。
-    - market_proxy 显式设置时：额外写入 HTTP_PROXY/HTTPS_PROXY（用于确实需要代理出网的环境）。
-    纯 os.environ 操作，无重型 import，调用顺序安全。
-
-    v1.6.0（审计 B6）：设 NO_PROXY 前先把 Windows 注册表系统代理物化进 env ——
-    requests/urllib 的 getproxies() 是「环境变量 or 注册表」短路逻辑，仅设 NO_PROXY
-    会让 getproxies_environment() 返回非空 dict，注册表代理被整体忽略，在「必须走
-    代理出网」的环境里等于全局断网开关。先物化再 bypass，两者兼得。
-
-    返回生效后的摘要（供诊断接口回显）。
-    """
+    """在进程启动早期（uvicorn/akshare 首次请求前）配置行情网络代理策略。"""
     import os
     import sys
 
     from ..config import settings
 
-    summary: dict[str, Any] = {
-        "bypass_proxy": bool(settings.market_bypass_proxy),
-        "market_proxy_set": bool(settings.market_proxy),
-    }
+    with _NET_LOCK:
+        summary: dict[str, Any] = {
+            "bypass_proxy": bool(settings.market_bypass_proxy),
+            "market_proxy_set": bool(settings.market_proxy),
+        }
 
-    # ① 注册表代理物化（仅 Windows 且 env 未显式配置代理时）
-    if sys.platform == "win32" and not (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
-        try:
-            import urllib.request
+        # ① 注册表代理物化（仅 Windows 且 env 未显式配置代理时）
+        if sys.platform == "win32" and not (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
+            try:
+                import urllib.request
 
-            reg = urllib.request.getproxies_registry()
-            for scheme in ("http", "https"):
-                p = reg.get(scheme) or (reg.get("https") if scheme == "http" else None)
-                if p:
-                    os.environ.setdefault(scheme.upper() + "_PROXY", p)
-                    summary.setdefault("materialized_registry_proxy", p)
-        except Exception:  # noqa: BLE001
-            pass
+                reg = urllib.request.getproxies_registry()
+                for scheme in ("http", "https"):
+                    p = reg.get(scheme) or (reg.get("https") if scheme == "http" else None)
+                    if p:
+                        os.environ.setdefault(scheme.upper() + "_PROXY", p)
+                        summary.setdefault("materialized_registry_proxy", p)
+            except Exception:  # noqa: BLE001
+                pass
 
-    if settings.market_bypass_proxy:
-        existing = ",".join([os.environ.get("NO_PROXY", ""), os.environ.get("no_proxy", "")])
-        parts = [h.strip() for h in existing.split(",") if h.strip()]
-        # 过滤无效通配符形态：Python 的 NO_PROXY 是 endswith 后缀匹配，`*.eastmoney.com`
-        # 永远匹配不上任何主机（Electron 侧曾注入这种形态，v1.6.0 已改为后端单一权威清单）
-        parts = [h[2:] if h.startswith("*.") else h for h in parts]
-        parts += [h for h in MARKET_HOSTS if h not in parts]
-        val = ",".join(dict.fromkeys(parts))  # 去重保序
-        os.environ["NO_PROXY"] = val
-        os.environ["no_proxy"] = val
-        summary["no_proxy"] = val
-    else:
-        summary["no_proxy"] = "(bypass disabled)"
+        if settings.market_bypass_proxy:
+            existing = ",".join([os.environ.get("NO_PROXY", ""), os.environ.get("no_proxy", "")])
+            parts = [h.strip() for h in existing.split(",") if h.strip()]
+            parts = [h[2:] if h.startswith("*.") else h for h in parts]
+            parts += [h for h in MARKET_HOSTS if h not in parts]
+            val = ",".join(dict.fromkeys(parts))  # 去重保序
+            os.environ["NO_PROXY"] = val
+            os.environ["no_proxy"] = val
+            summary["no_proxy"] = val
+        else:
+            summary["no_proxy"] = "(bypass disabled)"
 
-    if settings.market_proxy:
-        os.environ["HTTP_PROXY"] = settings.market_proxy
-        os.environ["HTTPS_PROXY"] = settings.market_proxy
-        summary["applied_proxy"] = settings.market_proxy
+        if settings.market_proxy:
+            os.environ["HTTP_PROXY"] = settings.market_proxy
+            os.environ["HTTPS_PROXY"] = settings.market_proxy
+            summary["applied_proxy"] = settings.market_proxy
 
-    return summary
+        return summary
 
 
 # ────────────────────────────────────────────────────────────
 # 市场前缀（Sina/Sina kline 用 sh/sz/bj 前缀）
 # ────────────────────────────────────────────────────────────
 def _sina_symbol(raw: str) -> str:
-    """纯 6 位代码 → Sina 前缀（sh/sz/bj）。
-
-    v1.6.0（审计 B7）：北交所 2024 年起新代码全部为 920xxx（种子表 325 只全是 920 开头），
-    此前只认 43/83/87/88 → 920 被判深证（sz920000 实测返回空），补 "92" 前缀。
-    """
-    if raw.startswith(("60", "68", "90", "11", "51", "56")):
+    """纯 6 位代码 → Sina 前缀（sh/sz/bj）。"""
+    if raw.startswith(SH_PREFIXES):
         return f"sh{raw}"
-    if raw.startswith(("43", "83", "87", "88", "92")):
+    if raw.startswith(BJ_PREFIXES):
         return f"bj{raw}"
     return f"sz{raw}"
 
 
 def _eastmoney_secid(raw: str) -> str:
     """Eastmoney secid: 1.SH, 0.SZ/BJ."""
-    return f"1.{raw}" if raw.startswith(("60", "68", "90", "11", "51", "56")) else f"0.{raw}"
+    return f"1.{raw}" if raw.startswith(SH_PREFIXES) else f"0.{raw}"
 
 
 def _http_get(url: str, headers: Optional[dict] = None, timeout: float = 3.0) -> str:
@@ -191,8 +182,10 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     """东方财富直连日 K，绕过 AkShare 封装层，国内免费源。"""
     raw = normalize_ticker(code)
     fqt = {"": "0", "qfq": "1", "hfq": "2"}.get(adjust, "1")
-    end = dt.datetime.now().strftime("%Y%m%d")
-    start = (dt.datetime.now() - dt.timedelta(days=int(n) * 3 + 90)).strftime("%Y%m%d")
+    now = now_cst()
+    fetch_n = max(1, int(n)) + 25
+    end = now.strftime("%Y%m%d")
+    start = (now - dt.timedelta(days=fetch_n * 3 + 90)).strftime("%Y%m%d")
     qs = urlencode(
         {
             "secid": _eastmoney_secid(raw),
@@ -207,7 +200,7 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?{qs}"
     body = _http_get(url, headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}, timeout=3)
     payload = json.loads(body)
-    rows = ((payload.get("data") or {}).get("klines") or [])[-int(n):]
+    rows = ((payload.get("data") or {}).get("klines") or [])[-fetch_n:]
     if not rows:
         raise ValueError("Eastmoney 日K 空数据")
 
@@ -225,6 +218,7 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
         out.append(
@@ -235,9 +229,9 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "high": _n(r["high"]),
                 "low": _n(r["low"]),
                 "volume": int(_n(r["volume"])),
-                "ma5": _n(r["ma5"]),
-                "ma10": _n(r["ma10"]),
-                "ma20": _n(r["ma20"]),
+                "ma5": _opt_n(r["ma5"]),
+                "ma10": _opt_n(r["ma10"]),
+                "ma20": _opt_n(r["ma20"]),
             }
         )
     return {
@@ -290,23 +284,30 @@ def eastmoney_intraday(code: str) -> dict:
         raise ValueError("Eastmoney 分时无有效时间字段")
     latest = df["dt"].iloc[-1].date()
     df = df[df["dt"].dt.date == latest]
-    today = dt.datetime.now().date()
-    if latest == today:
-        df = df[df["dt"] <= dt.datetime.now()]
+    now = now_cst()
+    if latest == now.date():
+        df = df[df["dt"] <= now]
     hhmm = df["dt"].dt.strftime("%H:%M")
     df = df[(hhmm >= "09:30") & (hhmm <= "15:00")]
-    # 1 分钟 → 5 分钟桶（与 akshare/sina 分时 5 分钟契约一致；avg 用累计均价）
+    if df.empty:
+        raise ValueError("Eastmoney 分时当前尚无交易时段有效点")
+    # 1 分钟 → 5 分钟桶（与 akshare/sina 分时 5 分钟契约一致；avg 用累计均价，零成交量回落现价）
     df = df.set_index("dt")
     bucket = df.resample("5min", label="left", closed="left")
     agg = bucket.agg(price=("price", "last"), volume=("volume", "sum")).dropna(subset=["price"])
     agg["time"] = agg.index.strftime("%H:%M")
     cum_p5 = (agg["price"] * agg["volume"]).cumsum()
-    cum_v5 = agg["volume"].cumsum().replace(0, 1)
-    agg["avg"] = (cum_p5 / cum_v5).round(2)
+    cum_v5 = agg["volume"].cumsum()
+    agg["avg"] = [
+        round(float(cp / cv), 2) if cv > 0 else round(float(pr), 2)
+        for cp, cv, pr in zip(cum_p5, cum_v5, agg["price"])
+    ]
     out = [
         {"time": str(r["time"]), "price": _n(r["price"]), "avg": _n(r["avg"]), "volume": int(_n(r["volume"]))}
         for _, r in agg.iterrows()
     ]
+    if not out:
+        raise ValueError("Eastmoney 分时重采样为空")
     return {
         "data": out,
         "trading_date": str(latest),
@@ -451,7 +452,7 @@ def tencent_realtime(code: str) -> dict:
         "prevClose": prev_close,
         "volume": _fmt_volume(_n(parts[36])),
         "turnover": _fmt_amount(amount_yuan),
-        "marketCap": _fmt_amount(_n(parts[45]) * 1e8) if len(parts) > 45 else "—",
+        "marketCap": _fmt_amount(_n(parts[45]) * 1e8) if (len(parts) > 45 and _n(parts[45]) > 0) else "—",
         "pe": _n(parts[39]) if len(parts) > 39 else 0.0,
         "pb": _n(parts[46]) if len(parts) > 46 else 0.0,
         "roe": 0.0,
@@ -469,12 +470,12 @@ def tencent_realtime(code: str) -> dict:
 
 
 def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
-    """Tencent qfq/day K line, domestic free fallback."""
+    """Tencent qfq/hfq/day K line, domestic free fallback."""
     raw = normalize_ticker(code)
     sym = _sina_symbol(raw)
-    key = "qfqday" if adjust != "" else "day"
-    fq = "qfq" if adjust != "" else ""
-    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{int(n)},{fq}"
+    key, fq = {"qfq": ("qfqday", "qfq"), "hfq": ("hfqday", "hfq"), "": ("day", "")}.get(adjust, ("qfqday", "qfq"))
+    fetch_n = max(1, int(n)) + 25
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{fetch_n},{fq}"
     body = _http_get(
         url,
         headers={"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"},
@@ -483,12 +484,11 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     payload = json.loads(body)
     if payload.get("code") != 0:
         raise ValueError(f"Tencent K线响应异常：{payload.get('msg')}")
-    rows = (((payload.get("data") or {}).get(sym) or {}).get(key) or [])[-int(n):]
-    # v1.6.3（B3）：北交所符号腾讯只回 'day' 键（不复权），即便请求了 qfq。
-    # 如实降级为不复权并显式标注——绝不把不复权数据冒充前复权（口径不撒谎）。
+    rows = (((payload.get("data") or {}).get(sym) or {}).get(key) or [])[-fetch_n:]
+    # v1.6.3（B3）：北交所符号腾讯只回 'day' 键（不复权），即便请求了 qfq/hfq。
     bj_unadjusted = False
-    if not rows and key == "qfqday" and raw.startswith(("43", "83", "87", "88", "92")):
-        rows = (((payload.get("data") or {}).get(sym) or {}).get("day") or [])[-int(n):]
+    if not rows and key != "day" and raw.startswith(BJ_PREFIXES):
+        rows = (((payload.get("data") or {}).get(sym) or {}).get("day") or [])[-fetch_n:]
         bj_unadjusted = True
     if not rows:
         raise ValueError("Tencent 日K 空数据")
@@ -515,6 +515,7 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
         out.append(
@@ -525,9 +526,9 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "high": _n(r["high"]),
                 "low": _n(r["low"]),
                 "volume": int(_n(r["volume"])),
-                "ma5": _n(r["ma5"]),
-                "ma10": _n(r["ma10"]),
-                "ma20": _n(r["ma20"]),
+                "ma5": _opt_n(r["ma5"]),
+                "ma10": _opt_n(r["ma10"]),
+                "ma20": _opt_n(r["ma20"]),
             }
         )
     return {
@@ -550,14 +551,11 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
 # 备用源 2：Sina 日 K（getKLineData，scale=240）
 # ────────────────────────────────────────────────────────────
 def sina_kline(code: str, n: int = 60) -> dict:
-    """Sina 日 K（不复权）。返回与 akshare kline 同构的 {data:[...], provenance}。
-
-    注意：Sina 免费接口不支持前/后复权，provenance 明确标注 adjust='none'，
-    上层会在该情况下追加风险提示（技术信号仅供参考）。
-    """
+    """Sina 日 K（不复权）。返回与 akshare kline 同构的 {data:[...], provenance}。"""
     raw = normalize_ticker(code)
     sym = _sina_symbol(raw)
-    qs = urlencode({"symbol": sym, "scale": 240, "ma": "no", "datalen": int(n)})
+    fetch_n = max(1, int(n)) + 25
+    qs = urlencode({"symbol": sym, "scale": 240, "ma": "no", "datalen": fetch_n})
     url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?{qs}"
     headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}
     body = _http_get(url, headers=headers)
@@ -574,6 +572,7 @@ def sina_kline(code: str, n: int = 60) -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
         out.append(
@@ -584,9 +583,9 @@ def sina_kline(code: str, n: int = 60) -> dict:
                 "high": _n(r.get("high")),
                 "low": _n(r.get("low")),
                 "volume": int(r.get("volume") or 0),
-                "ma5": _n(r.get("ma5")),
-                "ma10": _n(r.get("ma10")),
-                "ma20": _n(r.get("ma20")),
+                "ma5": _opt_n(r.get("ma5")),
+                "ma10": _opt_n(r.get("ma10")),
+                "ma20": _opt_n(r.get("ma20")),
             }
         )
     return {
@@ -624,20 +623,25 @@ def sina_intraday(code: str) -> dict:
     df = df.dropna(subset=["dt"]).sort_values("dt")
     if df.empty:
         raise ValueError("Sina 分时无有效时间字段")
-    # 仅保留最新交易日；若即今日则截断到当前时刻
     latest = df["dt"].iloc[-1].date()
     df = df[df["dt"].dt.date == latest]
-    today = dt.datetime.now().date()
-    if latest == today:
-        now = dt.datetime.now()
+    now = now_cst()
+    if latest == now.date():
         df = df[df["dt"] <= now]
     df["price"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["price"])
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0) / 100.0  # 股→手
     hhmm = (df["dt"].dt.strftime("%H:%M"))
     df = df[(hhmm >= "09:30") & (hhmm <= "15:00")]
+    if df.empty:
+        # 09:30–09:34 首根右标 5 分钟柱尚未闭合时，抛异常让上层自动降级到 1 分钟分时源
+        raise ValueError("Sina 5分钟分时当前尚无已闭合采样点")
     cum_p = (df["price"] * df["volume"]).cumsum()
-    cum_v = df["volume"].cumsum().replace(0, 1)
-    df["avg"] = (cum_p / cum_v).round(2)
+    cum_v = df["volume"].cumsum()
+    df["avg"] = [
+        round(float(cp / cv), 2) if cv > 0 else round(float(pr), 2)
+        for cp, cv, pr in zip(cum_p, cum_v, df["price"])
+    ]
     out = [
         {
             "time": str(r["dt"].strftime("%H:%M")),
@@ -669,6 +673,19 @@ def _n(v, d=0.0) -> float:
         return d if (x != x or x in (float("inf"), float("-inf"))) else x
     except Exception:
         return d
+
+
+def _opt_n(v) -> Optional[float]:
+    """均线等可缺失指标：NaN/None 返回 None（JSON null），绝不伪装成 0.00 元。"""
+    try:
+        if v is None:
+            return None
+        x = float(v)
+        if x != x or x in (float("inf"), float("-inf")):
+            return None
+        return round(x, 2)
+    except Exception:
+        return None
 
 
 def _fmt_volume(vol_hand: float) -> str:

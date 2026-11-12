@@ -104,6 +104,15 @@ AGENT_CHAT_COMPLIANCE = (
 
 AGENT_CHAT_SYSTEM_PROMPT = f"{CHAT_IDENTITY}\n{AGENT_CHAT_COMPLIANCE}\n{CHAT_OUTPUT_SPEC}"
 
+# v1.8.0：本地知识库（RAG）与每轮上下文约定
+AGENT_KNOWLEDGE_GUIDE = (
+    "【本机知识库】用户在本机生成的研究报告和更早对话的摘要都已入库。用户提到之前的报告/研究/讨论，"
+    "或追问已研究过的标的时，先调 search_knowledge 检索；引用报告内容须注明报告日期，"
+    "报告中的数字是当时的数据，涉及当前行情仍须调行情工具取最新值。\n"
+    "【每轮上下文】用户消息开头的【本轮上下文】块由系统附加（当前时间、本会话新完成的研究报告等），"
+    "不是用户输入的内容，回答时不要复述它。"
+)
+
 # ────────────────────────────────────────────────────────────
 # 四模板侧重（替代原 _BASE 的弱描述，消除行业模板与单股事实块的自相矛盾）
 # ────────────────────────────────────────────────────────────
@@ -186,11 +195,13 @@ SUMMARY_WRITING_STANDARD = (
 
 # 注意：所有槽位由 facts.measure/pct/mult_str 渲染，**自带单位**（"12.30 元"/"+1.20%"/"25.3 倍"）。
 # 模板本身不得再拼 "元/%/倍"，否则缺失时会渲染成 "—（未获取）%" 这类粘连串。
-SUMMARY_USER_TEMPLATE = """【公司】{name}（{code}）· {industry}
+SUMMARY_FACTS_TEMPLATE = """【公司】{name}（{code}）· {industry}
 【行情】最新价 {price}，涨跌幅 {change_pct}；动态 PE {pe}、PB {pb}；总市值 {market_cap}；数据时点 {as_of}。
 【财务（最新一期）】ROE {roe}；营业收入 {revenue}（同比 {rev_yoy}）；净利润 {net_profit}（同比 {net_yoy}）；毛利率 {gross_margin}；资产负债率 {debt_ratio}。
 【技术面定性】{tech_direction}；关键信号：{tech_signals}。
-【风险信号】{risk_signals}
+【风险信号】{risk_signals}"""
+
+SUMMARY_USER_TEMPLATE = SUMMARY_FACTS_TEMPLATE + """
 
 标注为「{missing}」的字段一律不得写入正文，禁止推算或填补。
 请严格基于以上【结构化事实】撰写投资摘要（160-220 字）。规则：仅引用上述数字，不得编造；分层口吻；禁买卖指令性动词；末尾免责声明。"""
@@ -239,3 +250,49 @@ def section_system_prompt(section: str, template: str = "equity_deep") -> str:
     focus = TEMPLATE_FOCUS.get(t, TEMPLATE_FOCUS["equity_deep"])
     task = SECTION_TASK.get(section, "")
     return f"{IDENTITY}\n{COMPLIANCE}\n{focus}\n{task}"
+
+
+# ────────────────────────────────────────────────────────────
+# v1.8.0：单次流式撰写（一次请求从摘要写到最后一段）
+# ────────────────────────────────────────────────────────────
+SUMMARY_HEADING = "投资摘要"
+
+REPORT_STREAM_COMPLIANCE = (
+    "【数字纪律】所有数字必须严格引用对应事实块中给出的字段，一字不差地沿用其口径；"
+    "事实块未出现的数字一律不得写入，禁止任何形式的估算、推演或编造；"
+    "某部分只能引用该部分自己的事实块（以及【摘要事实】），不得跨部分挪用数字。\n"
+    f"【禁指令词】绝对禁止使用任何买卖指令性动词，包括但不限于：{'、'.join(FORBIDDEN_VERBS)}。"
+    "分层口吻：核心论断用「我们认为/我们预计」，中性偏多用「建议关注/值得关注」，"
+    "谨慎用「短期承压/静待拐点」。\n"
+    "【免责】报告末尾由系统统一附加免责声明，各部分正文不要重复免责语句。"
+)
+
+
+def report_stream_system_prompt(template: str, parts: list[tuple[str, str]]) -> str:
+    """单次流式研报的 system prompt：身份 + 合规 + 模板侧重 + 分部写作任务 + 输出格式。
+
+    parts：按输出顺序的 (标题, 写作任务)；第一项恒为投资摘要。
+    标题行是前端分栏的唯一依据，格式要求写得足够死板，解析器另有容错。
+    """
+    t = (template or "equity_deep").strip()
+    focus = TEMPLATE_FOCUS.get(t, TEMPLATE_FOCUS["equity_deep"])
+    tasks = "\n".join(f"{i + 1}. 「{title}」：{task}" for i, (title, task) in enumerate(parts))
+    headings = "\n".join(f"## {title}" for title, _ in parts)
+    first = parts[0][0] if parts else SUMMARY_HEADING
+    return (
+        f"{IDENTITY}\n{REPORT_STREAM_COMPLIANCE}\n{focus}\n"
+        f"【本次任务】一次性按顺序写完整份研究报告的以下 {len(parts)} 个部分：\n{tasks}\n"
+        "【输出格式——必须严格遵守】\n"
+        "1. 严格按上述顺序输出，每个部分以单独一行的标题行开头，标题行写作「## 标题」，"
+        "标题文字必须与下列完全一致，不得增删改、不得合并或跳过：\n"
+        f"{headings}\n"
+        "2. 标题行之外不要使用任何 Markdown 符号（不要 **、#、-、`、表格）；正文为连贯段落。\n"
+        f"3. 不要输出开场白、目录或结束语，第一行就是「## {first}」。"
+    )
+
+
+SUMMARY_STREAM_TASK = (
+    "基于【摘要事实】撰写投资摘要：结论先行，首句给出当前状态的定性，随后 2-3 句展开核心逻辑链条；"
+    "引用数字须带量纲与方向（如「PE 25.3 倍」「净利润同比 +18.2%」）；"
+    "标注为「未获取」的字段不得写入；禁止空话套话。160-220 字。"
+)

@@ -52,6 +52,8 @@ def to_float(v: Any) -> Optional[float]:
             return float(s[:-1])
         if s.endswith("亿"):
             return float(s[:-1])
+        if s.endswith("万"):
+            return float(s[:-1]) / 10000.0
         return float(s.replace(",", ""))
     except Exception:  # noqa: BLE001
         return None
@@ -92,8 +94,18 @@ def pct(v: Any, d: int = 2, signed: bool = True) -> str:
 
 
 def mult_str(v: Any, d: int = 1) -> str:
-    """倍数渲染（PE/PB）：0 与缺失同义，均为 MISSING（不带"倍"）。"""
+    """倍数渲染（PB 等非负倍数）：0 与缺失同义，均为 MISSING（不带"倍"）。"""
     return measure(v, " 倍", d, zero_missing=True)
+
+
+def pe_str(v: Any, d: int = 1) -> str:
+    """市盈率渲染：0/缺失 → MISSING；负值（亏损）→ 显式标注「亏损（PE 为负）」，避免写「-18.5 倍」误导模型。"""
+    f = to_float(v)
+    if f is None or f == 0.0:
+        return MISSING
+    if f < 0:
+        return f"亏损（PE 为负，{f:.{d}f}）"
+    return f"{f:.{d}f} 倍"
 
 
 def quote_usable(quote: Optional[dict]) -> bool:
@@ -300,7 +312,7 @@ def render_quote_facts(quote: dict) -> str:
         f"【当前行情】{name} · {industry}",
         f"最新价 {measure(quote.get('price'), ' 元', 2, zero_missing=True)}"
         f"（涨跌幅 {pct(quote.get('changePct'), 2)}）；"
-        f"动态 PE {mult_str(quote.get('pe'), 1)}、PB {mult_str(quote.get('pb'), 1)}；"
+        f"动态 PE {pe_str(quote.get('pe'), 1)}、PB {mult_str(quote.get('pb'), 1)}；"
         f"总市值 {val_or_missing(quote.get('marketCap'), 'marketCap')}。",
         f"数据时点：{as_of}；来源：{source}。",
     ]
@@ -351,13 +363,18 @@ def render_news_facts(news: list, web: list = None) -> str:
         title = (n.get("title") or "").strip()
         if not title:
             continue
-        src = n.get("source") or n.get("time") or "公开来源"
-        lines.append(f"· 「{title}」（来源：{src}）")
+        src = str(n.get("source") or "").strip()
+        tm = str(n.get("time") or "").strip()
+        meta = f"{src} · {tm}" if (src and tm) else (src or tm or "公开来源")
+        lines.append(f"· 「{title}」（来源：{meta}）")
         has_any = True
     for w in (web or [])[:3]:
         if not isinstance(w, dict) or not (w.get("title") or "").strip():
             continue
-        lines.append(f"· 「{w['title'].strip()}」（来源：{w.get('source') or '网页'}）")
+        w_src = str(w.get("source") or "").strip()
+        w_tm = str(w.get("time") or "").strip()
+        w_meta = f"{w_src} · {w_tm}" if (w_src and w_tm) else (w_src or w_tm or "网页")
+        lines.append(f"· 「{w['title'].strip()}」（来源：{w_meta}）")
         has_any = True
     if not has_any:
         lines.append(MISSING + "（未检索到可引用的公开资讯）")

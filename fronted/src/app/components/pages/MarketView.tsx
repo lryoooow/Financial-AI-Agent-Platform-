@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { ArrowUpRight, ArrowDownRight, TrendingUp, Search, Loader2, AlertTriangle, Database, Globe2, ShieldCheck, RefreshCw } from "lucide-react";
+import { ArrowUpRight, ArrowDownRight, TrendingUp, Search, Loader2, AlertTriangle, Database, Globe2, ShieldCheck, RefreshCw, History, Star, Trash2 } from "lucide-react";
 import { WATCHLIST, type Stock } from "../../data/market";
-import { api, type Book, type Indicator, type IntradayPoint, type MarketDiagnostics, type Quote, type ResolveHit } from "../../api/client";
+import { api, type Book, type Indicator, type IntradayPoint, type MarketDiagnostics, type Quote, type ResolveHit, type StockHistoryItem } from "../../api/client";
 import { AnimatedNumber } from "../AnimatedNumber";
 import { OrderBook } from "../OrderBook";
 import { IntradayChart } from "../charts/IntradayChart";
@@ -18,8 +18,27 @@ const signalColor: Record<string, string> = {
   超买: "var(--up)",
   死叉: "var(--down)",
   空头: "var(--down)",
+  超卖: "var(--down)",
   中性: "var(--muted-foreground)",
 };
+
+const CST_MARKET_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Shanghai",
+  hour12: false,
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+function isCstTradingHours(): boolean {
+  const parts = CST_MARKET_FMT.formatToParts(new Date());
+  const m: Record<string, string> = {};
+  for (const p of parts) m[p.type] = p.value;
+  const wk = m.weekday ?? "";
+  if (!["Mon", "Tue", "Wed", "Thu", "Fri"].includes(wk)) return false;
+  const mins = (Number(m.hour ?? 0) % 24) * 60 + Number(m.minute ?? 0);
+  return (mins >= 565 && mins <= 695) || (mins >= 778 && mins <= 905);
+}
 
 function fallbackMeta(code: string): Pick<Stock, "code" | "name" | "exchange" | "industry"> {
   const s = WATCHLIST.find((x) => x.code === code);
@@ -128,11 +147,19 @@ export function MarketView({
   code,
   onSelect,
   onResearch,
+  visible = true,
 }: {
   code: string;
   onSelect: (c: string) => void;
-  onResearch: (c: string) => void;
+  onResearch: (c: string, name: string) => void;
+  /** 页面常驻挂载（hidden 切页）：回到前台时刷新搜索记录（其间研究也会计入） */
+  visible?: boolean;
 }) {
+  // v1.8.0：搜索记录（最近查看 + 最常查看），成功加载行情即记一次查看
+  const [history, setHistory] = useState<{ recent: StockHistoryItem[]; frequent: StockHistoryItem[] }>({ recent: [], frequent: [] });
+  const [historyTab, setHistoryTab] = useState<"recent" | "frequent">("recent");
+  const loadHistory = () => api.marketHistory(10).then(setHistory).catch(() => {});
+  useEffect(() => { if (visible) void loadHistory(); }, [visible]);
   const meta = fallbackMeta(code);
   const [stock, setStock] = useState<Quote | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
@@ -154,7 +181,11 @@ export function MarketView({
   const [diagRefreshing, setDiagRefreshing] = useState(false);
 
   const [results, setResults] = useState<ResolveHit[] | null>(null);
+  const [searchError, setSearchError] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [silentRefreshing, setSilentRefreshing] = useState(false);
+  const lastCodeRef = useRef("");
   const [favPrices, setFavPrices] = useState<Record<string, { price: number; changePct: number }>>({});
   const loadSeq = useRef(0);
   const [leftWidth, setLeftWidth] = useState(() => {
@@ -198,35 +229,53 @@ export function MarketView({
     window.addEventListener("pointercancel", onUp, { once: true });
   };
 
+  // 交易时段前台自动静默刷新（每 15 秒更新报价/分时/五档，不打断看图）
+  useEffect(() => {
+    if (!visible) return;
+    const t = window.setInterval(() => {
+      if (document.hidden || !isCstTradingHours()) return;
+      setRefreshTick((n) => n + 1);
+    }, 15_000);
+    return () => window.clearInterval(t);
+  }, [visible]);
+
   useEffect(() => {
     const seq = ++loadSeq.current;
     const ac = new AbortController();
     let cancelled = false;
-    setQuoteLoading(true);
-    setQuoteError("");
-    setChartError("");
-    setStock(null);
-    setDataAsOf("");
-    setIntraday([]);
-    setKline([]);
-    setBook(EMPTY_BOOK);
-    setIndicators([]);
-    setIntradayMeta(null);
-    setKlineMeta(null);
+    const isCodeSwitch = lastCodeRef.current !== code;
+    if (isCodeSwitch) {
+      setQuoteLoading(true);
+      setQuoteError("");
+      setChartError("");
+      setStock(null);
+      setDataAsOf("");
+      setIntraday([]);
+      setKline([]);
+      setBook(EMPTY_BOOK);
+      setIndicators([]);
+      setIntradayMeta(null);
+      setKlineMeta(null);
+    } else {
+      setSilentRefreshing(true);
+    }
 
     const timer = window.setTimeout(() => {
-    (async () => {
+      lastCodeRef.current = code;
+      (async () => {
       try {
         const qq = await api.quote(code, ac.signal);
         if (cancelled || ac.signal.aborted || seq !== loadSeq.current) return;
         if (!isUsableQuote(qq)) {
           // 类型守卫的负分支把 qq 收窄成 null；显式宽化回 Quote|null 再取失败原因
           const reason = (qq as Quote | null)?.provenance?.error || "行情接口未返回有效价格";
-          setQuoteError(reason);
+          if (isCodeSwitch) setQuoteError(reason);
           return;
         }
+        setQuoteError("");
         setStock(qq);
         setDataAsOf(qq.as_of || qq.provenance?.fetched_at || "");
+        if (isCodeSwitch) api.recordStockView(code, qq.name).then(loadHistory).catch(() => {});
 
         const [intraRes, klineRes, bookRes, indRes] = await Promise.allSettled([
           api.intraday(code, ac.signal),
@@ -238,37 +287,42 @@ export function MarketView({
 
         if (intraRes.status === "fulfilled") {
           const v = intraRes.value;
-          setIntraday(v.data || []);
+          if ((v.data || []).length || isCodeSwitch) setIntraday(v.data || []);
           setIntradayMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
         }
         if (klineRes.status === "fulfilled") {
           const v = klineRes.value;
-          setKline(v.data || []);
+          if ((v.data || []).length || isCodeSwitch) setKline(v.data || []);
           setKlineMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
         }
         if (bookRes.status === "fulfilled") setBook(bookRes.value);
         if (indRes.status === "fulfilled" && indRes.value.length) setIndicators(indRes.value);
 
-        const missing: string[] = [];
-        if (intraRes.status !== "fulfilled" || !(intraRes.value.data || []).length) missing.push("分时");
-        if (klineRes.status !== "fulfilled" || !(klineRes.value.data || []).length) missing.push("日K");
-        if (missing.length) setChartError(`${missing.join("、")}未返回真实数据，请检查数据源或稍后重试。`);
+        if (isCodeSwitch) {
+          const missing: string[] = [];
+          if (intraRes.status !== "fulfilled" || !(intraRes.value.data || []).length) missing.push("分时");
+          if (klineRes.status !== "fulfilled" || !(klineRes.value.data || []).length) missing.push("日K");
+          if (missing.length) setChartError(`${missing.join("、")}未返回真实数据，请检查数据源或稍后重试。`);
+        }
       } catch (e) {
-        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current) {
+        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current && isCodeSwitch) {
           setQuoteError(e instanceof Error ? e.message : String(e));
         }
       } finally {
-        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current) setQuoteLoading(false);
+        if (!cancelled && !ac.signal.aborted && seq === loadSeq.current) {
+          setQuoteLoading(false);
+          setSilentRefreshing(false);
+        }
       }
     })();
-    }, 120);
+    }, isCodeSwitch ? 120 : 0);
 
     return () => {
       cancelled = true;
       ac.abort();
       window.clearTimeout(timer);
     };
-  }, [code]);
+  }, [code, refreshTick]);
 
   // 诊断：仅挂载时读一次 fast（零网络）；不再随 code/quoteError 重探（避免重试风暴）。手动刷新才探测。
   useEffect(() => {
@@ -298,20 +352,28 @@ export function MarketView({
     const query = q.trim();
     if (!query) {
       setResults(null);
+      setSearchError(false);
       setSearching(false);
       return;
     }
     setSearching(true);
+    setSearchError(false);
     let cancelled = false;
     const ac = new AbortController();
     const t = setTimeout(async () => {
       try {
         const r = await api.resolve(query, 12, ac.signal);
-        if (!cancelled) setResults(r);
+        if (!cancelled) {
+          setResults(Array.isArray(r) ? r : []);
+          setSearchError(false);
+        }
       } catch (e) {
         if ((e as DOMException)?.name === "AbortError") return;
-        // v1.6.3（E）：服务错误与无结果区分（旧实现统一清空 → 用户误以为"查无此股"）
-        if (!cancelled) setResults("service-error" as unknown as never);
+        // 服务错误独立由 searchError 标识，results 严格保持数组类型，杜绝 list.map 崩溃
+        if (!cancelled) {
+          setSearchError(true);
+          setResults([]);
+        }
       } finally {
         if (!cancelled) setSearching(false);
       }
@@ -395,14 +457,14 @@ export function MarketView({
           <div className="p-2.5 border-b border-border">
             <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
               <Search className="size-3.5 text-muted-foreground" />
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
+              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码/首字母）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
               {searching && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
             </div>
-            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{results ? `全市场结果 ${list.length} 条` : "常用标的"}</p>
+            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{searchError ? "搜索服务异常" : results ? `全市场结果 ${list.length} 条` : "常用标的"}</p>
           </div>
           <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
-            {list.length === 0 && results === ("service-error" as unknown as never) && <div className="text-center text-[11px] text-destructive/80 py-8">搜索服务暂时不可用，请稍后重试</div>}
-            {list.length === 0 && Array.isArray(results) && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
+            {list.length === 0 && searchError && <div className="text-center text-[11px] text-destructive/80 py-8">搜索服务暂时不可用，请稍后重试</div>}
+            {list.length === 0 && !searchError && Array.isArray(results) && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
             {list.map((s) => (
               <button key={s.code} onClick={() => onSelect(s.code)} className={`w-full flex items-center justify-between px-2 py-2 rounded-lg transition-colors ${s.code === display.code ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"}`}>
                 <div className="text-left leading-tight min-w-0">
@@ -411,7 +473,7 @@ export function MarketView({
                 </div>
                 <div className="text-right leading-tight">
                   <div className={`text-xs tabular ${trendClass(s.changePct ?? 0)}`}>{s.price ? fmt(s.price) : "—"}</div>
-                  <div className={`text-[10px] tabular ${trendClass(s.changePct ?? 0)}`}>{s.changePct == null ? "—" : `${signed(s.changePct)}%`}</div>
+                  <div className={`text-[10px] tabular ${trendClass(s.changePct ?? 0)}`}>{typeof s.changePct === "number" && Number.isFinite(s.changePct) ? `${signed(s.changePct)}%` : "—"}</div>
                 </div>
               </button>
             ))}
@@ -427,7 +489,71 @@ export function MarketView({
         <div className="my-2 w-1 rounded-full bg-border transition-colors group-hover:bg-gold/60" />
       </div>
 
-      <div className="flex flex-col gap-4 min-h-0 flex-1 min-w-0">
+      <div className="flex flex-col gap-4 min-h-0 flex-1 min-w-0 overflow-y-auto">
+        {/* 窄窗口搜索入口（lg 以下左侧栏隐藏时仍可搜股切换） */}
+        <div className="lg:hidden rounded-xl border border-border bg-card p-2.5 relative">
+          <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
+            <Search className="size-3.5 text-muted-foreground" />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索全 A 股（名称/代码/拼音首字母）"
+              className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground"
+            />
+            {searching && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
+          </div>
+          {q.trim() && (
+            <div className="mt-1.5 max-h-48 overflow-y-auto rounded-lg border border-border bg-popover p-1 space-y-0.5">
+              {searchError ? (
+                <div className="text-center text-[11px] text-destructive py-3">搜索服务暂时不可用</div>
+              ) : list.length === 0 ? (
+                <div className="text-center text-[11px] text-muted-foreground py-3">未找到匹配股票</div>
+              ) : (
+                list.map((s) => (
+                  <button
+                    key={s.code}
+                    onClick={() => { onSelect(s.code); setQ(""); }}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs hover:bg-secondary"
+                  >
+                    <span className="truncate">{s.name} <span className="text-muted-foreground tabular">{s.code}</span></span>
+                    <span className={`tabular ${trendClass(s.changePct ?? 0)}`}>{s.price ? fmt(s.price) : ""}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          )}
+        </div>
+        {(history.recent.length > 0 || history.frequent.length > 0) && (
+          <div className="rounded-xl border border-border bg-card px-3 py-2 flex items-center gap-2 min-w-0">
+            <div className="flex rounded-md bg-secondary/60 p-0.5 text-[11px] shrink-0">
+              <button onClick={() => setHistoryTab("recent")} className={`flex items-center gap-1 rounded px-2 py-0.5 ${historyTab === "recent" ? "bg-card text-foreground" : "text-muted-foreground"}`}>
+                <History className="size-3" /> 最近
+              </button>
+              <button onClick={() => setHistoryTab("frequent")} className={`flex items-center gap-1 rounded px-2 py-0.5 ${historyTab === "frequent" ? "bg-card text-foreground" : "text-muted-foreground"}`}>
+                <Star className="size-3" /> 常看
+              </button>
+            </div>
+            <div className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto">
+              {(historyTab === "recent" ? history.recent : history.frequent).map((h) => (
+                <button
+                  key={h.code}
+                  onClick={() => onSelect(h.code)}
+                  title={`${h.code} · 查看 ${h.count} 次 · 最近 ${h.last_viewed}`}
+                  className={`shrink-0 text-[11px] px-2 py-1 rounded-md transition-colors ${h.code === code ? "bg-accent text-gold" : "bg-secondary/50 text-foreground/80 hover:bg-secondary"}`}
+                >
+                  {h.name}{historyTab === "frequent" && <span className="ml-1 text-muted-foreground">×{h.count}</span>}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => { if (window.confirm("清除全部行情搜索记录？")) api.clearMarketHistory().then(loadHistory).catch(() => {}); }}
+              className="grid place-items-center size-6 rounded text-muted-foreground hover:text-destructive shrink-0"
+              title="清除搜索记录"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        )}
         <motion.div layout className="rounded-xl border border-border bg-card p-4">
           <div className="flex flex-wrap items-end justify-between gap-4">
             <div>
@@ -444,22 +570,36 @@ export function MarketView({
                 <div className="mt-3 text-sm text-destructive">行情获取失败：{quoteError}</div>
               ) : (
                 <div className="mt-2 flex items-end gap-3">
-                  <AnimatedNumber value={display.price} className={`${trendClass(display.change)}`} decimals={2} />
+                  <AnimatedNumber value={display.price} className={`${trendClass(display.change)}`} decimals={display.price > 0 && display.price < 5 ? 3 : 2} />
                   <div className={`flex items-center gap-1 ${trendClass(display.change)}`}>
                     <Arrow className="size-4" />
-                    <span className="tabular text-sm">{signed(display.change)}</span>
+                    <span className="tabular text-sm">{signed(display.change, display.price > 0 && display.price < 5 ? 3 : 2)}</span>
                     <span className="tabular text-sm">({signed(display.changePct)}%)</span>
                   </div>
                 </div>
               )}
             </div>
-            <button onClick={() => onResearch(display.code)} disabled={!!quoteError || quoteLoading} className="flex items-center gap-1.5 rounded-lg bg-gold px-3.5 py-2 text-sm text-[#17140a] hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
-              <TrendingUp className="size-4" strokeWidth={2.4} /> 生成研究报告
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setRefreshTick((n) => n + 1)}
+                disabled={quoteLoading || silentRefreshing}
+                title="刷新实时行情"
+                className="flex items-center gap-1.5 rounded-lg bg-secondary hover:bg-secondary/70 px-3 py-2 text-xs text-foreground/85 disabled:opacity-50 transition-colors"
+              >
+                <RefreshCw className={`size-3.5 ${silentRefreshing ? "animate-spin" : ""}`} /> 刷新
+              </button>
+              <button onClick={() => onResearch(display.code, display.name || meta.name)} disabled={quoteLoading} className="flex items-center gap-1.5 rounded-lg bg-gold px-3.5 py-2 text-sm text-[#17140a] hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
+                <TrendingUp className="size-4" strokeWidth={2.4} /> 深度研究
+              </button>
+            </div>
           </div>
 
           <div className="mt-3 grid grid-cols-4 sm:grid-cols-6 gap-x-4 gap-y-2 text-xs">
-            {[["今开", display.open ? fmt(display.open) : "—"], ["最高", display.high ? fmt(display.high) : "—"], ["最低", display.low ? fmt(display.low) : "—"], ["昨收", display.prevClose ? fmt(display.prevClose) : "—"], ["成交量", display.volume], ["成交额", display.turnover]].map(([k, v]) => (
+            {(() => {
+              const pDec = display.price > 0 && display.price < 5 ? 3 : 2;
+              return [["今开", display.open ? fmt(display.open, pDec) : "—"], ["最高", display.high ? fmt(display.high, pDec) : "—"], ["最低", display.low ? fmt(display.low, pDec) : "—"], ["昨收", display.prevClose ? fmt(display.prevClose, pDec) : "—"], ["成交量", display.volume], ["成交额", display.turnover]];
+            })().map(([k, v]) => (
               <div key={k} className="flex flex-col">
                 <span className="text-muted-foreground text-[10px]">{k}</span>
                 <span className="tabular text-foreground/90">{v}</span>
@@ -530,7 +670,12 @@ export function MarketView({
         <div className="rounded-xl border border-border bg-card overflow-hidden">
           <div className="px-3 py-2.5 border-b border-border text-sm">基本面</div>
           <div className="grid grid-cols-2 gap-px bg-border">
-            {[["市值", display.marketCap], ["市盈率 PE", display.pe ? fmt(display.pe, 1) : "—"], ["市净率 PB", display.pb ? fmt(display.pb, 1) : "—"], ["ROE", display.roe ? fmt(display.roe, 1) + "%" : "—"]].map(([k, v]) => (
+            {[
+              ["市值", display.marketCap],
+              ["市盈率 PE", display.pe < 0 ? `${fmt(display.pe, 1)}（亏）` : display.pe > 0 ? fmt(display.pe, 1) : "—"],
+              ["市净率 PB", display.pb ? fmt(display.pb, 1) : "—"],
+              ["ROE", display.roe ? fmt(display.roe, 1) + "%" : "—"],
+            ].map(([k, v]) => (
               <div key={k} className="bg-card p-3">
                 <div className="text-[10px] text-muted-foreground">{k}</div>
                 <div className="tabular text-sm text-foreground/90 mt-0.5">{v}</div>

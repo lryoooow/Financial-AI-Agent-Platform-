@@ -29,10 +29,10 @@ from ...tools import facts as facts_mod
 from ...tools.entity import to_market_ticker
 from ...tools.industry import search_industry as _search_industry
 from ...tools.news import search_news as _search_news
-from .._utils import _timed_call
+from .._utils import _timed_call, sanitize_err_text
 from ..workers.entity_resolver import entity_node
 from ..workers.market import market_node
-from ..workers.report import _stream_push, report_node, summary_node
+from ..workers.report import _stream_push, _write_mode, report_node, summary_node
 from ..workers.research import research_node
 
 # 行业估值取数超时：与 deep/tools.py 的 _T_INDUSTRY 对齐（实测并行冷启动 5-12s）
@@ -96,14 +96,17 @@ def _summarize_findings(fv: dict) -> str:
     return "、".join(bits)
 
 
-def _emit_summary(state: dict, summary: str) -> None:
+def _emit_summary(state: dict, summary: str, *, header_only: bool = False) -> None:
     """把摘要快照作为 custom 事件推给前端，字段与旧路由发的 summary 事件逐字段一致。
 
     摘要是完整事实快照，不是模型 token —— 前端用替换语义渲染，重连/回放时不会重复 append。
+    header_only（v1.8.0 单次流式）：只推标的头信息（名称/代码/现价），摘要正文随后由模型流式写出。
     """
-    if not summary:
+    if not summary and not header_only:
         return
     quote = (state.get("facts") or {}).get("quote") or {}
+    prof = (state.get("facts") or {}).get("profile") or {}
+    usable = facts_mod.quote_usable(quote)
     # ticker 必须是带市场后缀的前端格式（600519.SH）：Workspace.tsx:183 直接拿 ev.ticker 当 code 用。
     # normalize_ticker 返回的是裸代码（600519），照发会让前端拿到错的标的格式。
     # v1.6.0（审计 B8）：行业链路的 normalized_ticker 是申万行业码（如 801735），
@@ -114,16 +117,23 @@ def _emit_summary(state: dict, summary: str) -> None:
     ticker = to_market_ticker(raw) if (raw and not is_industry and raw.isdigit() and len(raw) == 6) else raw
     _stream_push({
         "type": "research_summary",
-        "text": summary,
-        "name": quote.get("name") or "",
+        "text": "" if header_only else summary,
+        "name": quote.get("name") or prof.get("name") or "",
         "ticker": ticker,
-        "price": quote.get("price"),
-        "change": quote.get("change"),
-        "changePct": quote.get("changePct"),
+        "price": quote.get("price") if usable else None,
+        "change": quote.get("change") if usable else None,
+        "changePct": quote.get("changePct") if usable else None,
     })
 
 
-def build_research_tools(task_id: str, template: str, llm_config: Optional[dict], profile: dict):
+def build_research_tools(
+    task_id: str,
+    template: str,
+    llm_config: Optional[dict],
+    profile: dict,
+    write_mode: Optional[str] = None,
+    query: str = "",
+):
     """按任务构造工具（task_id / 模板 / 模型配置闭包进去，模型不用也不该传这些）。"""
 
     @tool
@@ -141,14 +151,38 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
         Args:
             code: 标的代码，如 "600519.SH"；不确定就先用 resolve_entity 查。
         """
+        _stream_push("正在识别标的与交易状态…")
         ent = await entity_node({"code": code})
+        if ent.get("error"):
+            return json.dumps({"error": str(ent["error"])}, ensure_ascii=False)
         norm = ent.get("normalized_ticker") or code
-        state = {"code": norm, "normalized_ticker": norm}
+        state = {"code": code, "normalized_ticker": norm}
 
-        # 旧图是 research → market 串行（add_edge）；这里并行，行为一致但更快。
-        research_out, market_out = await asyncio.gather(
-            research_node(state), market_node(state)
-        )
+        _stream_push("正在并行拉取实时行情、K线与财务资讯…")
+        r_task = asyncio.create_task(research_node(state))
+        m_task = asyncio.create_task(market_node(state))
+        try:
+            done, pending = await asyncio.wait({r_task, m_task}, return_when=asyncio.FIRST_COMPLETED)
+            if m_task in done and r_task in pending:
+                m_preview = m_task.result()
+                early_fv = facts_mod.normalize_findings(
+                    ent.get("findings", []) + m_preview.get("findings", [])
+                )
+                _emit_summary(
+                    {"code": code, "normalized_ticker": norm, "facts": early_fv},
+                    "",
+                    header_only=True,
+                )
+                _stream_push("✓ 实时行情与技术指标已就绪，正在获取财务指标与公开资讯…")
+            elif r_task in done and m_task in pending:
+                _stream_push("✓ 财务指标与公开资讯已就绪，正在获取实时行情与技术指标…")
+            research_out, market_out = await asyncio.gather(r_task, m_task)
+        except BaseException:
+            for t in (r_task, m_task):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(r_task, m_task, return_exceptions=True)
+            raise
 
         findings = (
             ent.get("findings", [])
@@ -183,6 +217,7 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
         Args:
             industry_name: 行业名称，如 "光伏" / "半导体" / "白酒"
         """
+        _stream_push(f"正在检索「{industry_name}」申万行业估值与行业资讯…")
         # 行业估值 + 行业新闻并行取。行业新闻用行业名作关键词走 search_news 的东财源
         # （它接受任意关键词，不止个股代码）。
         iv_res, news_res = await asyncio.gather(
@@ -197,7 +232,8 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
             prov_err = (iv.get("provenance") or {}).get("error") if isinstance(iv, dict) else None
             source_failed = bool(iv_err) or bool(prov_err)
             if source_failed:
-                reason = f"数据源暂时不可用（{iv_err or prov_err}），请稍后重试"
+                safe_detail = sanitize_err_text(iv_err or prov_err)
+                reason = f"数据源暂时不可用（{safe_detail}），请稍后重试"
             else:
                 reason = f"未找到名为「{industry_name}」的行业，请换个说法（如「光伏」「半导体」「白酒」）"
             # v1.6.0（审计 E2）：结构化错误 —— 纯字符串会让前端 tool_call 状态显示成
@@ -220,6 +256,11 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
             "fins": {"years": [], "rows": []},
             "indicators": [],
         }
+        _emit_summary(
+            {"normalized_ticker": top.get("code", ""), "is_industry": True, "facts": fv},
+            "",
+            header_only=True,
+        )
         findings = [
             {"key": "industry", "title": "行业估值", "items": iv.get("items", []),
              "provenance": iv.get("provenance")},
@@ -227,7 +268,7 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
              "provenance": (news or {}).get("provenance") if isinstance(news, dict) else None},
         ]
         citations = [
-            {"title": f"[行业估值] {top.get('name','')} · 申万/新浪", "url": "sw_index_info",
+            {"title": f"[行业估值] {top.get('name','')} · 申万行业估值", "url": "sw_index_info",
              "date": "", "kind": "industry"},
         ]
         for n in news_items[:6]:
@@ -267,6 +308,7 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
             "code": stored.get("normalized_ticker", ""),
             "normalized_ticker": stored.get("normalized_ticker", ""),
             "template": "industry" if stored.get("is_industry") else template,
+            "query": query or "",
             "task_id": task_id,
             "profile": profile,
             "llm_config": llm_config,
@@ -277,6 +319,8 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
             "data_as_of": stored.get("data_as_of", ""),
             # 行业研究：告诉 report_node 别把行业代码（801735.SI）当个股过 to_market_ticker
             "is_industry": bool(stored.get("is_industry")),
+            "industry_name": str(stored.get("industry_name") or ""),
+            "write_mode": write_mode,
         }
 
         # 先跑 summary_node，再跑 report_node —— 复刻旧图的 summary → report 边，一步都不能省：
@@ -284,13 +328,16 @@ def build_research_tools(task_id: str, template: str, llm_config: Optional[dict]
         # 2) report_use_llm_summary=True 时摘要由 LLM 撰写，与四段口吻统一。
         # 只调 report_node 的话，它那句 `state.get("draft_summary") or _compose_summary_block(...)`
         # 会永远走规则模板——LLM 摘要这条路就被静默砍掉了，开关打开也没反应。
-        sum_out = await summary_node(state)
+        stream_mode = _write_mode(state) == "stream"
+        sum_out = await summary_node(state, announce=not stream_mode)
         state["draft_summary"] = sum_out.get("draft_summary", "")
         state["facts"] = sum_out.get("facts") or state["facts"]
 
         # 摘要快照推给前端：旧路由是在 updates 流里看到 summary 节点完成时发 summary 事件；
         # 现在 summary_node 跑在工具内部，updates 流看不见它，改用 custom 事件带出去。
-        _emit_summary(state, sum_out.get("draft_summary", ""))
+        # v1.8.0：单次流式下只推标的头信息 —— 摘要正文由模型在同一条流里第一个写出，
+        # 不再「规则摘要先跳出来、正文段落再慢慢等」。
+        _emit_summary(state, sum_out.get("draft_summary", ""), header_only=stream_mode)
 
         out = await report_node(state)
         doc = out.get("draft_report")

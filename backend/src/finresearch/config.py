@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     #（多 3 次非流式模型往返，接思考模型时每次 30–120s 静默）。标的不是规范代码时
     # 无论此项如何都走 agent（需要 resolve_entity 理解意图）。
     research_agent_loop: bool = Field(default=False)
+    # v1.8.0：研究撰写模式。stream（默认）= 单次流式（一次请求从摘要写到最后一段，
+    # 思维链只出现一次、各段首尾相接逐 token 外发）；parallel = v1.7 的分段并行。
+    # 设置页「研究 · 撰写模式」可按用户覆盖（LocalSetting app-settings）。
+    report_write_mode: str = Field(default="stream")
     # v1.7.0 清理：context_summary_timeout_s 已删 —— 旧手写上下文摘要链路的遗留死配置，
     # 全仓零引用（对话上下文治理已移交 deepagents SummarizationMiddleware，无超时参数可配）。
 

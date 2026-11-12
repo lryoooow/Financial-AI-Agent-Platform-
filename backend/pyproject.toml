@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finresearch"
-version = "1.7.1"
+version = "1.8.1"
 description = "景渊 JingYuan · 家用本地金融研究助手后端（akshare + LangGraph 固定管线）"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -51,6 +51,8 @@ dependencies = [
   "rapidfuzz>=3.6",
   "python-dotenv>=1.0.1",
   "chinese-calendar>=1.9",  # 中国法定节假日/调休日历（休市日判断，替代硬编码）
+  "psutil>=5.9",            # 桌面父进程看门狗
+  "pywin32>=306; sys_platform == 'win32'",  # Windows DPAPI 密钥加密
 ]
 
 [project.optional-dependencies]
@@ -67,4 +69,4 @@ dev = ["pytest>=8.0", "httpx>=0.27"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-finresearch = ["report_templates/*.html", "data/*.json"]
+finresearch = ["report_templates/*.html", "data/*.json", "static/**/*"]

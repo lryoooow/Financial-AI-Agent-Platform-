@@ -31,13 +31,14 @@ import re
 from typing import Any, AsyncIterator, Optional
 
 from ...api import sse
+from .._utils import sanitize_err_text
 from ..workers.report import PUSH_SINK
 from .research_tools import _put, build_research_tools
 from .stream import _tool_failed, custom_event_to_sse, tool_label
 
 logger = logging.getLogger(__name__)
 
-_TICKER_RE = re.compile(r"^\d{6}(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
+_TICKER_RE = re.compile(r"^(?:(?:SH|SZ|BJ)\s*)?\d{6}(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
 
 
 def is_direct_target(code: str, template: str) -> bool:
@@ -105,11 +106,18 @@ async def run_research_direct(
     template: str,
     llm_config: Optional[dict],
     profile: Optional[dict],
+    write_mode: Optional[str] = None,
+    query: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """按固定流程执行研究，产出 SSE 行。失败原因写入工具层存储的 "failure" 键，
     供 routes 落库（报告草稿同样从存储取回，与 agent 路径一致）。"""
     tpl = (template or "equity_deep").strip() or "equity_deep"
-    tools = {t.name: t for t in build_research_tools(task_id, tpl, llm_config, profile or {})}
+    tools = {
+        t.name: t
+        for t in build_research_tools(
+            task_id, tpl, llm_config, profile or {}, write_mode=write_mode, query=query or ""
+        )
+    }
     if tpl == "industry":
         steps = [("prefetch_industry", {"industry_name": code.strip()})]
     else:
@@ -131,7 +139,7 @@ async def run_research_direct(
             raise
         except Exception as exc:  # noqa: BLE001  工具异常 = 该步失败，如实上报
             logger.exception("研究工具 %s 失败：%s", name, exc)
-            _put(task_id, "failure", f"{label}失败：{exc}")
+            _put(task_id, "failure", f"{label}失败：{sanitize_err_text(exc)}")
             yield sse.ev_tool_call(name, label, "error")
             return
         failed = _tool_failed(result)

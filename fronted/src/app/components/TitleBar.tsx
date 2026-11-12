@@ -1,7 +1,8 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { motion } from "motion/react";
-import { Wifi, Minus, Square, Copy, X } from "lucide-react";
+import { Wifi, WifiOff, Minus, Square, Copy, X } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
+import { api } from "../api/client";
 import logoMark from "../assets/logo-mark.svg";
 
 /**
@@ -13,14 +14,55 @@ import logoMark from "../assets/logo-mark.svg";
  * - 右侧控制按钮区 `-webkit-app-region: no-drag`，点击触发 IPC 真控窗口；
  * - 浏览器运行态（非 Electron）下 window.finresearch 不存在，按钮降级为可视不触发。
  */
+const CST_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Shanghai",
+  hour12: false,
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+
+function getCstClock(d: Date): { timeText: string; trading: boolean } {
+  const parts = CST_FMT.formatToParts(d);
+  const map: Record<string, string> = {};
+  for (const p of parts) map[p.type] = p.value;
+  const hh = Number(map.hour ?? 0) % 24;
+  const mm = Number(map.minute ?? 0);
+  const ss = map.second ?? "00";
+  const wk = map.weekday ?? "";
+  const isWorkday = wk === "Mon" || wk === "Tue" || wk === "Wed" || wk === "Thu" || wk === "Fri";
+  const mins = hh * 60 + mm;
+  const trading = isWorkday && ((mins >= 570 && mins <= 690) || (mins >= 780 && mins <= 900));
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  return { timeText: `${pad2(hh)}:${pad2(mm)}:${ss}`, trading };
+}
+
 export function TitleBar() {
   const [now, setNow] = useState(new Date());
   const [maximized, setMaximized] = useState(false);
+  const [healthOk, setHealthOk] = useState<boolean | null>(null);
   const win = typeof window !== "undefined" ? window.finresearch?.window : undefined;
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkHealth = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      api.health()
+        .then((r) => { if (!cancelled) setHealthOk(r.status === "ok"); })
+        .catch(() => { if (!cancelled) setHealthOk(false); });
+    };
+    checkHealth();
+    const t = setInterval(checkHealth, 15_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
 
   // 初始最大化状态 + 订阅变化（Electron 主进程 push）
@@ -32,10 +74,8 @@ export function TitleBar() {
     return () => unsub?.();
   }, [win]);
 
-  // 交易时段判断（09:30–11:30, 13:00–15:00 工作日）
-  const mins = now.getHours() * 60 + now.getMinutes();
-  const day = now.getDay();
-  const trading = day >= 1 && day <= 5 && ((mins >= 570 && mins <= 690) || (mins >= 780 && mins <= 900));
+  // 交易时段判断（北京时间 09:30–11:30, 13:00–15:00 工作日）
+  const { timeText, trading } = useMemo(() => getCstClock(now), [now]);
 
   const onDouble = () => win?.maximizeToggle();  // 双击标题栏切换最大化（Windows 习惯）
 
@@ -57,8 +97,17 @@ export function TitleBar() {
       {/* 中：状态 */}
       <div className="hidden md:flex items-center gap-4 text-xs text-muted-foreground">
         <div className="flex items-center gap-1.5">
-          <Wifi className="size-3.5 text-down" />
-          <span>本地服务 · 已连接</span>
+          {healthOk === false ? (
+            <>
+              <WifiOff className="size-3.5 text-up" />
+              <span className="text-up">本地服务 · 未连接</span>
+            </>
+          ) : (
+            <>
+              <Wifi className={`size-3.5 ${healthOk ? "text-down" : "text-muted-foreground"}`} />
+              <span>{healthOk ? "本地服务 · 已连接" : "本地服务 · 连接中"}</span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           <motion.span
@@ -69,8 +118,8 @@ export function TitleBar() {
           />
           <span>{trading ? "交易中" : "已休市"}</span>
         </div>
-        <span className="tabular text-foreground/70">
-          {now.toLocaleTimeString("zh-CN", { hour12: false })}
+        <span className="tabular text-foreground/70" title="北京时间 (UTC+8)">
+          {timeText}
         </span>
       </div>
 
@@ -101,7 +150,7 @@ export function TitleBar() {
         <button
           type="button"
           aria-label="关闭"
-          title="关闭"
+          title="关闭（驻留托盘，研究在后台继续）"
           onClick={() => win?.close()}
           className="grid place-items-center h-10 w-12 text-muted-foreground hover:bg-[#c42b1c] hover:text-white transition-colors"
         >

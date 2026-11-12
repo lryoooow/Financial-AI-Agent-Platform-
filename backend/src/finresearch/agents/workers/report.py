@@ -22,20 +22,36 @@ v1.7.0 起各段经 _llm_section 真流式**并行撰写**（并发闸 _LLM_GATE
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
+import html as html_lib
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from ...config import settings
-from ...llm import ThinkTagSplitter, build_llm, is_reasoning_model, reasoning_effort_of, strip_think
+from ...llm import (
+    ThinkTagSplitter,
+    build_llm,
+    is_reasoning_model,
+    llm_available,
+    reasoning_effort_of,
+    strip_think,
+)
 from ...tools import facts, report as report_tool
 from ...tools.context import build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
+from .._utils import sanitize_err_text
 from ..prompts import (
     FORBIDDEN_VERBS,
+    SECTION_TASK,
+    SUMMARY_FACTS_TEMPLATE,
+    SUMMARY_HEADING,
+    SUMMARY_STREAM_TASK,
     SUMMARY_USER_TEMPLATE,
+    report_stream_system_prompt,
     section_system_prompt,
     summary_system_prompt,
 )
@@ -133,15 +149,38 @@ def _stream_push(msg) -> None:
         pass
 
 
-def check_generated(text: str) -> List[str]:
-    """检测 LLM 产出是否命中禁用词，返回命中列表（不改写文本）。
+_QUOTED_SPAN_RE = re.compile(r"「[^」\n]{0,180}」|“[^”\n]{0,180}”")
+_UNCLOSED_QUOTE_TAIL_RE = re.compile(r"(?:「[^」\n]{0,140}|“[^”\n]{0,140})$")
+_NEUTRAL_FIN_TERMS_RE = re.compile(
+    r"(?:"
+    r"净买入|净卖出|融资买入|融券卖出|买入额|卖出额|大宗交易买入|大宗交易卖出"
+    r"|买入评级|卖出评级|(?:维持|给予|上调至|下调至|获)买入"
+    r"|不构成(?:任何)?[^\n。；！？]{0,20}"
+    r")"
+)
 
-    旧 _sanitize 盲替换会污染引文、产生"不建议建议关注（偏多）"等语义崩坏；
-    此处只检测，命中后由调用方截断（对话）或回退模板（报告）——无重写环节。
+
+def _clean_query(state: dict) -> str:
+    raw = str(state.get("query") or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[\r\n\t]+", " ", raw).strip()
+    return cleaned[:200]
+
+
+def check_generated(text: str, *, streaming: bool = False) -> List[str]:
+    """检测 LLM 产出是否命中禁用指令词，返回命中列表（不改写文本）。
+
+    先剥离客观引文（「新闻标题」/“引文”）、中性市场数据术语（净买入/融资买入/买入评级）
+    与合规免责声明（不构成任何买入或卖出建议），避免引用真实快讯标题时误抹除已流式章节。
     """
     if not text:
         return []
-    return [w for w in FORBIDDEN_VERBS if w in text]
+    cleaned = _QUOTED_SPAN_RE.sub(" ", text)
+    if streaming:
+        cleaned = _UNCLOSED_QUOTE_TAIL_RE.sub(" ", cleaned)
+    cleaned = _NEUTRAL_FIN_TERMS_RE.sub(" ", cleaned)
+    return [w for w in FORBIDDEN_VERBS if w in cleaned]
 
 
 # ────────────────────────────────────────────────────────────
@@ -253,8 +292,10 @@ def _support_resistance(kline: list, im: dict) -> str:
     boll_sig = boll.get("signal", "中性")
     if boll_mid:
         pos_desc = {
-            "多头": "运行于布林带中轨之上，相对位置偏强",
-            "空头": "运行于布林带下轨之下，相对位置偏弱",
+            "超买": "突破布林带上轨，短线处于超买偏强区间",
+            "超卖": "跌破布林带下轨，短线处于超卖偏弱区间",
+            "多头": "运行于布林带中轨与上轨之间，相对位置偏强",
+            "空头": "运行于布林带中轨与下轨之间，相对位置偏弱",
             "中性": "围绕布林带中轨震荡",
         }.get(boll_sig, "围绕布林带中轨震荡")
         parts.append(
@@ -464,7 +505,8 @@ def _section_industry_company(fv: dict) -> str:
     web = fv.get("web", [])
     name = quote.get("name") or profile.get("name", "")
     industry = quote.get("industry") or profile.get("industry", "")
-    market_cap = quote.get("marketCap") or profile.get("market_cap", "—")
+    raw_mc = quote.get("marketCap")
+    market_cap = raw_mc if (raw_mc and raw_mc != "—") else (profile.get("market_cap") or "—")
     parts = [
         f"【行业定位】{name}所属{industry or '（行业未识别）'}行业，"
         f"总市值约 {market_cap}。"
@@ -772,6 +814,9 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
         return f"（{spec.title}所需数据不足，本报告不展开该部分。）", "insufficient"
 
     facts_block = spec.build_facts(fv)
+    q = _clean_query(state)
+    if q:
+        facts_block += f"\n\n【用户重点关注】{q}（仅在事实块已有数据范围内回应，无对应数据则如实说明未获取，禁止编造。）"
     sys_prompt = section_system_prompt(spec.key, template)
 
     # temperature 统一 1.0：o3 / QwQ 等推理模型拒绝非默认 temperature，
@@ -845,7 +890,7 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
             return True  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
         # 实时禁用词闸：并入这段 token 会命中禁用词，就不外发它、停止流式，
         # 转下方回退模板（最终 report_section 事件会以模板 body 覆盖已流出的片段）。
-        if check_generated(acc + tok):
+        if check_generated(acc + tok, streaming=True):
             forbidden = True
             return False
         acc += tok
@@ -869,6 +914,12 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
                         thinking += rc
                         _push_thinking()
                     content, inline_rc = splitter.feed(_extract_token(chunk))
+                    if splitter.orphan_think_closed:
+                        splitter.orphan_think_closed = False
+                        thinking += acc
+                        acc = ""
+                        parts.clear()
+                        _push_thinking(force=True)
                     if inline_rc:
                         thinking += inline_rc
                         _push_thinking()
@@ -878,7 +929,7 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
                     tail, inline_rc = splitter.flush()
                     thinking += inline_rc
                     _accept(tail)
-        if forbidden:
+        if forbidden or check_generated("".join(parts)):
             finalize_diag(diag, _elapsed(), error="forbidden_verbs")
             return spec.fallback(fv) + "（模型输出含禁用表述，已使用事实模板。）", "template"
         text = "".join(parts)
@@ -930,7 +981,7 @@ def _quote_measures(quote: dict) -> dict:
     return {
         "price": facts.measure(quote.get("price"), " 元", 2, zero_missing=True),
         "change_pct": facts.pct(quote.get("changePct"), 2),
-        "pe": facts.mult_str(quote.get("pe"), 1),
+        "pe": facts.pe_str(quote.get("pe"), 1),
         "pb": facts.mult_str(quote.get("pb"), 1),
         "market_cap": facts.val_or_missing(quote.get("marketCap"), "marketCap"),
     }
@@ -993,18 +1044,13 @@ def _compose_summary_block(state: ResearchState, fv: dict) -> str:
     )
 
 
-async def _llm_summary(state: ResearchState, fv: dict) -> str:
-    """分析师级摘要。使用 summary_system_prompt（此前死代码，现已接上）。
-
-    LLM 未配置或失败时回退模板（数字仍来自事实块，缺失走 MISSING）。
-    """
+def _summary_facts(state: ResearchState, fv: dict) -> dict:
+    """投资摘要的结构化事实槽位（LLM 摘要与单次流式撰写共用；缺失统一走 MISSING）。"""
     quote = fv.get("quote", {})
     profile = fv.get("profile", {})
     fins = fv.get("fins", {})
     name = quote.get("name", "")
     code = state.get("normalized_ticker", "")
-    template = state.get("template", "equity_deep")
-    task_id = state.get("task_id") or code
     im = _indicator_map(fv.get("indicators", []))
     direction, _ = _tech_summary(im)
     tech_signals = "；".join(
@@ -1040,11 +1086,27 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
         "missing": facts.MISSING,
     }
 
+    return s_facts
+
+
+async def _llm_summary(state: ResearchState, fv: dict) -> str:
+    """分析师级摘要。使用 summary_system_prompt（此前死代码，现已接上）。
+
+    LLM 未配置或失败时回退模板（数字仍来自事实块，缺失走 MISSING）。
+    """
+    s_facts = _summary_facts(state, fv)
+    code = state.get("normalized_ticker", "")
+    template = state.get("template", "equity_deep")
+    task_id = state.get("task_id") or code
+
     llm = build_llm(streaming=False, override=state.get("llm_config"))
     if llm is None:
         return _compose_summary_block(state, fv) + "（LLM 未配置，以上为模板化摘要，数字均来自本地工具库。）"
 
     user = SUMMARY_USER_TEMPLATE.format(**s_facts)
+    q = _clean_query(state)
+    if q:
+        user += f"\n\n【用户重点关注】{q}（仅在事实块已有数据范围内回应，无对应数据则如实说明未获取，禁止编造。）"
     sys_prompt = summary_system_prompt(template)
     lc, diag = build_report_section_context(
         system_prompt=sys_prompt, facts_block=user,
@@ -1127,9 +1189,300 @@ def _compose_risks(risk_flags: list, fv: dict) -> list:
 
 
 # ────────────────────────────────────────────────────────────
+# v1.8.0：单次流式撰写（默认）—— 一次请求从摘要写到最后一段
+# ────────────────────────────────────────────────────────────
+# 根因（代码审查）：分段写作 = N 次独立请求 + 并发闸 2 ⇒ 第 3/4 段必须等前两段整段写完；
+# 思考型模型每段各自从零 CoT；摘要是规则模板先行推出。用户看到的就是「先出摘要，
+# 后面每一段都要等」。单次流式让思维链只出现一次、各段首尾相接逐 token 外发。
+_SUMMARY_CAP = 360
+_THINK_PUSH_INTERVAL_S = 0.5
+_SUMMARY_ALIASES = (
+    SUMMARY_HEADING, "摘要", "核心摘要", "报告摘要", "研究摘要", "行业研究摘要", "个股深度摘要",
+    "财报点评摘要", "风险评估摘要",
+)
+_SECTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "technical": ("技术面分析", "技术面", "量价与技术面", "技术形态分析", "技术指标分析"),
+    "fundamentals": ("基本面分析", "基本面", "财务与基本面", "财务分析", "经营与财务分析", "基本面剖析"),
+    "valuation": ("估值分析", "估值水平", "估值与性价比", "估值匹配度", "估值评价"),
+    "industry": ("行业与公司分析", "公司与行业分析", "行业及公司分析", "行业竞争与公司地位", "公司与行业"),
+    "industry_landscape": ("行业景气与竞争格局", "行业景气与格局", "行业景气分析", "竞争格局与景气度", "行业分析"),
+    "earnings_review": ("业绩快评", "财报点评", "业绩点评", "核心业绩分析", "财报快评"),
+    "risk_scenario": ("风险情景与监测指标", "风险情景分析", "风险评估与情景", "情景分析与监测指标", "风险分析"),
+}
+
+
+def _write_mode(state: dict) -> str:
+    """撰写模式：stream（默认，单次流式）/ parallel（旧的分段并行）。"""
+    mode = str(state.get("write_mode") or getattr(settings, "report_write_mode", "stream") or "stream")
+    return "parallel" if mode.strip().lower() == "parallel" else "stream"
+
+
+def _summary_facts_block(state: ResearchState, fv: dict) -> str:
+    template = (state.get("template") or "equity_deep").strip()
+    if template == "industry":
+        prof = fv.get("profile") or {}
+        return (
+            f"【摘要事实】行业：{prof.get('name') or state.get('normalized_ticker') or '未获取'}。"
+            "行业摘要只能引用下方「行业景气与竞争格局」事实块中的数字与证据。"
+        )
+    return "【摘要事实】\n" + SUMMARY_FACTS_TEMPLATE.format(**_summary_facts(state, fv))
+
+
+class _Part:
+    """单次流中一个部分（摘要或某一段）的累积状态。"""
+
+    __slots__ = ("title", "cap", "acc", "forbidden", "capped", "started", "closed")
+
+    def __init__(self, title: str, cap: int) -> None:
+        self.title = title
+        self.cap = cap
+        self.acc = ""
+        self.forbidden = False
+        self.capped = False
+        self.started = False
+        self.closed = False
+
+
+def _safe_fallback(sp: "SectionSpec", fv: dict, note: str = "") -> tuple[str, str]:
+    try:
+        return sp.fallback(fv) + note, "template"
+    except Exception as fb_err:  # noqa: BLE001  fallback 本身崩溃也只影响本段
+        logger.warning("%s 段 fallback 失败：%s", sp.key, fb_err)
+        return f"（{sp.title}生成失败，数据可能异常，本段暂不展开。）", "error"
+
+
+async def _llm_report_stream(
+    state: ResearchState, specs: List["SectionSpec"], fv: dict
+) -> tuple[tuple[str, str], list[tuple[str, str]]]:
+    """一次 LLM 调用按序写完摘要与全部分析段，逐 token 路由到各部分并即时外发。
+
+    返回 ((摘要, 来源), [(各段正文, 来源)…])，与 specs 一一对应；来源取值同 _llm_section。
+    任一部分命中禁用词/为空 → 仅该部分回退规则模板；流中途失败 → 已写部分保留，其余回退。
+    """
+    from ...tools.context import _truncate_facts_by_segment
+    from .section_stream import SectionStreamParser
+
+    template = state.get("template", "equity_deep")
+    task_id = state.get("task_id") or state.get("normalized_ticker", "")
+    summary_fallback = _compose_summary_block(state, fv)
+    order = [sp.key for sp in specs]
+    results: dict[str, tuple[str, str]] = {}
+    writable = [sp for sp in specs if sp.has_data(fv)]
+    pending_insufficient = [sp for sp in specs if not sp.has_data(fv)]
+    for sp in pending_insufficient:
+        results[sp.key] = (f"（{sp.title}所需数据不足，本报告不展开该部分。）", "insufficient")
+
+    def _emit_insufficient(limit: int) -> None:
+        """数据不足段在报告顺位上排在 limit 之前的，按顺位收口（保持自上而下的阅读顺序）。"""
+        for sp in list(pending_insufficient):
+            if order.index(sp.key) < limit:
+                body, source = results[sp.key]
+                _stream_push({"type": "report_section", "title": sp.title, "body": body, "source": source})
+                pending_insufficient.remove(sp)
+
+    thinks = _thinks(state)
+    base_cap = max(120, int(getattr(settings, "report_section_max_chars", 420)))
+    caps = [_SUMMARY_CAP] + [min(sp.max_chars, base_cap) for sp in writable]
+    # 字数上限按字符算；中文约 1 字 ≈ 1 token，另加标题行与模型超写的余量（评审：1.3 倍偏紧）
+    max_tokens = int(sum(caps) * 1.8) + 512 + (8192 if thinks else 0)
+    llm = build_llm(streaming=True, max_tokens=max_tokens, override=state.get("llm_config"))
+    if llm is None:
+        _stream_push({"type": "research_summary_text", "text": summary_fallback})
+        for sp in writable:
+            results[sp.key] = _safe_fallback(sp, fv)
+        for sp in specs:
+            body, source = results[sp.key]
+            _stream_push({"type": "report_section", "title": sp.title, "body": body, "source": source})
+        return (summary_fallback, "template"), [results[sp.key] for sp in specs]
+
+    budget = max(400, int(getattr(settings, "section_facts_max_chars", 2400)))
+    facts_parts = [_summary_facts_block(state, fv)]
+    for sp in writable:
+        block, _cut = _truncate_facts_by_segment(sp.build_facts(fv), budget)
+        facts_parts.append(f"【{sp.title}·事实块】\n{block}")
+    q = _clean_query(state)
+    if q:
+        facts_parts.append(f"【用户重点关注】{q}（请在不超出上述各节事实块数字的前提下予以回应；无相关数据则如实说明未获取。）")
+    facts_block = "\n\n".join(facts_parts)
+    plan = [(SUMMARY_HEADING, SUMMARY_STREAM_TASK)] + [(sp.title, SECTION_TASK.get(sp.key, "")) for sp in writable]
+    lc, diag = build_report_section_context(
+        system_prompt=report_stream_system_prompt(template, plan), facts_block=facts_block,
+        profile=state.get("profile"), template=template,
+        section="stream", obj_id=task_id, max_chars=len(facts_block) + 1,
+    )
+    t0 = time.perf_counter()
+
+    section_titles = [_SUMMARY_ALIASES] + [
+        _SECTION_ALIASES.get(sp.key, (sp.title,)) for sp in writable
+    ]
+    parts = [_Part(SUMMARY_HEADING, caps[0])] + [_Part(sp.title, c) for sp, c in zip(writable, caps[1:])]
+    parser = SectionStreamParser(section_titles)
+    splitter = ThinkTagSplitter()
+    thinking = ""
+    last_think_push = 0.0
+    cur = 0
+
+    def _push_thinking(force: bool = False) -> None:
+        nonlocal last_think_push
+        now = time.perf_counter()
+        if thinking and (force or now - last_think_push >= _THINK_PUSH_INTERVAL_S):
+            last_think_push = now
+            _stream_push({"type": "report_thinking", "text": thinking[-160:], "chars": len(thinking)})
+
+    def _start(i: int) -> None:
+        part = parts[i]
+        if part.started:
+            return
+        part.started = True
+        if i > 0:
+            _emit_insufficient(order.index(writable[i - 1].key))
+            _stream_push({"type": "section_start", "title": part.title})
+
+    def _close(i: int) -> None:
+        part = parts[i]
+        if part.closed:
+            return
+        part.closed = True
+        final_forbidden = part.forbidden or bool(check_generated(part.acc, streaming=False))
+        if i == 0:
+            if final_forbidden:
+                text, source = summary_fallback + "（模型输出含禁用表述，已使用事实摘要。）", "template"
+            elif not part.acc.strip():
+                text, source = summary_fallback, "template"
+            else:
+                text, source = _bound_generated_text(part.acc, part.cap)[0], "llm"
+            results["__summary__"] = (text, source)
+            _stream_push({"type": "research_summary_text", "text": text})
+            return
+        sp = writable[i - 1]
+        if final_forbidden:
+            body, source = _safe_fallback(sp, fv, "（模型输出含禁用表述，已使用事实模板。）")
+        elif not part.acc.strip():
+            body, source = _safe_fallback(sp, fv)
+        else:
+            body, source = _bound_generated_text(part.acc, part.cap)[0], "llm"
+        results[sp.key] = (body, source)
+        _stream_push({"type": "report_section", "title": sp.title, "body": body, "source": source})
+        _stream_push(f"✓ {sp.title} 完成")
+
+    def _route(events) -> bool:
+        """把解析器事件落到各部分；返回 False 表示可以提前结束（末段已写满/已判废）。"""
+        nonlocal cur
+        for kind, idx, text in events:
+            if idx >= len(parts):
+                continue
+            if kind == "enter":
+                for k in range(cur, idx):
+                    _start(k)
+                    _close(k)
+                cur = idx
+                _start(idx)
+                continue
+            part = parts[idx]
+            _start(idx)
+            if part.forbidden or part.capped:
+                continue
+            tok = text if part.acc else text.lstrip()
+            if not tok:
+                continue
+            # 实时禁用词闸：并入会命中就不外发、该部分作废（收口时回退模板覆盖已流出片段）
+            if check_generated(part.acc + tok, streaming=True):
+                part.forbidden = True
+                continue
+            room = part.cap - len(part.acc)
+            if len(tok) >= room:
+                tok = tok[:room]
+                part.capped = True
+            part.acc += tok
+            if tok:
+                _stream_push(
+                    {"type": "summary_token", "text": tok} if idx == 0
+                    else {"type": "section_token", "title": part.title, "text": tok}
+                )
+        last = parts[-1]
+        return not (cur == len(parts) - 1 and (last.capped or last.forbidden))
+
+    idle = _SECTION_TIMEOUT * (_REASONING_TIMEOUT_FACTOR if thinks else 1.0)
+    # 总时长只是兜底上限（真正判死靠空闲超时）：慢中转 10 token/s 写完整份报告也要 4-5 分钟
+    total = max(600.0, idle * (len(parts) + 1) * 2)
+    _stream_push(f"开始撰写研究报告（单次流式：摘要 + {len(writable)} 段）…")
+    error = ""
+    try:
+        async with _LLM_GATE:
+            async with asyncio.timeout(total):
+                it = llm.astream(lc).__aiter__()
+                try:
+                    while True:
+                        try:
+                            # 空闲超时：两个 chunk 之间静默过久才判死（思考型模型按倍率放宽），
+                            # 不再用"整段总时长"误杀正在稳定吐字的长报告。
+                            chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+                        except StopAsyncIteration:
+                            tail, rc = splitter.flush()
+                            thinking += rc
+                            _route(parser.feed(tail) + parser.flush())
+                            break
+                        rc = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
+                        if isinstance(rc, str) and rc:
+                            thinking += rc
+                            _push_thinking()
+                        content, inline_rc = splitter.feed(_extract_token(chunk))
+                        if splitter.orphan_think_closed:
+                            splitter.orphan_think_closed = False
+                            # 网关预填 <think> 仅输出裸 </think> 时，若思考链内提前复述了 ## 小节标题，
+                            # cur 可能已推进到 >0；必须全量归还到思考链并重置解析器与前端临时章节。
+                            had_sec = any(p.started for p in parts[1:])
+                            leaked_cot = "\n".join(p.acc for p in parts if p.acc)
+                            if leaked_cot:
+                                thinking += leaked_cot
+                            for p in parts:
+                                p.acc = ""
+                                p.started = False
+                                p.closed = False
+                                p.capped = False
+                                p.forbidden = False
+                            cur = 0
+                            results.clear()
+                            parser = SectionStreamParser(section_titles)
+                            _stream_push({"type": "research_summary_text", "text": ""})
+                            if had_sec:
+                                _stream_push({"type": "sections_reset"})
+                                for sp in specs:
+                                    _stream_push({"type": "section_queued", "title": sp.title})
+                            _push_thinking(force=True)
+                        if inline_rc:
+                            thinking += inline_rc
+                            _push_thinking()
+                        if content and not _route(parser.feed(content)):
+                            break
+                finally:
+                    aclose = getattr(it, "aclose", None)
+                    if aclose is not None:
+                        with contextlib.suppress(Exception):
+                            await aclose()
+    except Exception as e:  # noqa: BLE001  超时/网络/429：已写部分保留，其余回退模板
+        error = sanitize_err_text(type(e).__name__ + (f": {e}" if str(e) else ""))
+        state["_llm_stream_error"] = error
+        logger.warning("单次流式撰写中断，未完成部分回退模板：%s", error)
+        _stream_push(f"⚠ 模型流式撰写中断（{error[:80]}），未完成章节已回退规则模板")
+
+    if thinking:
+        _push_thinking(force=True)
+    for i in range(len(parts)):
+        if not parts[i].closed:
+            _start(i)
+            _close(i)
+    _emit_insufficient(len(order))
+    finalize_diag(diag, int((time.perf_counter() - t0) * 1000), error=error)
+
+    summary = results.pop("__summary__", (summary_fallback, "template"))
+    return summary, [results[sp.key] for sp in specs]
+
+
+# ────────────────────────────────────────────────────────────
 # summary_node：先生成可立即展示的事实摘要
 # ────────────────────────────────────────────────────────────
-async def summary_node(state: ResearchState) -> dict:
+async def summary_node(state: ResearchState, announce: bool = True) -> dict:
     """在详细段落开始前产出摘要，降低研究任务的首段等待时间。
 
     v1.6.0（审计 D4，注释与实现对齐）：出厂默认 report_use_llm_summary=False ——
@@ -1146,12 +1499,15 @@ async def summary_node(state: ResearchState) -> dict:
         fv = facts.normalize_findings(findings)
     fv["profile"] = fv.get("profile") or _find(findings, "profile")
 
-    _stream_push("正在撰写投资摘要…")
-    if getattr(settings, "report_use_llm_summary", False):
+    if not announce:
+        # v1.8.0 单次流式：摘要由同一条模型流第一个写出，这里只归一化事实、备好规则兜底摘要
+        summary = _compose_summary_block(state, fv)
+    elif getattr(settings, "report_use_llm_summary", False):
+        _stream_push("正在撰写投资摘要…")
         summary = await _llm_summary(state, fv)
+        _stream_push("✓ 投资摘要完成")
     else:
         summary = _compose_summary_block(state, fv)
-    _stream_push("✓ 投资摘要完成")
 
     return {
         "draft_summary": summary,
@@ -1173,11 +1529,31 @@ async def report_node(state: ResearchState) -> dict:
     template = state.get("template", "equity_deep")
     quote = fv.get("quote", {})
     profile = fv.get("profile", {})
-    name = quote.get("name", "") or profile.get("name", "")
+    ind_items = ((fv.get("industry_valuation") or {}).get("items") or []) if isinstance(fv.get("industry_valuation"), dict) else []
+    ind_top_name = str(ind_items[0].get("name") or "") if ind_items and isinstance(ind_items[0], dict) else ""
+    name = (
+        quote.get("name", "")
+        or profile.get("name", "")
+        or str(state.get("industry_name") or "")
+        or ind_top_name
+    )
 
     sections_t0 = time.perf_counter()
-    summary = state.get("draft_summary") or _compose_summary_block(state, fv)
     specs = _section_specs(template)
+    if _write_mode(state) == "stream":
+        # v1.8.0 默认：单次流式（摘要 → 各段首尾相接逐 token 外发；思维链只出现一次）
+        for spec in specs:
+            _stream_push({"type": "section_queued", "title": spec.title})
+        (summary, _summary_source), results = await _llm_report_stream(state, specs, fv)
+    else:
+        summary, results = await _write_sections_parallel(state, specs, fv)
+    _stream_push("各段撰写完成，正在组装报告…")
+    return _assemble_report(state, fv, findings, specs, results, summary, sections_t0, name)
+
+
+async def _write_sections_parallel(state: ResearchState, specs: List[SectionSpec], fv: dict) -> tuple[str, list]:
+    """旧的分段并行撰写（report_write_mode=parallel）：每段一次请求，并发闸限流。"""
+    summary = state.get("draft_summary") or _compose_summary_block(state, fv)
     # v1.7.0：四段并行·并发 2（段间零依赖：各段事实块/system prompt 只来自 state+fv，
     # 后段不引用前段输出；决策史见 config.report_llm_concurrency）。机制仍是"逐段真流式"：
     # 先统一发 section_start 让前端把全部段落点亮为"撰写中"，段内由 _llm_section 逐 token
@@ -1206,12 +1582,25 @@ async def report_node(state: ResearchState) -> dict:
         return result
 
     results = await asyncio.gather(*(_write_one(s) for s in specs), return_exceptions=True)
-    _stream_push("各段撰写完成，正在组装报告…")
+    return summary, list(results)
 
+
+def _assemble_report(
+    state: ResearchState,
+    fv: dict,
+    findings: list,
+    specs: List[SectionSpec],
+    results: list,
+    summary: str,
+    sections_t0: float,
+    name: str,
+) -> dict:
+    """把各段结果组装成 ReportDoc + HTML（两种撰写模式共用）。"""
+    template = state.get("template", "equity_deep")
     sections: list[dict] = []
     gen: dict[str, str] = {}
     for spec, res in zip(specs, results):
-        if isinstance(res, Exception):
+        if isinstance(res, BaseException):
             logger.warning("%s 段 gather 异常，回退模板：%s", spec.key, res)
             # fallback 本身也可能抛异常（如数据源返回畸形 kline，_ma_arrangement 崩）。
             # 这里是"单段独立降级"的最后一道兜底：fallback 再崩，也只让这一段显示占位，
@@ -1246,6 +1635,7 @@ async def report_node(state: ResearchState) -> dict:
     # 那会把 .SI 误当个股后缀改成 .SZ，污染成不存在的股票代码。
     _raw_code = state.get("normalized_ticker") or state.get("code", "")
     _ticker = _raw_code if state.get("is_industry") else to_market_ticker(_raw_code)
+    usable_quote = fv.get("quote") if facts.quote_usable(fv.get("quote")) else None
     doc = report_tool.build_doc(
         ticker=_ticker,
         name=name,
@@ -1257,15 +1647,24 @@ async def report_node(state: ResearchState) -> dict:
         risks=risks,
         sources=sources,
         as_of=state.get("data_as_of"),
-        quote=fv.get("quote"),
+        quote=usable_quote,
     )
+    writable_sources = [src for src in gen.values() if src != "insufficient"]
+    stream_err = str(state.get("_llm_stream_error") or "")
+    if writable_sources and all(src != "llm" for src in writable_sources) and llm_available(state.get("llm_config")):
+        doc["llm_degraded"] = True
+        doc["llm_fallback_reason"] = stream_err or "模型调用未返回可用章节，已自动降级为本地事实模板"
+    elif stream_err:
+        doc["llm_degraded"] = True
+        doc["llm_fallback_reason"] = stream_err
 
     try:
         html = report_tool.render_html(doc)
     except Exception as e:  # noqa: BLE001
-        logger.error("报告渲染失败：%s", e)
-        doc["summary"] = (doc.get("summary", "") + f"\n（渲染告警：{e}）").strip()
-        html = f"<pre>{doc.get('summary', '')}</pre>"
+        safe_err = sanitize_err_text(e)
+        logger.error("报告渲染失败：%s", safe_err)
+        safe_summary = html_lib.escape(str(doc.get("summary") or ""))
+        html = f"<pre>{safe_summary}\n\n（报告排版渲染异常，已展示纯文本摘要）</pre>"
 
     doc["html"] = html
     return {

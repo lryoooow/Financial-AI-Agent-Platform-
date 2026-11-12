@@ -3,7 +3,9 @@
 {% for s in doc.sections %}
   <div class="section">
     <h3 style="font-size:14px;margin:14px 0 4px;">{{ s.title }}</h3>
-    <p>{{ s.body }}</p>
+    {% for para in (s.body or "").split("\n") if para.strip() %}
+      <p>{{ para.strip() }}</p>
+    {% endfor %}
   </div>
 {% endfor %}
 {% endblock %}

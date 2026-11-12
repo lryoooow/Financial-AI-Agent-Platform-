@@ -9,7 +9,18 @@
       <title>景渊 · 金融研究助手</title>
       <meta name="description" content="景渊 · 金融研究助手：真实行情、联网搜索增强与券商级研报，本地隐私优先，AI 仅供研究参考。" />
       <meta name="robots" content="noindex, nofollow" />
-      <style>html, body { height: 100%; margin: 0; } #root { height: 100%; }</style>
+      <style>html, body { height: 100%; margin: 0; } #root { height: 100%; } html.dark, html.dark body { background: #1c1c1e; }</style>
+      <script>
+        (function () {
+          try {
+            var t = localStorage.getItem("theme");
+            var dark = t ? t === "dark" : (!window.matchMedia || window.matchMedia("(prefers-color-scheme: dark)").matches);
+            if (dark) document.documentElement.classList.add("dark");
+          } catch (_) {
+            document.documentElement.classList.add("dark");
+          }
+        })();
+      </script>
 
     </head>
 

@@ -12,9 +12,22 @@ declare global {
     onMaximizeChange: (cb: (isMaximized: boolean) => void) => () => void;
   }
 
+  /** v1.8.0：桌面偏好（托盘驻留 / 开机自启），由主进程持久化 */
+  interface FinResearchDesktopPrefs {
+    closeToTray: boolean;
+    autoLaunch: boolean;
+    version: string;
+  }
+
+  interface FinResearchApp {
+    getPreferences: () => Promise<FinResearchDesktopPrefs>;
+    setPreferences: (p: Partial<Pick<FinResearchDesktopPrefs, "closeToTray" | "autoLaunch">>) => Promise<FinResearchDesktopPrefs>;
+  }
+
   interface Window {
     finresearch?: {
       window: FinResearchWindow;
+      app?: FinResearchApp;
     };
   }
 }

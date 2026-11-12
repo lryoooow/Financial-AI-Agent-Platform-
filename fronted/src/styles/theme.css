@@ -28,7 +28,7 @@
   --destructive: #d4183d;
   --destructive-foreground: #ffffff;
   --border: rgba(0, 0, 0, 0.1);
-  --input: transparent;
+  --input: rgba(0, 0, 0, 0.12);
   --input-background: #f3f3f5;
   --switch-background: #cbced4;
   --font-weight-medium: 500;
@@ -54,6 +54,8 @@
   --gold-foreground: #1a140a;
   --up: #dc2626;   /* 涨 / 正向（红） */
   --down: #16a34a; /* 跌 / 负向（绿） */
+  --up-soft: rgba(220, 38, 38, 0.12);
+  --down-soft: rgba(22, 163, 74, 0.12);
 }
 
 .dark {
@@ -71,8 +73,8 @@
   --muted-foreground: oklch(0.708 0 0);
   --accent: oklch(0.269 0 0);
   --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.396 0.141 25.723);
-  --destructive-foreground: oklch(0.637 0.237 25.331);
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
   --border: oklch(0.3 0 0 / 0.6);
   --input: oklch(0.269 0 0);
   --ring: oklch(0.439 0 0);
@@ -95,6 +97,8 @@
   --gold-foreground: #1a140a;
   --up: #f5475b;   /* 涨（亮红） */
   --down: #25c26a; /* 跌（亮绿） */
+  --up-soft: rgba(245, 71, 91, 0.16);
+  --down-soft: rgba(37, 194, 106, 0.16);
 }
 
 /* ---- 颜色映射：让 bg-gold / text-up / text-down / border-gold 等工具类生效 ---- */

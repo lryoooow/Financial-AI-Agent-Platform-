@@ -27,6 +27,8 @@ import time
 from threading import Lock
 from typing import Any, List, Optional, Tuple, Union
 
+from . import now_cst
+
 _DIAG: List[dict] = []
 _LOCK = Lock()
 _CAP = 60
@@ -48,6 +50,16 @@ PROFILE_LABELS = {
     "analysis_style": "分析风格",
 }
 
+_PROFILE_CTRL_RE = re.compile(r"[\r\n\t\x00-\x1f]+")
+_PROFILE_VAL_CAP = 120
+
+
+def _sanitize_profile_val(v: Any) -> str:
+    """清洗画像字段：压平换行/控制符并截断长度，防止破坏【段落】结构或提示词注入。"""
+    cleaned = _PROFILE_CTRL_RE.sub(" ", str(v or "")).strip()
+    cleaned = cleaned.replace("【", "[").replace("】", "]")
+    return cleaned[:_PROFILE_VAL_CAP]
+
 
 def _merge_profile(profile: Optional[dict]) -> dict:
     """逐字段回填默认画像：用户只填了风险偏好，其余用默认，而非整体 or None。"""
@@ -55,8 +67,10 @@ def _merge_profile(profile: Optional[dict]) -> dict:
     if profile:
         for k in DEFAULT_PROFILE:
             v = profile.get(k)
-            if v is not None and str(v).strip():
-                merged[k] = str(v).strip()
+            if v is not None:
+                cleaned = _sanitize_profile_val(v)
+                if cleaned:
+                    merged[k] = cleaned
     return merged
 
 
@@ -98,14 +112,25 @@ _HOLIDAYS = {
     "2025-02-03", "2025-02-04", "2025-04-04", "2025-04-05", "2025-04-06",
     "2025-05-01", "2025-05-02", "2025-05-03", "2025-05-05",
     "2025-06-02", "2025-10-01", "2025-10-02", "2025-10-03", "2025-10-06", "2025-10-07", "2025-10-08",
-    # 2026
+    # 2026（含完整春节 02-15..02-23、端午 06-19..06-21、中秋 09-25..09-27、国庆 10-01..10-08）
     "2026-01-01", "2026-01-02", "2026-01-03",
-    "2026-02-16", "2026-02-17", "2026-02-18",
+    "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+    "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
     "2026-04-04", "2026-04-05", "2026-04-06",
     "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
-    "2026-06-19",
+    "2026-06-19", "2026-06-20", "2026-06-21",
+    "2026-09-25", "2026-09-26", "2026-09-27",
     "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+    # 2027（静态兜底：元旦、春节除夕至初六、清明、劳动节、端午、中秋、国庆）
+    "2027-01-01", "2027-01-02", "2027-01-03",
+    "2027-02-05", "2027-02-06", "2027-02-07", "2027-02-08", "2027-02-09", "2027-02-10", "2027-02-11", "2027-02-12",
+    "2027-04-03", "2027-04-04", "2027-04-05",
+    "2027-05-01", "2027-05-02", "2027-05-03", "2027-05-04", "2027-05-05",
+    "2027-06-09", "2027-06-10", "2027-06-11",
+    "2027-09-15", "2027-09-16", "2027-09-17",
+    "2027-10-01", "2027-10-02", "2027-10-03", "2027-10-04", "2027-10-05", "2027-10-06", "2027-10-07",
 }
+_STATIC_CALENDAR_MAX_YEAR = 2027
 
 
 def _dynamic_holidays(years: list) -> set:
@@ -130,8 +155,22 @@ def _dynamic_holidays(years: list) -> set:
 
 
 # 静态表未覆盖的未来年份，启动时用 chinese_calendar 生成一次（模块级缓存）
-_extra_years = [y for y in (dt.date.today().year, dt.date.today().year + 1) if y > 2026]
+_extra_years = [y for y in (now_cst().year, now_cst().year + 1) if y > 2026]
 _HOLIDAYS |= _dynamic_holidays(_extra_years)
+
+
+def calendar_is_authoritative(now: Optional[dt.datetime] = None) -> bool:
+    """当前日期是否处于权威节假日日历覆盖范围内（chinese_calendar 或内置静态表）。"""
+    n = now or now_cst()
+    if n.year <= _STATIC_CALENDAR_MAX_YEAR:
+        return True
+    try:
+        import chinese_calendar as cc
+
+        cc.get_holiday_detail(n.date())
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _cn_holiday(now: dt.datetime) -> bool:
@@ -160,25 +199,22 @@ def is_trading_day(now: Optional[dt.datetime] = None) -> bool:
     把所有数据源判为"陈旧"而拒绝 → 补班日全天行情/分时/K线全挂。先按周末排除，
     再查工作日是否为法定节假日。
     """
-    n = now or dt.datetime.now()
+    n = now or now_cst()
     if n.weekday() >= 5:
         return False
     try:
         import chinese_calendar as cc
         return cc.is_workday(n.date())
     except NotImplementedError:
-        # v1.6.3（D8）：超出包覆盖年份（当前数据止于 2026）——降级为「周末+静态已知表」，
-        # 2027 起的法定节假日会误判为交易日（仅影响 _ensure_fresh 新鲜度检查的方向，
-        # 不影响数据本身的展示）。日历覆盖后自动恢复（chinese_calendar 随国务院公告发版）。
         logging.getLogger(__name__).debug(
-            "节假日日历不覆盖 %s，降级为周末+静态表（2027 起休市日可能被误判为交易日）", n.year)
+            "节假日日历不覆盖 %s，降级为周末+静态表", n.year)
         return n.strftime("%Y-%m-%d") not in _HOLIDAYS
     except Exception:  # ImportError(未安装) 等 → 同上回退
         return n.strftime("%Y-%m-%d") not in _HOLIDAYS
 
 
 def _trading_session(now: Optional[dt.datetime] = None) -> str:
-    n = now or dt.datetime.now()
+    n = now or now_cst()
     mins = n.hour * 60 + n.minute
     # 非交易日：由 is_trading_day 统一判断（含调休补班），再区分法定节假日 vs 周末
     if not is_trading_day(n):
@@ -203,7 +239,7 @@ def render_time_anchor(now: Optional[dt.datetime] = None) -> str:
     对话链路此前完全没有时间概念，模型会拿训练截止日期推理"最近"，
     对行情工具是硬伤。
     """
-    n = now or dt.datetime.now()
+    n = now or now_cst()
     wd = _WEEKDAYS[n.weekday()] if 0 <= n.weekday() < 7 else ""
     return f"【当前时间】{n.strftime('%Y-%m-%d')}（{wd}）{n.strftime('%H:%M')} · {_trading_session(n)}"
 

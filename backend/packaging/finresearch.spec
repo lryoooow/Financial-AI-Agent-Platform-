@@ -12,6 +12,7 @@
 
 import glob
 import os
+import sys
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
 
 # SPECPATH 是 PyInstaller 注入的"spec 所在目录"（即 packaging/），不是 spec 文件路径。
@@ -19,6 +20,8 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_dat
 _SPEC_DIR = os.path.abspath(SPECPATH)                     # .../backend/packaging
 _PROJ_DIR = os.path.dirname(_SPEC_DIR)                    # .../backend
 _SRC_DIR = os.path.join(_PROJ_DIR, "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 
 datas = []
 binaries = []
@@ -61,13 +64,38 @@ hiddenimports += collect_submodules("finresearch")
 # 排除 postgres 检查点（桌面用 SQLite，postgres 分支永不触发）：从 collect_all 结果中剔除
 hiddenimports = [h for h in hiddenimports if not h.startswith("langgraph.checkpoint.postgres")]
 
-# 本包数据（报告模板）。即便没 pip install -e . 也兜底显式收集
+# 本包数据（报告模板、本地数据、tzdata 时区库、前端构建产物）。即便没 pip install -e . 也兜底显式收集
 datas += collect_data_files("finresearch")
 datas += collect_data_files("reportlab")
+try:
+    datas += collect_data_files("docx")
+except Exception:
+    pass
+try:
+    datas += collect_data_files("tzdata")
+except Exception:
+    pass
 _tmpl_dir = os.path.join(_SRC_DIR, "finresearch", "report_templates")
 datas += [(f, "finresearch/report_templates") for f in glob.glob(os.path.join(_tmpl_dir, "*.html"))]
 _data_dir = os.path.join(_SRC_DIR, "finresearch", "data")
 datas += [(f, "finresearch/data") for f in glob.glob(os.path.join(_data_dir, "*.json"))]
+_static_dir = os.path.join(_SRC_DIR, "finresearch", "static")
+if os.path.isdir(_static_dir):
+    for _root, _dirs, _files in os.walk(_static_dir):
+        _rel = os.path.relpath(_root, _static_dir)
+        _dest = "finresearch/static" if _rel == "." else os.path.join("finresearch/static", _rel).replace("\\", "/")
+        for _fn in _files:
+            datas.append((os.path.join(_root, _fn), _dest))
+
+# 去重 datas（避免 collect_data_files("finresearch") 与显式 walk 重复计入同一源文件）
+_seen_datas = set()
+_deduped_datas = []
+for _src, _dst in datas:
+    _key = (os.path.normcase(os.path.abspath(_src)), _dst.replace("\\", "/"))
+    if _key not in _seen_datas:
+        _seen_datas.add(_key)
+        _deduped_datas.append((_src, _dst))
+datas = _deduped_datas
 
 # v1.6.0（审计 P2）：移除显式重复收集 —— collect_data_files("finresearch") 已包含
 # src/finresearch/static/**，此前再收一份到顶层 "static" 导致包内两份前端产物

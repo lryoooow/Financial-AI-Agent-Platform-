@@ -34,14 +34,23 @@ def _ensure() -> None:
         return
     _tried = True
     try:
+        import json
+
         from sqlalchemy.ext.asyncio import (
             AsyncSession,
             async_sessionmaker,
             create_async_engine,
         )
 
+        from ..tools import clean_for_json
+
         url = resolve_db_url()
-        kwargs: dict = {"future": True}
+        kwargs: dict = {
+            "future": True,
+            "json_serializer": lambda obj: json.dumps(
+                clean_for_json(obj), ensure_ascii=False, allow_nan=False
+            ),
+        }
         is_sqlite = url.startswith("sqlite")
         if is_sqlite:
             # SQLite：跨线程 + 单文件。timeout=30 是 aiosqlite→sqlite3 的 busy_timeout（秒）：
@@ -126,11 +135,14 @@ async def init_db() -> None:
             # 加列迁移：research_task.llm_config（前端所选模型，SSE GET 无法带 body，落库持久化）
             await _add_column_if_missing(conn, "research_task", "llm_config", "JSON")
             await _add_column_if_missing(conn, "chat_conversation", "archived_at", "DATETIME")
-            # 1.2.0：研究任务可恢复字段（阶段 / 阶段事件流 / 各阶段耗时 / 关联报告 id）
+            # 1.2.0：研究任务可恢复字段（阶段 / 阶段事件流 / 各阶段耗时 / 关联报告 id / 标的名称）
+            await _add_column_if_missing(conn, "research_task", "name", "VARCHAR(128)")
             await _add_column_if_missing(conn, "research_task", "stage", "VARCHAR(32)")
             await _add_column_if_missing(conn, "research_task", "progress_events", "JSON")
             await _add_column_if_missing(conn, "research_task", "timings", "JSON")
             await _add_column_if_missing(conn, "research_task", "report_id", "VARCHAR(64)")
+            # v1.8.0：对话自动压缩代际
+            await _add_column_if_missing(conn, "chat_context_summary", "generation", "INTEGER DEFAULT 0")
         logger.info("DB 表已就绪（create_all + 迁移）。")
     except Exception as e:  # noqa: BLE001
         logger.warning("init_db 失败（PG 可能未起）：%s", e)

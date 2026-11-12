@@ -28,8 +28,8 @@ import pandas as pd
 from ..cache import quote_cache
 from . import make_provenance, now_iso
 from . import market_provider
-from .entity import normalize_ticker, to_market_ticker
-from .market_provider import _fmt_volume, _fmt_amount
+from .entity import BJ_PREFIXES, SH_PREFIXES, normalize_ticker, to_market_ticker
+from .market_provider import _fmt_amount, _fmt_volume, _opt_n
 
 logger = logging.getLogger(__name__)
 
@@ -59,21 +59,20 @@ def _now_cst() -> dt.datetime:
 
 
 def _requires_today_intraday(now: Optional[dt.datetime] = None) -> bool:
-    """交易日上午开盘后，分时不能继续展示上一交易日。
-
-    必须排除法定节假日（工作日休市）：否则春节/国庆等法定假日（工作日调休），
-    Sina/Tencent/东财返回的是上一交易日数据，此处若仍判定"需要今日数据"，
-    _ensure_fresh 会把所有源全部判为"陈旧"而拒绝 → 节假日行情全挂。
-    """
-    from .context import is_trading_day
+    """交易日上午开盘后，分时不能继续展示上一交易日。"""
+    from .context import calendar_is_authoritative, is_trading_day
     n = now or _now_cst()
+    if not calendar_is_authoritative(n):
+        return False
     return is_trading_day(n) and n.time() >= dt.time(9, 35)
 
 
 def _requires_today_kline(now: Optional[dt.datetime] = None) -> bool:
     """收盘后一段时间，日 K 不能继续停留在上一交易日（同样排除节假日）。"""
-    from .context import is_trading_day
+    from .context import calendar_is_authoritative, is_trading_day
     n = now or _now_cst()
+    if not calendar_is_authoritative(n):
+        return False
     return is_trading_day(n) and n.time() >= dt.time(15, 10)
 
 
@@ -87,22 +86,19 @@ def _ensure_fresh(result: dict, *, kind: str) -> None:
     got = _parse_date(trading_date)
     if not got:
         return
-    today = _now_cst().date()
-    if kind == "intraday" and _requires_today_intraday() and got < today:
+    now = _now_cst()
+    today = now.date()
+    if kind == "intraday" and _requires_today_intraday(now) and got < today:
         raise ValueError(f"分时数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
-    if kind == "kline" and _requires_today_kline() and got < today:
+    if kind == "kline" and _requires_today_kline(now) and got < today:
         raise ValueError(f"日K数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
-    if kind == "quote" and _requires_today_intraday() and got < today:
+    if kind == "quote" and _requires_today_intraday(now) and got < today:
         raise ValueError(f"报价数据仍停留在上一交易日 {got.isoformat()}，当前交易日 {today.isoformat()} 尚未更新")
 
 
 def _is_bj(raw: str) -> bool:
-    """北交所代码（东方财富直连 secid 对 BJ 不可靠，需跳过 eastmoney-direct）。
-
-    v1.6.0（审计 B7）：北交所 2024 年起新代码全部 920xxx（种子表 325 只全是 920 开头），
-    只认 43/83/87/88 会把 920 全线判成深证。补 "92"。
-    """
-    return raw.startswith(("43", "83", "87", "88", "92"))
+    """北交所代码（东方财富直连 secid 对 BJ 不可靠，需跳过 eastmoney-direct）。"""
+    return raw.startswith(BJ_PREFIXES)
 
 
 def _enrich(prov: dict, *, trading_date: str = "", attempts: Optional[list] = None) -> dict:
@@ -129,8 +125,19 @@ def _f(v, default=0.0) -> float:
         return default
 
 
+def _clean_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and not math.isfinite(v):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() in ("nan", "none", "<na>") else s
+
+
 def _fmt_market_cap(yuan: float) -> str:
     v = _f(yuan)
+    if v <= 0:
+        return "—"
     if v >= 1e8:
         return f"{v/1e8:.2f}亿"
     return f"{v:.0f}"
@@ -244,7 +251,7 @@ def get_realtime_quote(code: str) -> dict:
         prev_close = _f(row.get("昨收", price))
         result = {
             "code": to_market_ticker(raw),
-            "name": str(row.get("名称", "") or ""),
+            "name": _clean_str(row.get("名称")),
             "exchange": _classify(raw),
             "price": price,
             "change": round(_f(row.get("涨跌额", price - prev_close)), 3),
@@ -259,7 +266,7 @@ def get_realtime_quote(code: str) -> dict:
             "pe": _f(row.get("市盈率-动态")),
             "pb": _f(row.get("市净率")),
             "roe": 0.0,  # 快照无 ROE，由基本面接口补
-            "industry": str(row.get("行业", "") or ""),
+            "industry": _clean_str(row.get("行业")),
             "as_of": now_iso(),
             "trading_date": _today(),
             "provenance": make_provenance(source="akshare", endpoint="stock_zh_a_spot_em", raw_value=raw),
@@ -368,7 +375,7 @@ def get_intraday(code: str) -> dict:
     # 3) AkShare 兜底（1min → 5min 桶）
     try:
         import akshare as ak
-        mkt = "sh" if raw.startswith(("60", "68", "90", "11", "51", "56")) else (
+        mkt = "sh" if raw.startswith(SH_PREFIXES) else (
             "bj" if _is_bj(raw) else "sz"
         )
         df = ak.stock_zh_a_minute(symbol=f"{mkt}{raw}", period="1", adjust="")
@@ -393,11 +400,15 @@ def get_intraday(code: str) -> dict:
                 df = df[df.index <= now]
         bucket = df.resample("5min", label="left", closed="left")
         agg = bucket.agg(close=("close", "last"), volume=("volume", "sum")).dropna()
+        agg["volume"] = agg["volume"] / 100.0  # stock_zh_a_minute 返回股，统一折算为手
         agg["price"] = agg["close"]
         agg["time"] = agg.index.strftime("%H:%M")
         cum_p = (agg["price"] * agg["volume"]).cumsum()
-        cum_v = agg["volume"].cumsum().replace(0, 1)
-        agg["avg"] = (cum_p / cum_v).round(2)
+        cum_v = agg["volume"].cumsum()
+        agg["avg"] = [
+            round(float(cp / cv), 2) if cv > 0 else round(float(pr), 2)
+            for cp, cv, pr in zip(cum_p, cum_v, agg["price"])
+        ]
         out = [
             {"time": str(r["time"]), "price": _f(r["price"]), "avg": _f(r["avg"]), "volume": int(_f(r["volume"]))}
             for _, r in agg.iterrows()
@@ -474,15 +485,18 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     # 4) AkShare 兜底（前复权）
     try:
         import akshare as ak
-        end = dt.datetime.now().strftime("%Y%m%d")
-        start = (dt.datetime.now() - dt.timedelta(days=int(n) * 3 + 90)).strftime("%Y%m%d")
+        now = _now_cst()
+        end = now.strftime("%Y%m%d")
+        start = (now - dt.timedelta(days=(int(n) + 25) * 3 + 90)).strftime("%Y%m%d")
         df = ak.stock_zh_a_hist(symbol=raw, period="daily", start_date=start, end_date=end, adjust=adjust)
         if df is None or df.empty:
             raise ValueError("stock_zh_a_hist 空数据")
-        df = df.copy().tail(int(n)).reset_index(drop=True)
+        df = df.copy()
+        df["收盘"] = pd.to_numeric(df["收盘"], errors="coerce")
         df["ma5"] = df["收盘"].rolling(5).mean()
         df["ma10"] = df["收盘"].rolling(10).mean()
         df["ma20"] = df["收盘"].rolling(20).mean()
+        df = df.tail(int(n)).reset_index(drop=True)
         dts = pd.to_datetime(df["日期"])
         out = []
         for i, row in df.iterrows():
@@ -492,7 +506,7 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "open": _f(row["开盘"]), "close": _f(row["收盘"]),
                 "high": _f(row["最高"]), "low": _f(row["最低"]),
                 "volume": int(_f(row["成交量"])),
-                "ma5": _f(row["ma5"]), "ma10": _f(row["ma10"]), "ma20": _f(row["ma20"]),
+                "ma5": _opt_n(row["ma5"]), "ma10": _opt_n(row["ma10"]), "ma20": _opt_n(row["ma20"]),
             })
         prov = make_provenance(
             source="akshare", endpoint="stock_zh_a_hist",
@@ -557,7 +571,13 @@ def get_bid_ask(code: str) -> dict:
             v = rec.get(f"{side}_{i}_vol")
             if v is None or str(v).strip() in ("-", ""):
                 v = 0
-            return {"label": label, "price": _f(p), "vol": int(_f(v))}
+            vol_shares = int(_f(v))
+            return {
+                "label": label,
+                "price": _f(p),
+                "vol": vol_shares,
+                "lots": int(round(vol_shares / 100.0)),
+            }
 
         entries = [pick(s, i, lab) for s, i, lab in levels]
         asks = [e for e in entries[:5] if e]
@@ -595,42 +615,48 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
     """对日 K DataFrame 计算 MA/MACD/RSI/KDJ/BOLL，返回指标列表。
 
     df 需有列：close, high, low（中文或英文均可）。
-    pandas-ta-classic 优先；缺失则纯 pandas 兜底。
+    pandas-ta-classic 优先（必须在 DataFrame 上调 .ta）；缺失或样本不足则纯 pandas 兜底。
     """
     out: List[dict] = []
-    close = df["close"]
-    high = df.get("high", close)
-    low = df.get("low", close)
+    close = pd.to_numeric(df["close"] if "close" in df else df.get("收盘"), errors="coerce").dropna()
+    if close.empty:
+        return out
+    high = pd.to_numeric(df["high"] if "high" in df else df.get("最高", close), errors="coerce").reindex(close.index).fillna(close)
+    low = pd.to_numeric(df["low"] if "low" in df else df.get("最低", close), errors="coerce").reindex(close.index).fillna(close)
 
     def _ma(n: int) -> float:
         s = close.tail(n)
-        return _f(s.mean()) if len(s) else 0.0
+        return _f(s.mean()) if len(s) >= n else 0.0
 
     ma5, ma20 = _ma(5), _ma(20)
     last_close = _f(close.iloc[-1]) if len(close) else 0.0
 
     # MA
-    out.append({"name": "MA5", "value": f"{ma5:.2f}", "signal": "多头" if last_close > ma5 > 0 else "空头"})
-    out.append({"name": "MA20", "value": f"{ma20:.2f}", "signal": ("多头" if ma5 > ma20 else "空头") if ma5 and ma20 else "中性"})
+    out.append({"name": "MA5", "value": f"{ma5:.2f}" if ma5 > 0 else "—", "signal": "多头" if (ma5 > 0 and last_close > ma5) else ("空头" if ma5 > 0 else "中性")})
+    out.append({"name": "MA20", "value": f"{ma20:.2f}" if ma20 > 0 else "—", "signal": ("多头" if ma5 > ma20 else "空头") if (ma5 > 0 and ma20 > 0) else "中性"})
 
     macd_hist = prev_macd_hist = rsi_v = kdj_j = None
     try:
         import pandas_ta_classic as ta  # noqa: F401
-        macd_df = close.ta.macd() if hasattr(close, "ta") else None
-        if macd_df is not None and not macd_df.empty:
-            macd_hist = _f(macd_df.iloc[-1].get(f"MACDh_12_26_9"))
-            # v1.6.0（审计 E2）：金叉/死叉是「交叉事件」，需要上一根的柱值对比
-            if len(macd_df) >= 2:
-                prev_macd_hist = _f(macd_df.iloc[-2].get(f"MACDh_12_26_9"))
-        rsi_s = close.ta.rsi()
-        if rsi_s is not None and len(rsi_s):
-            rsi_v = _f(rsi_s.iloc[-1])
         hldf = pd.DataFrame({"high": high, "low": low, "close": close})
-        stoch = hldf.ta.stoch()
+        macd_df = hldf.ta.macd()
+        if macd_df is not None and not macd_df.empty and "MACDh_12_26_9" in macd_df:
+            last_h = macd_df["MACDh_12_26_9"].iloc[-1]
+            if pd.notna(last_h):
+                macd_hist = _f(last_h)
+                if len(macd_df) >= 2 and pd.notna(macd_df["MACDh_12_26_9"].iloc[-2]):
+                    prev_macd_hist = _f(macd_df["MACDh_12_26_9"].iloc[-2])
+        rsi_s = hldf.ta.rsi(length=14)
+        if rsi_s is not None and len(rsi_s) and pd.notna(rsi_s.iloc[-1]):
+            rsi_v = _f(rsi_s.iloc[-1])
+        stoch = hldf.ta.stoch(k=9, d=3, smooth_k=3)
         if stoch is not None and not stoch.empty:
-            _k = _f(stoch.iloc[-1].get("STOCHk_14_3_3"))
-            _d = _f(stoch.iloc[-1].get("STOCHd_14_3_3"))
-            kdj_j = 3 * _k - 2 * _d  # J = 3K - 2D
+            k_col = "STOCHk_9_3_3" if "STOCHk_9_3_3" in stoch else "STOCHk_14_3_3"
+            d_col = "STOCHd_9_3_3" if "STOCHd_9_3_3" in stoch else "STOCHd_14_3_3"
+            if pd.notna(stoch.iloc[-1].get(k_col)) and pd.notna(stoch.iloc[-1].get(d_col)):
+                _k = _f(stoch.iloc[-1].get(k_col))
+                _d = _f(stoch.iloc[-1].get(d_col))
+                kdj_j = 3 * _k - 2 * _d  # J = 3K - 2D
     except Exception as e:  # noqa: BLE001
         logger.debug("pandas-ta-classic 不可用，回退纯 pandas：%s", e)
 
@@ -645,21 +671,29 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
             prev_macd_hist = _f(hist_series.iloc[-2])
     if rsi_v is None:
         delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean().replace(0, 1e-9)
-        rs = gain / loss
-        rsi_v = _f((100 - 100 / (1 + rs)).iloc[-1]) if len(rs) else 50.0
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        if len(gain):
+            g_last = _f(gain.iloc[-1])
+            l_last = _f(loss.iloc[-1])
+            if g_last == 0.0 and l_last == 0.0:
+                rsi_v = 50.0
+            elif l_last == 0.0:
+                rsi_v = 100.0
+            else:
+                rsi_v = _f(100.0 - 100.0 / (1.0 + g_last / l_last))
+        else:
+            rsi_v = 50.0
     if kdj_j is None:
-        low9 = low.rolling(9).min()
-        high9 = high.rolling(9).max().replace(0, 1e-9)
-        rsv = (close - low9) / (high9 - low9) * 100
-        rsv = rsv.fillna(50.0)
+        low9 = low.rolling(9, min_periods=1).min()
+        high9 = high.rolling(9, min_periods=1).max()
+        denom = (high9 - low9).replace(0, float("nan"))
+        rsv = ((close - low9) / denom * 100).fillna(50.0)
         k = rsv.ewm(com=2, adjust=False).mean()
         d = k.ewm(com=2, adjust=False).mean()
         kdj_j = _f((3 * k - 2 * d).iloc[-1]) if len(d) else 50.0
 
-    # v1.6.0（审计 E2）：金叉/死叉判「交叉事件」（上一根柱值与当前柱值跨零），
-    # 未发生交叉时如实标注当前 多头/空头 状态 —— 旧实现 hist>0 就叫"金叉"是误称。
+    # v1.6.0（审计 E2）：金叉/死叉判「交叉事件」（上一根柱值与当前柱值跨零）
     if prev_macd_hist is not None:
         macd_signal = (
             "金叉" if (macd_hist > 0 and prev_macd_hist <= 0)
@@ -674,14 +708,15 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
 
     try:
         mid = close.rolling(20).mean()
-        std = close.rolling(20).std()
+        std = close.rolling(20).std(ddof=0)
         up = mid + 2 * std
         lo = mid - 2 * std
         lc = last_close
         if len(mid) and not math.isnan(mid.iloc[-1]):
             mid_v = _f(mid.iloc[-1])
+            up_v = _f(up.iloc[-1])
             lo_v = _f(lo.iloc[-1])
-            sig = "多头" if lc > mid_v else ("空头" if lc < lo_v else "中性")
+            sig = "超买" if lc > up_v else ("超卖" if lc < lo_v else ("多头" if lc > mid_v else ("空头" if lc < mid_v else "中性")))
             out.append({"name": "BOLL", "value": f"{mid_v:.2f}", "signal": sig})
     except Exception:  # noqa: BLE001
         out.append({"name": "BOLL", "value": "—", "signal": "中性"})

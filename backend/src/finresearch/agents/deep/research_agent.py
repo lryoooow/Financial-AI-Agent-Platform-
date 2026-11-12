@@ -37,6 +37,12 @@ from .tools import resolve_entity
 
 logger = logging.getLogger(__name__)
 
+# 研究主循环仅需 resolve_entity / prefetch_basics / prefetch_industry / compose_report 四个专用工具，
+# 额外摘除 deepagents 默认注入的待办与虚拟文件系统工具，防止轻量模型在无关工具上空转耗轮次。
+_RESEARCH_EXCLUDED_TOOLS = _EXCLUDED_TOOLS | frozenset({
+    "write_todos", "ls", "read_file", "write_file", "edit_file", "glob", "grep",
+})
+
 RESEARCH_SYSTEM_PROMPT = """你是金融研究任务的执行者。你的职责是把一次研究任务跑完，而不是自己写分析。
 
 【工作流程】
@@ -48,7 +54,7 @@ RESEARCH_SYSTEM_PROMPT = """你是金融研究任务的执行者。你的职责�
 - 行业研究（任务是研究某个行业，如"光伏行业"、"半导体"）：
   1. 调用 prefetch_industry，传行业名称（如"光伏"）。
   2. 调用 compose_report 生成报告。
-最后用一句话说明结果，不要复述报告内容。
+调用 compose_report 完成后直接简短回复“研究完成”，不要复述报告内容。
 
 【纪律】
 - 你没有任何计算能力，也不掌握任何实时数据。不要在回复里给出任何具体数值——
@@ -67,6 +73,8 @@ def build_research_agent(
     llm_config: Optional[dict] = None,
     profile: Optional[dict] = None,
     checkpointer: Optional[Any] = None,
+    write_mode: Optional[str] = None,
+    query: Optional[str] = None,
 ) -> Optional[Any]:
     """构建研究 agent；LLM 未配置时返回 None，由调用方降级。
 
@@ -76,6 +84,8 @@ def build_research_agent(
         llm_config: 前端所选模型；为空回落环境变量。
         profile: 用户画像，透传给报告各段撰写。
         checkpointer: 复用 graph.py:init_checkpointer() 的全局检查点。
+        write_mode: stream / parallel，与直跑路径对齐。
+        query: 用户自定义关注问题，透传至报告撰写。
     """
     strong = build_llm(streaming=True, override=llm_config)
     if strong is None:
@@ -86,15 +96,23 @@ def build_research_agent(
     loop_model = build_chart_llm(llm_config) or strong
 
     focus = TEMPLATE_FOCUS.get(template, "")
+    q_line = f"【用户研究关注点】{query.strip()[:200]}" if (query or "").strip() else ""
     system_prompt = "\n".join(
-        [
+        p for p in [
             RESEARCH_SYSTEM_PROMPT,
             f"【本次任务模板】{template}。{focus}" if focus else f"【本次任务模板】{template}。",
+            q_line,
             render_time_anchor(),
-        ]
+        ] if p
     )
 
-    tools = [resolve_entity, *build_research_tools(task_id, template, llm_config, profile or {})]
+    tools = [
+        resolve_entity,
+        *build_research_tools(
+            task_id, template, llm_config, profile or {},
+            write_mode=write_mode, query=query or "",
+        ),
+    ]
 
     return create_deep_agent(
         model=loop_model,
@@ -104,5 +122,5 @@ def build_research_agent(
         checkpointer=checkpointer,
         # 与对话链路同样摘掉 execute（"能跑 shell"，会破坏数字零幻觉）与 task
         # （研究是定向任务，不需要 general-purpose subagent 再套一层循环）。
-        middleware=[ExcludeToolsMiddleware(excluded=_EXCLUDED_TOOLS)],
+        middleware=[ExcludeToolsMiddleware(excluded=_RESEARCH_EXCLUDED_TOOLS)],
     )

@@ -2,10 +2,36 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag, Plus, X, Gauge } from "lucide-react";
 import { PROVIDERS, type Provider, type ModelInfo, type Region } from "../../data/providers";
-import { api, type UserProfile } from "../../api/client";
+import { api } from "../../api/client";
 
 type Status = "idle" | "testing" | "connected" | "error";
 interface Cfg { baseUrl: string; apiKey: string; reasoningEffort: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
+
+const MASKED_KEY_RE = /^•{8}(?:.{4})?$/;
+
+function isMaskedApiKey(k: string): boolean {
+  return MASKED_KEY_RE.test(k || "");
+}
+
+function maskKeyForCache(k: string): string {
+  const v = (k || "").trim();
+  if (!v) return "";
+  if (isMaskedApiKey(v)) return v;
+  return v.length <= 6 ? "••••••••" : `••••••••${v.slice(-4)}`;
+}
+
+function normalizeApiKeyInput(prev: string, next: string): string {
+  if (!isMaskedApiKey(prev) || !next.includes("•")) return next;
+  // 防止在掩码中间误触单次 Backspace/Delete 瞬间清空整串已存密钥；
+  // 全选删除（next === ""）、粘贴新密钥或点击右侧「更换」按钮仍可正常替换。
+  if (next.length < prev.length) return next.length === 0 ? "" : prev;
+  if (next.length === prev.length) return prev;
+  let p = 0;
+  while (p < prev.length && p < next.length && prev[p] === next[p]) p++;
+  let s = 0;
+  while (s < prev.length - p && s < next.length - p && prev[prev.length - 1 - s] === next[next.length - 1 - s]) s++;
+  return next.slice(p, next.length - s);
+}
 
 interface Props {
   active: { providerId: string; modelId: string } | null;
@@ -36,14 +62,17 @@ export function Settings({ active, onActivate }: Props) {
       }];
     }));
   });
-  // 竞态修复：首次 GET 完成前不触发 debounce 保存，避免空 localStorage 覆盖后端已存密钥。
+  // 竞态修复：首次 GET 完成前不触发 debounce 保存，避免空 localStorage 覆盖后端已存密钥；
+  // 同时标记远端恢复本身不触发无意义的立即回写 PUT。
   const configsLoadedRef = useRef(false);
+  const skipPersistOnceRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
     api.localSetting("model-configs")
       .then((r) => {
         if (cancelled || !r.payload) return;
         const saved = r.payload as Record<string, any>;
+        skipPersistOnceRef.current = true;
         setConfigs(Object.fromEntries(PROVIDERS.map((p) => {
           const s = saved[p.id] || {};
           // v1.6.4：同上 —— 保存过的空清单不被预置清单复活
@@ -67,9 +96,39 @@ export function Settings({ active, onActivate }: Props) {
       .finally(() => { if (!cancelled) configsLoadedRef.current = true; });
     return () => { cancelled = true; };
   }, []);
-  // 持久化 key/baseUrl/模型列表/所选模型；避免每次打开都重新测试和拉取模型。
+  // 持久化 key/baseUrl/模型列表/所选模型；localStorage 仅存掩码，真实密钥只发后端 DPAPI 加密落库。
+  const pendingSaveRef = useRef<Record<string, any> | null>(null);
+  useEffect(() => {
+    const flushPending = () => {
+      if (!pendingSaveRef.current) return;
+      const payload = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      api.saveLocalSetting("model-configs", payload).catch(() => {});
+    };
+    window.addEventListener("beforeunload", flushPending);
+    return () => {
+      window.removeEventListener("beforeunload", flushPending);
+      flushPending();
+    };
+  }, []);
+
   useEffect(() => {
     if (!configsLoadedRef.current) return;
+    const toCache = Object.fromEntries(Object.entries(configs).map(([id, c]) => [id, {
+      baseUrl: c.baseUrl,
+      apiKey: maskKeyForCache(c.apiKey),
+      reasoningEffort: c.reasoningEffort,
+      selectedModel: c.selectedModel,
+      models: c.models,
+    }]));
+    try {
+      localStorage.setItem("finresearch_keys", JSON.stringify(toCache));
+    } catch { /* ignore */ }
+    if (skipPersistOnceRef.current) {
+      skipPersistOnceRef.current = false;
+      window.dispatchEvent(new CustomEvent("finresearch:configs-updated"));
+      return;
+    }
     const toSave = Object.fromEntries(Object.entries(configs).map(([id, c]) => [id, {
       baseUrl: c.baseUrl,
       apiKey: c.apiKey,
@@ -77,13 +136,12 @@ export function Settings({ active, onActivate }: Props) {
       selectedModel: c.selectedModel,
       models: c.models,
     }]));
-    localStorage.setItem("finresearch_keys", JSON.stringify(toSave));
-    // v1.6.2：广播配置更新 —— 已挂载的 ModelPicker 据此即时刷新（否则换 key 后
-    // 聊天页选择器仍握挂载时的旧缓存，带着旧 key 请求 401）
+    // v1.6.2：广播配置更新 —— 已挂载的 ModelPicker 据此即时刷新
     window.dispatchEvent(new CustomEvent("finresearch:configs-updated"));
+    pendingSaveRef.current = toSave;
     const t = window.setTimeout(() => {
-      // v1.6.3（C1）：保存失败绝不静默 —— DB 是后端 overlay 的事实源，失败必须让
-      // 用户知道（否则 DB 留旧 key，后端会把前端新 key 反向覆盖回 401）
+      pendingSaveRef.current = null;
+      // v1.6.3（C1）：保存失败绝不静默 —— DB 是后端 overlay 的事实源
       api.saveLocalSetting("model-configs", toSave).catch((e) => {
         const msg = `密钥保存失败（${e instanceof Error ? e.message : String(e)}）。请检查后端连接后重试，否则换 key 不会生效。`;
         setSaveError(msg);
@@ -133,36 +191,18 @@ export function Settings({ active, onActivate }: Props) {
   useEffect(() => {
     if (!PROVIDERS.some((p) => p.id === selectedId)) setSelectedId(PROVIDERS[0].id);
   }, [selectedId]);
+  // 外部（如聊天页 ModelPicker）切换了当前激活模型时，同步该厂商的 selectedModel 高亮
+  useEffect(() => {
+    if (!active?.providerId || !active?.modelId) return;
+    setConfigs((c) => {
+      const cur = c[active.providerId];
+      if (!cur || cur.selectedModel === active.modelId) return c;
+      if (!cur.models.some((m) => m.id === active.modelId)) return c;
+      return { ...c, [active.providerId]: { ...cur, selectedModel: active.modelId } };
+    });
+  }, [active?.providerId, active?.modelId]);
   const [showKey, setShowKey] = useState(false);
   const [regionFilter, setRegionFilter] = useState<Region | "all">("all");
-  const [profile, setProfile] = useState<UserProfile>({
-    risk_preference: "",
-    investment_cycle: "",
-    focus_metrics: "",
-    analysis_style: "",
-  });
-
-  const profileLoadedRef = useRef(false);
-  useEffect(() => {
-    let cancelled = false;
-    api.userProfile()
-      .then((r) => {
-        if (!cancelled && r.payload) setProfile(r.payload);
-      })
-      .catch(() => {})
-      .finally(() => { if (!cancelled) profileLoadedRef.current = true; });
-    return () => { cancelled = true; };
-  }, []);
-
-  // 竞态修复：首次 GET 完成前不触发 debounce 保存，避免空画像覆盖后端已存的。
-  useEffect(() => {
-    if (!profileLoadedRef.current) return;
-    const t = window.setTimeout(() => {
-      api.saveUserProfile(profile).catch(() => {});
-    }, 400);
-    return () => window.clearTimeout(t);
-  }, [profile]);
-
   const provider = PROVIDERS.find((p) => p.id === selectedId) ?? PROVIDERS[0];
   const cfg = configs[selectedId] ?? configs[PROVIDERS[0].id]!;
   const patch = (id: string, p: Partial<Cfg>) => {
@@ -184,12 +224,12 @@ export function Settings({ active, onActivate }: Props) {
     patch(selectedId, { status: "testing", message: "" });
     const t0 = performance.now();
     try {
-      const r = await api.models(cfg.baseUrl, cfg.apiKey);
+      const r = await api.models(cfg.baseUrl, cfg.apiKey, selectedId);
       const err = r.provenance?.error as string | undefined;
       const ok = !err && (r.models?.length ?? 0) > 0;
       patch(selectedId, ok
         ? { status: "connected", latency: Math.round(performance.now() - t0), message: `连接成功（拉到 ${r.models!.length} 个模型）` }
-        : { status: "error", message: `认证失败：${err || "未返回任何模型"}` });
+        : { status: "error", message: `认证或探测失败：${err || "未返回任何模型"}` });
     } catch (e) {
       patch(selectedId, { status: "error", message: `连接失败：${e instanceof Error ? e.message : String(e)}` });
     }
@@ -200,9 +240,24 @@ export function Settings({ active, onActivate }: Props) {
     if (!cfg.apiKey.trim()) { patch(selectedId, { status: "error", message: "请先填入 API Key" }); return; }
     patch(selectedId, { fetching: true });
     try {
-      const r = await api.models(cfg.baseUrl, cfg.apiKey);
+      const r = await api.models(cfg.baseUrl, cfg.apiKey, selectedId);
+      const err = r.provenance?.error as string | undefined;
       const live = (r.models || []).map((m) => ({ id: m.id, label: m.label || m.id, context: "" }));
-      const models = live.length ? live : provider.models;
+      const models = live.length ? live : (cfg.models.length ? cfg.models : provider.models);
+      if (err && !live.length) {
+        patch(selectedId, {
+          fetching: false,
+          models,
+          selectedModel: cfg.selectedModel && models.some((m) => m.id === cfg.selectedModel)
+            ? cfg.selectedModel
+            : models[0]?.id || "",
+          status: "error",
+          message: models.length
+            ? `拉取失败（${err}），当前展示已保存/内置清单`
+            : `拉取失败：${err}（可在下方手动添加模型 ID）`,
+        });
+        return;
+      }
       patch(selectedId, {
         fetching: false,
         models,
@@ -213,21 +268,22 @@ export function Settings({ active, onActivate }: Props) {
           : models[0]?.id || "",
         status: "connected",
         // v1.6.4：自定义端点无内置清单可兜底 —— 提示改为引导手动添加
-        message: live.length ? "已拉取最新模型" : provider.models.length ? "使用内置模型清单" : "该端点未返回模型，可在下方手动添加",
+        message: live.length ? `已拉取 ${live.length} 个模型` : provider.models.length ? "使用内置模型清单" : "该端点未返回模型，可在下方手动添加",
       });
-    } catch {
-      // 厂商 /models 拉取失败 → 回退静态清单（已是 2026-07 当前线）
+    } catch (e) {
+      // 厂商 /models 拉取异常 → 回退静态清单并如实提示错误
       const models = cfg.models.length ? cfg.models : provider.models;
+      const reason = e instanceof Error ? e.message : String(e);
       patch(selectedId, {
         fetching: false,
         models,
         selectedModel: cfg.selectedModel && models.some((m) => m.id === cfg.selectedModel)
           ? cfg.selectedModel
           : models[0]?.id || "",
-        status: "connected",
-        message: cfg.models.length || provider.models.length
-          ? "模型接口不可用，使用已保存/内置清单"
-          : "模型接口不可用，可在下方手动添加模型",
+        status: "error",
+        message: models.length
+          ? `拉取失败（${reason}），当前展示已保存/内置清单`
+          : `拉取失败（${reason}），可在下方手动添加模型`,
       });
     }
   }
@@ -358,52 +414,38 @@ export function Settings({ active, onActivate }: Props) {
               <label className="text-xs text-muted-foreground flex items-center gap-1.5 mb-1.5"><KeyRound className="size-3.5" /> API Key</label>
               <div className="flex items-center rounded-lg bg-input border border-border focus-within:border-gold/40 transition-colors">
                 <input
-                  type={showKey ? "text" : "password"}
+                  type={isMaskedApiKey(cfg.apiKey) || showKey ? "text" : "password"}
                   value={cfg.apiKey}
-                  onChange={(e) => patch(selectedId, { apiKey: e.target.value, status: "idle", message: "" })}
+                  onFocus={(e) => { if (isMaskedApiKey(cfg.apiKey)) e.currentTarget.select(); }}
+                  onChange={(e) => patch(selectedId, { apiKey: normalizeApiKeyInput(cfg.apiKey, e.target.value), status: "idle", message: "" })}
                   placeholder="sk-··· 在此填入你的密钥"
                   className="flex-1 bg-transparent px-3 py-2.5 text-sm font-mono outline-none placeholder:text-muted-foreground placeholder:font-sans"
                   spellCheck={false}
                 />
-                <button onClick={() => setShowKey((s) => !s)} className="px-3 text-muted-foreground hover:text-foreground transition-colors">
-                  {showKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                {isMaskedApiKey(cfg.apiKey) && (
+                  <button
+                    type="button"
+                    title="清空当前密钥并重新输入"
+                    onClick={() => patch(selectedId, { apiKey: "", status: "idle", message: "" })}
+                    className="px-2 py-1 mr-1 rounded text-[11px] bg-secondary/70 text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                  >
+                    更换
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={isMaskedApiKey(cfg.apiKey)}
+                  title={isMaskedApiKey(cfg.apiKey) ? "已加密保存在本机（仅展示末 4 位），点击「更换」或粘贴新密钥即可替换" : (showKey ? "隐藏密钥" : "显示密钥")}
+                  onClick={() => setShowKey((s) => !s)}
+                  className="px-3 text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  {showKey && !isMaskedApiKey(cfg.apiKey) ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
                 </button>
               </div>
-              <p className="text-[10.5px] text-muted-foreground/70 mt-1.5">密钥仅保存在本机，永不上传。</p>
+              <p className="text-[10.5px] text-muted-foreground/70 mt-1.5">密钥经 Windows DPAPI 加密后仅保存在本机数据库，永不上传或明文外泄。</p>
             </div>
 
             {/* 测试连通性 */}
-            <div className="mt-5 rounded-lg border border-border bg-secondary/25 p-3">
-              <div className="text-sm text-foreground">用户画像 / 研究偏好</div>
-              <p className="mt-1 text-[11px] text-muted-foreground">仅保存在本地，用于专业对话和研究任务的上下文侧重。</p>
-              <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                <input
-                  value={profile.risk_preference || ""}
-                  onChange={(e) => setProfile((p) => ({ ...p, risk_preference: e.target.value }))}
-                  placeholder="风险偏好，如 稳健"
-                  className="rounded-lg bg-input border border-border px-3 py-2 text-xs outline-none focus:border-gold/40"
-                />
-                <input
-                  value={profile.investment_cycle || ""}
-                  onChange={(e) => setProfile((p) => ({ ...p, investment_cycle: e.target.value }))}
-                  placeholder="投资周期，如 中期"
-                  className="rounded-lg bg-input border border-border px-3 py-2 text-xs outline-none focus:border-gold/40"
-                />
-                <input
-                  value={profile.focus_metrics || ""}
-                  onChange={(e) => setProfile((p) => ({ ...p, focus_metrics: e.target.value }))}
-                  placeholder="关注指标，如 ROE、现金流"
-                  className="rounded-lg bg-input border border-border px-3 py-2 text-xs outline-none focus:border-gold/40"
-                />
-                <input
-                  value={profile.analysis_style || ""}
-                  onChange={(e) => setProfile((p) => ({ ...p, analysis_style: e.target.value }))}
-                  placeholder="分析风格，如 结论先行"
-                  className="rounded-lg bg-input border border-border px-3 py-2 text-xs outline-none focus:border-gold/40"
-                />
-              </div>
-            </div>
-
             <div className="mt-4 flex items-center gap-3">
               <button onClick={testConn} disabled={cfg.status === "testing"} className="flex items-center gap-2 rounded-lg bg-secondary hover:bg-secondary/70 px-3.5 py-2 text-sm transition-colors disabled:opacity-60">
                 {cfg.status === "testing" ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4 text-gold" />}
@@ -487,7 +529,7 @@ export function Settings({ active, onActivate }: Props) {
                 <input
                   value={newModelId}
                   onChange={(e) => setNewModelId(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") addManualModel(); }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) addManualModel(); }}
                   placeholder="手动添加模型 ID，如 gpt-4o / claude-sonnet-5（按中转站的模型名填）"
                   className="flex-1 rounded-lg bg-input border border-border px-3 py-2 text-xs font-mono outline-none focus:border-gold/40 transition-colors"
                   spellCheck={false}
@@ -519,7 +561,7 @@ export function Settings({ active, onActivate }: Props) {
                         patch(selectedId, { selectedModel: cfg.models[0]?.id || "" });
                         return;
                       }
-                      onActivate({ providerId: provider.id, modelId: m.id, provider: provider.name, model: m.label, accent: provider.accent });
+                      onActivate({ providerId: provider.id, modelId: m.id, provider: provider.name, model: m.id, accent: provider.accent });
                     }}
                     className="mt-4 w-full flex items-center justify-center gap-2 rounded-lg border border-gold/40 bg-accent/60 py-2.5 text-sm text-gold hover:bg-accent transition-colors overflow-hidden disabled:opacity-40 disabled:cursor-not-allowed"
                   >

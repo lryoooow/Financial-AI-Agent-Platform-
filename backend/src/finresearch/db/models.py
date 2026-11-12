@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -33,6 +34,7 @@ class ResearchTask(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
     code: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     template: Mapped[str] = mapped_column(String(32), default="equity_deep")
     query: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/running/done/error
@@ -89,6 +91,9 @@ class ChatConversation(Base):
 
 class ChatDelta(Base):
     __tablename__ = "chat_delta"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "seq", name="uq_chat_delta_conv_seq"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -111,6 +116,8 @@ class ChatContextSummary(Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     history_path: Mapped[str] = mapped_column(Text, default="")
     model: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    # v1.8.0：自动压缩代际。agent 线程 thread_id = 会话 id（第 0 代）或 "会话id:gN"
+    generation: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

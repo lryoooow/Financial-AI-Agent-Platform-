@@ -9,9 +9,24 @@ v1.6.0（审计 E2）：加 max_entries 容量上限 —— 旧实现过期项�
 
 from __future__ import annotations
 
+import copy
 import time
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
+
+
+def _clone_cached(val: Any) -> Any:
+    """对可变容器返回浅拷贝（含 provenance 子字典），防止调用方原地修改污染进程内缓存；
+    DataFrame 等重型对象保持零拷贝引用。"""
+    if isinstance(val, dict):
+        out = copy.copy(val)
+        prov = out.get("provenance")
+        if isinstance(prov, dict):
+            out["provenance"] = copy.copy(prov)
+        return out
+    if isinstance(val, list):
+        return list(val)
+    return val
 
 
 class TTLCache:
@@ -30,12 +45,13 @@ class TTLCache:
             if exp < now:
                 self._store.pop(key, None)
                 return None
-            return val
+            return _clone_cached(val)
 
     def set(self, key: str, value: Any, ttl: float = 5.0) -> None:
         now = time.time()
+        stored = _clone_cached(value)
         with self._lock:
-            self._store[key] = (now + ttl, value)
+            self._store[key] = (now + ttl, stored)
             if len(self._store) > self._max_entries:
                 # 先清过期项
                 expired = [k for k, (exp, _v) in self._store.items() if exp < now]

@@ -14,8 +14,13 @@
 // - [D3] backend.log 只记生命周期事件（stdout/stderr 详细日志由 Python 侧 sidecar 日志承载，
 //        此前同一输出双份采集）；超 5MB 截断，不再无限追加。
 // - [D7] 加固：setWindowOpenHandler 全拒 + will-navigate 白名单 + IPC 校验 sender。
+//
+// v1.8.0：后台驻留 —— 关闭窗口 = 隐藏到系统托盘（研究任务在后台继续），只有托盘菜单
+// 「退出」才完全退出（后端优雅停机）。偏好（托盘驻留 / 开机自启）存
+// %APPDATA%/FinResearch/desktop-settings.json，由设置页经 IPC 读写；开机自启以 --hidden
+// 参数启动，直接驻留托盘不弹窗口。
 
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Tray, Menu, screen, session, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -29,6 +34,15 @@ let backendPort = null;
 let quitting = false;
 let restartingBackend = false;
 let backendRestartAttempts = 0;
+let tray = null;
+let trayHintShown = false;
+// Windows 注销/关机期间：关闭窗口不拦截（与「正在退出」分开记 —— 关机被取消后会话继续，
+// 若复用 quitting，quitAll 的重入守卫会让之后再也无法退出、后端成孤儿进程）
+let sessionEnding = false;
+// 隐藏启动（开机自启）期间用户又双击了快捷方式：窗口就绪后要显示
+let showWhenReady = false;
+// 开机自启以 --hidden 启动：不出 splash、不弹窗口，直接驻留托盘
+const startHidden = process.argv.includes('--hidden');
 
 // [B2] 单实例锁：第二个实例只聚焦既有窗口，不再拉起第二套后端
 const gotLock = app.requestSingleInstanceLock();
@@ -36,10 +50,7 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
+    showMainWindow();
   });
 }
 
@@ -88,6 +99,88 @@ function appendBackendLog(message) {
   } catch (_) {}
 }
 
+// ── v1.8.0：桌面偏好（托盘驻留 / 开机自启） ─────────────────
+const DEFAULT_DESKTOP_PREFS = { closeToTray: true, autoLaunch: false };
+
+function desktopPrefsFile() {
+  return path.join(appDataDir(), 'desktop-settings.json');
+}
+
+function readDesktopPrefs() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(desktopPrefsFile(), 'utf8'));
+    return {
+      closeToTray: typeof raw.closeToTray === 'boolean' ? raw.closeToTray : DEFAULT_DESKTOP_PREFS.closeToTray,
+      autoLaunch: typeof raw.autoLaunch === 'boolean' ? raw.autoLaunch : DEFAULT_DESKTOP_PREFS.autoLaunch,
+    };
+  } catch (_) {
+    return { ...DEFAULT_DESKTOP_PREFS };
+  }
+}
+
+let desktopPrefs = readDesktopPrefs();
+
+function writeDesktopPrefs(next) {
+  desktopPrefs = { ...desktopPrefs, ...next };
+  try {
+    fs.mkdirSync(appDataDir(), { recursive: true });
+    fs.writeFileSync(desktopPrefsFile(), JSON.stringify(desktopPrefs, null, 2), 'utf8');
+  } catch (e) {
+    appendBackendLog(`[prefs-write-failed] ${e && e.message ? e.message : e}`);
+  }
+  applyAutoLaunch();
+  return desktopPrefs;
+}
+
+function applyAutoLaunch() {
+  if (!app.isPackaged) return; // 开发态不写注册表
+  try {
+    // 便携版运行时 execPath 指向解压临时目录，自启必须指向便携 exe 本体
+    const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+    app.setLoginItemSettings({ openAtLogin: !!desktopPrefs.autoLaunch, path: exePath, args: ['--hidden'] });
+  } catch (e) {
+    appendBackendLog(`[auto-launch-failed] ${e && e.message ? e.message : e}`);
+  }
+}
+
+function ensureWindowVisibleOnScreen(targetWin) {
+  try {
+    const b = targetWin.getBounds();
+    const displays = screen.getAllDisplays();
+    const intersects = displays.some((d) => {
+      const wa = d.workArea;
+      const overlapX = Math.min(b.x + b.width, wa.x + wa.width) - Math.max(b.x, wa.x);
+      const overlapY = Math.min(b.y + b.height, wa.y + wa.height) - Math.max(b.y, wa.y);
+      return overlapX >= 120 && overlapY >= 80;
+    });
+    if (!intersects) targetWin.center();
+  } catch (_) {}
+}
+
+function showMainWindow() {
+  if (!win || win.isDestroyed()) {
+    showWhenReady = true; // 窗口尚未创建（后端仍在启动）：就绪后显示
+    return;
+  }
+  if (win.isMinimized()) win.restore();
+  ensureWindowVisibleOnScreen(win);
+  if (!win.isVisible()) win.show();
+  win.focus();
+}
+
+function createTray() {
+  if (tray) return;
+  tray = new Tray(windowIcon());
+  tray.setToolTip('景渊 · 金融研究助手');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '打开景渊', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: '退出', click: () => { quitAll(); } },
+  ]));
+  tray.on('click', () => { sessionEnding = false; showMainWindow(); });
+  tray.on('double-click', () => showMainWindow());
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -124,17 +217,39 @@ function readPort(retries = 240) {
 function waitHealth(port, retries = 240) {
   return new Promise((resolve, reject) => {
     let n = 0;
+    let settled = false;
     const tick = () => {
+      if (settled) return;
       const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
-        res.resume();
-        if (res.statusCode === 200) resolve();
-        else retry();
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          if (raw.length < 4096) raw += chunk;
+        });
+        res.on('end', () => {
+          if (settled) return;
+          if (res.statusCode === 200) {
+            try {
+              const parsed = JSON.parse(raw);
+              if (parsed && parsed.status === 'ok') {
+                settled = true;
+                resolve();
+                return;
+              }
+            } catch (_) {}
+          }
+          retry();
+        });
       });
       // [B2] 单次探测 3s 超时：后端僵死（可连不响应）时 retry 才有机会触发
       req.setTimeout(3000, () => req.destroy(new Error('health probe timeout')));
       req.on('error', retry);
       function retry() {
-        if (++n > retries) return reject(new Error('后端健康检查超时'));
+        if (settled) return;
+        if (++n > retries) {
+          settled = true;
+          return reject(new Error('后端健康检查超时'));
+        }
         setTimeout(tick, 500);
       }
     };
@@ -183,11 +298,24 @@ function closeSplash() {
 
 function createWindow(port) {
   backendPort = port;
+  let initWidth = 1280;
+  let initHeight = 820;
+  let minWidth = 960;
+  let minHeight = 600;
+  try {
+    const wa = screen.getPrimaryDisplay().workAreaSize;
+    if (wa && wa.width && wa.height) {
+      initWidth = Math.min(1280, Math.max(800, wa.width - 24));
+      initHeight = Math.min(820, Math.max(560, wa.height - 24));
+      minWidth = Math.min(960, Math.max(760, wa.width - 40));
+      minHeight = Math.min(600, Math.max(520, wa.height - 40));
+    }
+  } catch (_) {}
   win = new BrowserWindow({
-    width: 1280,
-    height: 820,
-    minWidth: 960,
-    minHeight: 600,
+    width: initWidth,
+    height: initHeight,
+    minWidth,
+    minHeight,
     title: '景渊 · 金融研究助手',
     frame: false,            // 无原生边框：去掉 Windows 标题栏按钮，仅保留应用内 TitleBar
     autoHideMenuBar: true,
@@ -203,8 +331,27 @@ function createWindow(port) {
 
   win.loadURL(`http://127.0.0.1:${port}/`);
   win.once('ready-to-show', () => {
-    win.show();
+    if (!startHidden || showWhenReady) win.show();
     closeSplash();
+  });
+  // Windows 注销/关机：不拦截关闭（否则托盘驻留会阻止会话结束）
+  win.on('query-session-end', () => { sessionEnding = true; });
+  win.on('session-end', () => { quitAll(); });
+  // v1.8.0：关闭窗口 = 隐藏到托盘（研究任务后台继续）；只有托盘「退出」或关闭了托盘驻留才真正退出
+  win.on('close', (e) => {
+    if (quitting || sessionEnding || !desktopPrefs.closeToTray) return;
+    e.preventDefault();
+    win.hide();
+    if (!trayHintShown && tray && process.platform === 'win32') {
+      trayHintShown = true;
+      try {
+        tray.displayBalloon({
+          iconType: 'info',
+          title: '景渊仍在后台运行',
+          content: '研究任务会继续进行。点击托盘图标恢复窗口，右键选择「退出」完全退出。',
+        });
+      } catch (_) {}
+    }
   });
   // v1.6.3（D5）：加载失败兜底 —— 后端在 health 通过后、窗口加载前死掉时
   // ready-to-show 永不触发，splash 会永久卡死。失败即关 splash + 弹错（restart 循环自会接手）。
@@ -215,14 +362,39 @@ function createWindow(port) {
   });
   win.on('closed', () => { win = null; });
 
-  // [D7] 加固：渲染内容来自本地后端，不允许开新窗口与外部跳转。
-  // 核验修复：用 URL 解析精确比对 host —— 前缀匹配可被 `http://127.0.0.1:9527@evil/`
-  // 这类 userinfo 形态绕过。
-  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  // [D7] 加固：渲染内容来自本地后端，禁止在应用内打开新窗口；合法外链交给系统浏览器打开。
+  // 核验修复：用 URL 解析精确比对 host，并使用动态 backendPort（兼容后端异常重启换端口）。
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const u = new URL(url);
+      if (
+        (u.protocol === 'https:' || u.protocol === 'http:') &&
+        u.hostname !== '127.0.0.1' &&
+        u.hostname !== 'localhost'
+      ) {
+        shell.openExternal(url).catch(() => {});
+      }
+    } catch (_) {}
+    return { action: 'deny' };
+  });
   win.webContents.on('will-navigate', (event, url) => {
     try {
       const u = new URL(url);
-      if (u.host !== `127.0.0.1:${port}` && u.host !== `localhost:${port}`) event.preventDefault();
+      const activePort = backendPort || port;
+      if (u.host !== `127.0.0.1:${activePort}` && u.host !== `localhost:${activePort}`) {
+        event.preventDefault();
+        if (
+          (u.protocol === 'https:' || u.protocol === 'http:') &&
+          u.hostname !== '127.0.0.1' &&
+          u.hostname !== 'localhost'
+        ) {
+          shell.openExternal(url).catch(() => {});
+        }
+        return;
+      }
+      if (u.pathname.startsWith('/api/')) {
+        event.preventDefault();
+      }
     } catch (_) {
       event.preventDefault();
     }
@@ -246,6 +418,17 @@ function registerWindowIpc() {
   });
   ipcMain.on('finresearch:window:close', (e) => { if (isMainWindow(e)) win.close(); });
   ipcMain.handle('finresearch:window:is-maximized', (e) => isMainWindow(e) && !!win.isMaximized());
+  // v1.8.0：桌面偏好读写（设置页）
+  const prefsPayload = () => ({ ...desktopPrefs, version: app.getVersion() });
+  ipcMain.handle('finresearch:app:get-prefs', (e) => (isMainWindow(e) ? prefsPayload() : null));
+  ipcMain.handle('finresearch:app:set-prefs', (e, patch) => {
+    if (!isMainWindow(e) || !patch || typeof patch !== 'object') return prefsPayload();
+    const next = {};
+    if (typeof patch.closeToTray === 'boolean') next.closeToTray = patch.closeToTray;
+    if (typeof patch.autoLaunch === 'boolean') next.autoLaunch = patch.autoLaunch;
+    writeDesktopPrefs(next);
+    return prefsPayload();
+  });
 }
 
 // [B3] 优雅退出：先握手让后端自己走 lifespan 收尾（检查点 flush、日志「关闭。」），
@@ -282,13 +465,22 @@ async function stopBackendGracefully() {
   if (backend === child) backend = null;
 }
 
+let backendStableTimer = null;
+
 async function start() {
-  createSplash();          // [B2] 立即出反馈窗口
+  if (!startHidden) createSplash();          // [B2] 立即出反馈窗口（开机自启隐藏启动时不出）
   registerWindowIpc();
+  createTray();
+  applyAutoLaunch();
   try {
     const port = await launchBackend();
+    // v1.8.0：界面由本地后端伺服，HTTP 缓存毫无收益却会在升级后继续显示旧版界面
+    //（1.7→1.8 实测：安装新版后窗口仍是旧 index.html + 旧脚本）。每次启动清掉 HTTP 缓存，
+    // 只清缓存，不动 localStorage（用户的界面偏好）。
+    try { await session.defaultSession.clearCache(); } catch (e) { appendBackendLog(`[clear-cache-failed] ${e}`); }
     createWindow(port);
   } catch (e) {
+    if (quitting) return;
     appendBackendLog(`[startup-failed] ${e && e.stack ? e.stack : e}`);
     closeSplash();
     dialog.showErrorBox(
@@ -301,6 +493,7 @@ async function start() {
 }
 
 async function launchBackend() {
+  if (quitting) throw new Error('app is quitting');
   const exe = backendExe();
   clearStalePort();
   appendBackendLog(`launch ${exe}`);
@@ -317,6 +510,10 @@ async function launchBackend() {
   });
   child.on('exit', (code, signal) => {
     appendBackendLog(`[exit] code=${code} signal=${signal || ''}`);
+    if (backendStableTimer) {
+      clearTimeout(backendStableTimer);
+      backendStableTimer = null;
+    }
     if (backend === child) backend = null;
     if (!quitting) restartBackend();
   });
@@ -329,7 +526,11 @@ async function launchBackend() {
     })(),
     launchFailed,
   ]);
-  backendRestartAttempts = 0;
+  if (backendStableTimer) clearTimeout(backendStableTimer);
+  backendStableTimer = setTimeout(() => {
+    if (backend === child && !quitting) backendRestartAttempts = 0;
+    backendStableTimer = null;
+  }, 30000);
   appendBackendLog(`ready http://127.0.0.1:${port}/`);
   return port;
 }
@@ -378,7 +579,10 @@ async function restartBackend() {
 // 必须与 electron-builder.yml 的 appId 一致，否则任务栏图标会与快捷方式分成两组。
 app.setAppUserModelId('com.jingyuan.app');
 
-app.whenReady().then(start).catch((e) => {
+// v1.8.0（冒烟实测）：未拿到单实例锁的进程只负责把消息转给已运行实例然后退出，
+// 绝不能再走 start() —— 旧实现 app.quit() 是异步的，whenReady 仍会触发：第二个实例
+// 拉起第二套后端并删掉运行中实例的 port.txt。托盘驻留后用户常在后台运行时再点快捷方式，必须挡住。
+if (gotLock) app.whenReady().then(start).catch((e) => {
   appendBackendLog(`[startup-failed] ${e && e.stack ? e.stack : e}`);
   closeSplash();
   console.error('启动失败：', e);
@@ -386,11 +590,17 @@ app.whenReady().then(start).catch((e) => {
 });
 
 async function quitAll() {
+  if (quitting) return;
   quitting = true;
   await stopBackendGracefully(); // [B3]
+  if (tray) {
+    try { tray.destroy(); } catch (_) {}
+    tray = null;
+  }
   app.quit();
 }
 
+// 托盘驻留时窗口只是隐藏，不会触发本事件；关闭了托盘驻留（或窗口真被销毁）时才退出
 app.on('window-all-closed', () => { quitAll(); });
 app.on('before-quit', (e) => {
   if (quitting) return;

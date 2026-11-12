@@ -25,17 +25,21 @@ Phase 1 不挂 subagents——同样是有意偏离方案，理由：
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Any, Optional
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from langchain.agents.middleware.types import AgentMiddleware
+from langchain_core.messages import ToolMessage
 
-from ...llm import build_llm
-from ...tools.context import render_profile_block, render_time_anchor
-from ..prompts import AGENT_CHAT_SYSTEM_PROMPT
-from .tools import CHAT_TOOLS
+from .._utils import sanitize_err_text
+from ...llm import build_llm, context_window_tokens
+from ...tools.context import render_profile_block
+from ..prompts import AGENT_CHAT_SYSTEM_PROMPT, AGENT_KNOWLEDGE_GUIDE
+from .tools import CHAT_TOOLS, KNOWLEDGE_TOOLS, PROFILE_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +93,43 @@ class ExcludeToolsMiddleware(AgentMiddleware):
     async def awrap_model_call(self, request, handler):
         return await handler(self._filter(request))
 
+    def _error_tool_msg(self, request, exc: Exception) -> ToolMessage:
+        call = getattr(request, "tool_call", None) or {}
+        name = (call.get("name") if isinstance(call, dict) else getattr(call, "name", None)) or "tool"
+        call_id = (call.get("id") if isinstance(call, dict) else getattr(call, "id", None)) or ""
+        safe = sanitize_err_text(exc)
+        logger.warning("工具调用未捕获异常 name=%s：%s", name, safe)
+        return ToolMessage(
+            content=json.dumps({"error": f"工具执行异常：{safe}"}, ensure_ascii=False),
+            name=str(name),
+            tool_call_id=str(call_id),
+            status="error",
+        )
+
+    def wrap_tool_call(self, request, handler):
+        try:
+            return handler(request)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_tool_msg(request, exc)
+
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return self._error_tool_msg(request, exc)
+
 
 def build_chat_agent(
     *,
     llm_config: Optional[dict] = None,
     profile: Optional[dict] = None,
     checkpointer: Optional[Any] = None,
+    learned_block: str = "",
+    knowledge_enabled: bool = True,
+    learn_enabled: bool = True,
+    context_window: Optional[int] = None,
 ) -> Optional[Any]:
     """构建对话 agent；LLM 未配置时返回 None，由调用方按旧链路的方式优雅降级。
 
@@ -109,15 +144,34 @@ def build_chat_agent(
         logger.warning("LLM 未配置，chat agent 不可用。")
         return None
 
-    # 段序沿用 prompts.py 的约定：身份/纪律/输出规范 → 画像 → 时间锚点。
-    # 稳定前缀在前、易变内容在后，既贴合注意力分布，也让厂商 prompt cache 命中长前缀。
+    # v1.8.0：把上下文窗口写进 model.profile —— 中转/国产模型名没有 profile 时，deepagents
+    # 内置摘要回落到固定 170k 才触发（远超 64k/128k 窗口，长对话先撞窗口报错）。写入后它按
+    # 窗口 85% 触发，作为本项目 Codex 式压缩（compaction.py，默认 70%）之后的第二道保险。
+    window = int(context_window or context_window_tokens(getattr(model, "model_name", "") or ""))
+    try:
+        prof = dict(getattr(model, "profile", None) or {})
+        if context_window or not isinstance(prof.get("max_input_tokens"), int):
+            prof["max_input_tokens"] = window
+            model.profile = prof
+    except Exception as e:  # noqa: BLE001
+        logger.debug("设置 model.profile 失败（不影响对话）：%s", e)
+
+    # 段序：身份/纪律/输出规范 → 知识库用法 → 手动画像 → 已学习偏好。全部是低频变化的内容，
+    # 系统提示跨轮稳定，厂商 prompt cache 可命中。v1.8.0：时间锚点从这里移到每轮用户消息
+    # 前缀（它每分钟都变，放在系统提示里会让整段前缀缓存每轮失效）。
     system_prompt = "\n".join(
-        [
+        part for part in [
             AGENT_CHAT_SYSTEM_PROMPT,
+            AGENT_KNOWLEDGE_GUIDE if knowledge_enabled else "",
             render_profile_block(profile),
-            render_time_anchor(),
-        ]
+            learned_block,
+        ] if part
     )
+    tools = list(CHAT_TOOLS)
+    if knowledge_enabled:
+        tools += KNOWLEDGE_TOOLS
+    if learn_enabled:
+        tools += PROFILE_TOOLS
 
     backend = StateBackend()
 
@@ -126,7 +180,7 @@ def build_chat_agent(
     # 必须留着。
     return create_deep_agent(
         model=model,
-        tools=CHAT_TOOLS,
+        tools=tools,
         system_prompt=system_prompt,
         backend=backend,
         checkpointer=checkpointer,

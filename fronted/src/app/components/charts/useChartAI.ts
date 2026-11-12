@@ -29,7 +29,10 @@ export function useChartAI(
     request.current = null;
     // v1.6.3（C5）：切点先清旧速读文案（悬停跨点残留旧文案），有缓存则立即回填
     setAi(undefined);
-    if (!code || !point) return;
+    if (!code || !point) {
+      lastSig.current = "";
+      return;
+    }
     // 归一化 price（分时用 price，K线用 close）
     const price = point.price ?? point.close;
     const activeLlm = loadActiveLlm() ?? undefined;
@@ -42,8 +45,6 @@ export function useChartAI(
       return;
     }
     timer.current = setTimeout(async () => {
-      if (sig === lastSig.current) return;
-      lastSig.current = sig;
       const controller = new AbortController();
       request.current = controller;
       setLoading(true);
@@ -55,8 +56,11 @@ export function useChartAI(
           prevClose,
           llm: activeLlm,  // URL / Key / model 作为同一供应商配置原子传递
         }, controller.signal);
-        chartAiCache.set(sig, { text: r.text, expiresAt: Date.now() + CHART_AI_CACHE_TTL_MS });
-        setAi(r.text);
+        const text = (r.text || "").trim();
+        if (!text || text.startsWith("(") || text.startsWith("（未配置")) return;
+        lastSig.current = sig;
+        chartAiCache.set(sig, { text, expiresAt: Date.now() + CHART_AI_CACHE_TTL_MS });
+        setAi(text);
       } catch (error) {
         if ((error as DOMException)?.name === "AbortError") return;
         // 静默：后端不可用时不显示 AI 行

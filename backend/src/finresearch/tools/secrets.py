@@ -16,14 +16,21 @@ v1.6.0（审计 B1）强化，两级方案：
 from __future__ import annotations
 
 import base64
+import ctypes
+import ctypes.wintypes
 import hashlib
 import os
+import re
 import socket
 import uuid
 from functools import lru_cache
 
 _PREFIX = "enc:"
 _DPAPI_PREFIX = "dpapi:"
+_DPAPI_V2_ENTROPY = b"finresearch-dpapi-v2"
+_CRYPTPROTECT_UI_FORBIDDEN = 0x01
+_MASK_PREFIX = "••••••••"
+_MASK_EXACT_RE = re.compile(r"^•{8}(?:.{4})?$")
 _NONCE_LEN = 16
 
 
@@ -56,32 +63,126 @@ def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     return bytes(out[:length])
 
 
-def _dpapi_available() -> bool:
-    if os.name != "nt":
-        return False
-    try:
-        from win32 import win32crypt  # noqa: F401
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
 
-        return True
+
+@lru_cache(maxsize=1)
+def _dpapi_funcs():
+    """加载 Windows 系统自带 crypt32/kernel32 DPAPI 函数（零第三方依赖，打包与虚拟环境均原生生效）。"""
+    if os.name != "nt":
+        return None
+    try:
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+
+        protect = crypt32.CryptProtectData
+        protect.argtypes = [
+            ctypes.POINTER(_DATA_BLOB),
+            ctypes.wintypes.LPCWSTR,
+            ctypes.POINTER(_DATA_BLOB),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(_DATA_BLOB),
+        ]
+        protect.restype = ctypes.wintypes.BOOL
+
+        unprotect = crypt32.CryptUnprotectData
+        unprotect.argtypes = [
+            ctypes.POINTER(_DATA_BLOB),
+            ctypes.c_void_p,
+            ctypes.POINTER(_DATA_BLOB),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(_DATA_BLOB),
+        ]
+        unprotect.restype = ctypes.wintypes.BOOL
+
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        return protect, unprotect, local_free
     except Exception:  # noqa: BLE001
-        return False
+        return None
+
+
+def _make_blob(data: bytes) -> tuple[_DATA_BLOB, ctypes.Array]:
+    buf = ctypes.create_string_buffer(data, len(data))
+    return _DATA_BLOB(len(data), buf), buf
+
+
+def _dpapi_available() -> bool:
+    return _dpapi_funcs() is not None
 
 
 def _dpapi_protect(plaintext: str) -> str:
-    from win32 import win32crypt
-
-    blob = win32crypt.CryptProtectData(
-        plaintext.encode("utf-8"), "finresearch", _machine_fingerprint(), None, None, 0
+    funcs = _dpapi_funcs()
+    if funcs is None:
+        raise RuntimeError("DPAPI unavailable")
+    protect, _unprotect, local_free = funcs
+    # v1.8.1：Windows DPAPI 已由操作系统绑定到当前登录用户凭据与本机密钥环，
+    # 不再把易变的网卡 MAC（Wi-Fi 随机 MAC / 切换热点 / VPN 虚拟网卡）混入 entropy，
+    # 避免切换网络后已保存的 API Key 静默解密为空。
+    in_blob, _in_buf = _make_blob(plaintext.encode("utf-8"))
+    ent_blob, _ent_buf = _make_blob(_DPAPI_V2_ENTROPY)
+    out_blob = _DATA_BLOB()
+    ok = protect(
+        ctypes.byref(in_blob),
+        "finresearch",
+        ctypes.byref(ent_blob),
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
-    return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        raw = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            local_free(out_blob.pbData)
+    return _DPAPI_PREFIX + base64.b64encode(raw).decode("ascii")
+
+
+def _dpapi_unprotect_raw(blob_bytes: bytes, entropy: bytes) -> bytes:
+    funcs = _dpapi_funcs()
+    if funcs is None:
+        raise RuntimeError("DPAPI unavailable")
+    _protect, unprotect, local_free = funcs
+    in_blob, _in_buf = _make_blob(blob_bytes)
+    ent_blob, _ent_buf = _make_blob(entropy)
+    out_blob = _DATA_BLOB()
+    ok = unprotect(
+        ctypes.byref(in_blob),
+        None,
+        ctypes.byref(ent_blob),
+        None,
+        None,
+        _CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        if out_blob.pbData:
+            local_free(out_blob.pbData)
 
 
 def _dpapi_unprotect(stored: str) -> str:
-    from win32 import win32crypt
-
     blob = base64.b64decode(stored[len(_DPAPI_PREFIX):])
-    _desc, data = win32crypt.CryptUnprotectData(blob, _machine_fingerprint(), None, None, 0)
-    return data.decode("utf-8")
+    try:
+        return _dpapi_unprotect_raw(blob, _DPAPI_V2_ENTROPY).decode("utf-8")
+    except Exception:  # noqa: BLE001
+        # 平滑兼容 v1.6~v1.8.0 旧版以 _machine_fingerprint() 为 entropy 写入的密文
+        return _dpapi_unprotect_raw(blob, _machine_fingerprint()).decode("utf-8")
 
 
 def encrypt_value(plaintext: str) -> str:
@@ -126,6 +227,27 @@ def decrypt_value(stored: str) -> str:
 _KEY_FIELDS = ("api_key", "apiKey")
 
 
+def is_masked_secret(val) -> bool:
+    """严格判断是否为未改动的脱敏占位符（•••••••• 或 ••••••••xxxx）。
+    绝不用 startswith：防止用户误在脱敏串后粘贴新 Key（如 ••••••••1234sk-xxx）被误判为未修改而静默丢弃。
+    """
+    return isinstance(val, str) and bool(_MASK_EXACT_RE.fullmatch(val))
+
+
+def mask_secret(stored_or_plain: str) -> str:
+    """将明文或密文 API Key 转为展示用脱敏串（仅保留末 4 位，短密钥不露尾）。"""
+    if not stored_or_plain or not isinstance(stored_or_plain, str):
+        return ""
+    if is_masked_secret(stored_or_plain):
+        return stored_or_plain
+    plain = decrypt_value(stored_or_plain).strip()
+    if not plain:
+        return ""
+    if len(plain) <= 6:
+        return _MASK_PREFIX
+    return _MASK_PREFIX + plain[-4:]
+
+
 def encrypt_config(config):
     """深拷贝 config dict，对其中的密钥字段加密。None/非 dict 原样返回。"""
     if not isinstance(config, dict):
@@ -134,7 +256,10 @@ def encrypt_config(config):
     for field in _KEY_FIELDS:
         key = out.get(field)
         if isinstance(key, str) and key:
-            out[field] = encrypt_value(key)
+            if is_masked_secret(key):
+                out[field] = ""
+            elif not key.startswith((_DPAPI_PREFIX, _PREFIX)):
+                out[field] = encrypt_value(key)
     return out
 
 
@@ -146,21 +271,78 @@ def decrypt_config(config):
     for field in _KEY_FIELDS:
         key = out.get(field)
         if isinstance(key, str) and key:
-            out[field] = decrypt_value(key)
+            out[field] = "" if is_masked_secret(key) else decrypt_value(key)
     return out
+
+
+def mask_config(config):
+    """深拷贝 config dict，将其中的密钥字段替换为安全摘要（不含明文或密文）。"""
+    if not isinstance(config, dict):
+        return config
+    out = {}
+    has_key = False
+    for k, v in config.items():
+        if k in _KEY_FIELDS:
+            if isinstance(v, str) and v and bool(decrypt_value(v).strip() if not is_masked_secret(v) else True):
+                has_key = True
+            continue
+        out[k] = v
+    out["has_api_key"] = has_key
+    return out
+
+
+def merge_masked_nested(incoming, existing):
+    """保存嵌套配置时，若前端回传的是未改动的脱敏占位符，保留数据库中既有的密文/明文。"""
+    if isinstance(incoming, dict):
+        ex_dict = existing if isinstance(existing, dict) else {}
+        out = {}
+        for k, v in incoming.items():
+            if k in _KEY_FIELDS and isinstance(v, str) and is_masked_secret(v):
+                prev = ex_dict.get(k)
+                out[k] = prev if isinstance(prev, str) and not is_masked_secret(prev) else ""
+            else:
+                out[k] = merge_masked_nested(v, ex_dict.get(k))
+        return out
+    if isinstance(incoming, list):
+        ex_list = existing if isinstance(existing, list) else []
+        return [
+            merge_masked_nested(x, ex_list[i] if i < len(ex_list) else None)
+            for i, x in enumerate(incoming)
+        ]
+    return incoming
+
+
+def mask_nested(obj):
+    """递归将 dict/list 树中所有密钥字段脱敏为 ••••••••xxxx，严禁明文密钥经公共 API 外泄。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _KEY_FIELDS and isinstance(v, str):
+                out[k] = mask_secret(v)
+            else:
+                out[k] = mask_nested(v)
+        return out
+    if isinstance(obj, list):
+        return [mask_nested(x) for x in obj]
+    return obj
 
 
 def encrypt_nested(obj):
     """递归加密 dict/list 树中所有密钥字段（api_key / apiKey）。
 
     供 model-configs 这类「{厂商id: {apiKey: ...}}」嵌套形状使用。
-    已加密值（dpapi:/enc: 前缀）原样跳过，杜绝二次加密。
+    已加密值（dpapi:/enc: 前缀）原样跳过，杜绝二次加密；脱敏占位符兜底置空。
     """
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if k in _KEY_FIELDS and isinstance(v, str) and v and not v.startswith((_DPAPI_PREFIX, _PREFIX)):
-                out[k] = encrypt_value(v)
+            if k in _KEY_FIELDS and isinstance(v, str) and v:
+                if is_masked_secret(v):
+                    out[k] = ""
+                elif v.startswith((_DPAPI_PREFIX, _PREFIX)):
+                    out[k] = v
+                else:
+                    out[k] = encrypt_value(v)
             else:
                 out[k] = encrypt_nested(v)
         return out

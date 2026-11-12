@@ -29,9 +29,10 @@ MARKET_SOURCE_ORDER = [
 _MARKET_KINDS = {"quote", "intraday", "kline", "book", "indicators"}
 
 
-def _latest(recent: list, source: str, kinds=None):
+def _latest(recent: list, source, kinds=None):
     """从环形缓冲取某源（可限 kind）最近一条；按 ts 字符串比较（ISO 格式可比较）。"""
-    cand = [r for r in recent if r.get("source") == source and (kinds is None or r.get("kind") in kinds)]
+    sources = {source} if isinstance(source, str) else set(source)
+    cand = [r for r in recent if r.get("source") in sources and (kinds is None or r.get("kind") in kinds)]
     if not cand:
         return None
     return max(cand, key=lambda r: r.get("ts", ""))
@@ -54,7 +55,7 @@ def get_market_diagnostics_fast() -> dict:
             "status": status, "last_ts": (last or {}).get("ts", ""),
             "error": (last or {}).get("error", "") if last and not last.get("ok") else "",
         })
-    news_last = _latest(recent, "akshare", {"news"})
+    news_last = _latest(recent, {"eastmoney_search", "akshare"}, {"news"})
     news_status = "unknown" if not news_last else ("ok" if news_last.get("ok") else "fail")
 
     serper_on = bool(settings.enable_serper_search and settings.serper_api_key and settings.serper_api_key.strip())

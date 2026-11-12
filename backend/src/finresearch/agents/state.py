@@ -48,6 +48,9 @@ class ResearchState(TypedDict, total=False):
     citations: List[dict]
     # LLM 配置覆盖（来自前端选择的模型：{base_url, api_key, model}）；为空则回落环境变量
     llm_config: Optional[dict]
+    # 撰写模式（stream / parallel）与行业标识
+    write_mode: Optional[str]
+    is_industry: Optional[bool]
     # 阶段耗时诊断（ms）
     timings: dict
     # 错误

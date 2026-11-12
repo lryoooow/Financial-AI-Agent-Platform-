@@ -22,10 +22,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..tools import clean_for_json
+
 
 def sse(event: dict) -> str:
-    """格式化为 SSE 一行：`data: {json}\n\n`。"""
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    """格式化为严格合法的 SSE 一行：`data: {json}\n\n`（绝不输出 NaN/Infinity 非法字面量）。"""
+    safe_event = clean_for_json(event)
+    return f"data: {json.dumps(safe_event, ensure_ascii=False, allow_nan=False)}\n\n"
 
 
 def ev_node(name: str, label: str) -> str:

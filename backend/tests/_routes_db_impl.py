@@ -53,6 +53,8 @@ def check(cond: bool, msg: str) -> None:
 
 
 async def t_model_configs_encryption():
+    from finresearch.tools.secrets import decrypt_nested
+
     await put_local_setting("model-configs", LocalSettingRequest(payload={
         "deepseek": {"baseUrl": "https://api.deepseek.com", "apiKey": "sk-plain-1234567890", "selectedModel": "m"},
     }))
@@ -63,15 +65,26 @@ async def t_model_configs_encryption():
     check("sk-plain-1234567890" not in raw, "PUT 后 DB 中无明文 key")
     check("dpapi:" in raw or "enc:" in raw, "DB 中为前缀密文")
     got = await get_local_setting("model-configs")
-    check(got["payload"]["deepseek"]["apiKey"] == "sk-plain-1234567890", "GET 透明解密还原明文")
+    masked_key = got["payload"]["deepseek"]["apiKey"]
+    check(masked_key == "••••••••7890" and "sk-plain" not in str(got), "GET 对外返回脱敏 key（不泄明文）")
 
-    # 旧明文行（v1.5 遗留）GET 不炸且原样返回
+    # 前端带着未改动的脱敏 key 回写其他字段（如 selectedModel）时，DB 内真实密钥必须完整保留
+    await put_local_setting("model-configs", LocalSettingRequest(payload={
+        "deepseek": {"baseUrl": "https://api.deepseek.com", "apiKey": masked_key, "selectedModel": "m2"},
+    }))
+    async with session_scope() as s:
+        row = await s.get(LocalSetting, "model-configs")
+        restored = decrypt_nested(row.payload)
+    check(restored["deepseek"]["apiKey"] == "sk-plain-1234567890" and restored["deepseek"]["selectedModel"] == "m2",
+          "PUT 回传脱敏占位符时保留真实密文且更新其他字段")
+
+    # 旧明文行（v1.5 遗留）GET 不炸且自动脱敏返回
     async with session_scope() as s:
         row = await s.get(LocalSetting, "model-configs")
         row.payload = {"deepseek": {"apiKey": "sk-legacy-plain"}}
         await s.commit()
     got = await get_local_setting("model-configs")
-    check(got["payload"]["deepseek"]["apiKey"] == "sk-legacy-plain", "旧明文行 GET 原样返回（零迁移）")
+    check(got["payload"]["deepseek"]["apiKey"] == "••••••••lain", "旧明文行 GET 同样脱敏返回（零迁移）")
 
 
 async def t_zombie_sweep():
@@ -163,7 +176,7 @@ async def t_chat_compliance_gate_and_guard():
         await s.commit()
 
     # 合规闸：mock 流产出禁用词 token
-    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None, **_kw):
         for piece in ("茅台基本面稳健。", "建议", "买入", "并持有。"):
             yield f'data: {{"type":"token","text":{chr(34)}{piece}{chr(34)}}}\n\n', piece
 
@@ -236,7 +249,7 @@ async def t_active_llm_fallback_overrides_stale_conv_config():
 
     captured = {}
 
-    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None, **_kw):
         captured["llm_cfg"] = llm_cfg
         yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
 
@@ -336,7 +349,7 @@ async def t_overlay_current_key_wins_over_stale_cache():
 
     captured = {}
 
-    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None, **_kw):
         captured["llm_cfg"] = llm_cfg
         yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
 
@@ -383,7 +396,7 @@ async def t_cancel_persist_real_cancellation_semantics():
         s.add(ChatConversation(id=conv_id, title="t"))
         await s.commit()
 
-    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None, **_kw):
         for i in range(50):
             await asyncio.sleep(0.02)
             yield f'data: {{"type":"token","text":"chunk{i}"}}\n\n', f"chunk{i} "
@@ -439,7 +452,7 @@ async def t_overlay_no_active_model_full_table_fallback():
 
     captured = {}
 
-    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None):
+    async def fake_stream(*, conv_id, text, history, profile, llm_cfg, images=None, user_msg=None, **_kw):
         captured["llm_cfg"] = llm_cfg
         yield 'data: {"type":"token","text":"ok"}\n\n', "ok"
 

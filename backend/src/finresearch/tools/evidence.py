@@ -14,8 +14,9 @@ from . import market_provider
 logger = logging.getLogger(__name__)
 
 
-def _latest(recent: list, source: str, kinds=None):
-    cand = [r for r in recent if r.get("source") == source and (kinds is None or r.get("kind") in kinds)]
+def _latest(recent: list, source, kinds=None):
+    sources = {source} if isinstance(source, str) else set(source)
+    cand = [r for r in recent if r.get("source") in sources and (kinds is None or r.get("kind") in kinds)]
     if not cand:
         return None
     return max(cand, key=lambda r: r.get("ts", ""))
@@ -27,8 +28,8 @@ def get_evidence_status() -> dict:
 
     recent = market_provider.recent_diagnostics(30)
 
-    # 国内新闻证据：东方财富个股新闻（akshare stock_news_em）
-    news_last = _latest(recent, "akshare", {"news"})
+    # 国内新闻证据：东方财富直连搜索 (eastmoney_search) 与 AkShare (akshare) 任一最近成功即可用
+    news_last = _latest(recent, {"eastmoney_search", "akshare"}, {"news"})
     news_available = bool(news_last and news_last.get("ok"))
 
     # 行情证据：任一行情源最近成功即视为可用

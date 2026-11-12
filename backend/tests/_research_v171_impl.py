@@ -20,6 +20,8 @@ from pathlib import Path
 _tmp = tempfile.mkdtemp()
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///" + os.path.join(_tmp, "t.db").replace(os.sep, "/")
 os.environ["LLM_API_KEY"] = ""
+# v1.8.0：默认撰写模式改为单次流式；本脚本专测 v1.7 分段并行语义，显式固定 parallel
+os.environ["REPORT_WRITE_MODE"] = "parallel"
 os.environ["SERPER_API_KEY"] = ""
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 

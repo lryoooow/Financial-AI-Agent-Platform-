@@ -219,7 +219,7 @@ def main() -> None:
     from PIL import Image
 
     here = os.path.dirname(os.path.abspath(__file__))
-    proj_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))  # → D:\Lry\langchain
+    proj_root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))  # → 项目根目录
     fronted = os.path.join(proj_root, "fronted")
     build_dir = os.path.join(fronted, "build")
     public_dir = os.path.join(fronted, "public")

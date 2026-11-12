@@ -275,6 +275,59 @@ async def search_industry(name: str, limit: int = 8) -> dict:
     return _normalize(res)
 
 
+@tool
+async def search_knowledge(query: str, ticker: str = "", limit: int = 5) -> dict:
+    """检索本机知识库：用户此前生成的研究报告，以及更早对话的压缩摘要（RAG）。
+
+    以下情况先调本工具：用户提到「之前的报告/上次研究/我们聊过」、追问已研究过的标的、
+    或需要引用本机已有的分析结论时。命中片段带报告日期（as_of）——报告里的数字是**当时**
+    的数据，引用时必须注明「据 X 日报告」，涉及当前行情仍要调行情工具取最新值，不得混用。
+    无命中就如实说明本机暂无相关报告，不要编造。
+
+    Args:
+        query: 检索词，如 "茅台 估值" / "宁德时代 现金流" / "光伏 景气"
+        ticker: 可选，限定标的代码（如 "600519.SH"）
+        limit: 返回片段数上限（1-10）
+    """
+    from ...knowledge import service as kb
+
+    hits = await kb.search(query, limit=max(1, min(10, int(limit))), ticker=ticker)
+    if not hits:
+        return {"items": [], "note": "知识库中没有相关内容"}
+    return {
+        "items": [
+            {
+                "source": h["title"],
+                "kind": "研究报告" if h["kind"] == "report" else "历史对话摘要",
+                "report_id": h["report_id"],
+                "as_of": h["as_of"],
+                "section": h["heading"],
+                "text": h["text"],
+            }
+            for h in hits
+        ]
+    }
+
+
+@tool
+async def remember_user_preference(note: str) -> dict:
+    """记下用户明确表达的、长期有效的投资偏好或习惯，供以后的对话参考。
+
+    只在用户**明确表达**偏好时调用（如「我更看重分红」「我只做长线」「别给我讲技术面」
+    「我持有茅台」），一句话、30 字以内、用第三人称客观描述。不要记录一次性的问题、
+    你自己的推测，也不要记录任何账户、金额等隐私信息。
+
+    Args:
+        note: 偏好描述，如 "偏好高股息低估值标的" / "投资周期以 3 年以上长线为主"
+    """
+    from ...knowledge import service as kb
+
+    saved = await kb.remember_note(note, source="model")
+    if not saved:
+        return {"ok": False, "note": "", "reason": "只能记录用户本轮亲口表达的偏好（请尽量沿用用户原话）"}
+    return {"ok": True, "note": saved["text"]}
+
+
 # 对话链路工具集。研究链路在此基础上增补 prefetch_basics / compose_report。
 CHAT_TOOLS = [
     resolve_entity,
@@ -287,3 +340,6 @@ CHAT_TOOLS = [
     web_search,
     search_industry,
 ]
+# v1.8.0：本地知识库 / 偏好学习工具（按设置页开关挂载，见 chat_agent.build_chat_agent）
+KNOWLEDGE_TOOLS = [search_knowledge]
+PROFILE_TOOLS = [remember_user_preference]

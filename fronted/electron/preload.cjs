@@ -17,4 +17,9 @@ contextBridge.exposeInMainWorld('finresearch', {
       return () => ipcRenderer.removeListener('finresearch:window:maximize-change', handler);
     },
   },
+  // v1.8.0：桌面偏好（托盘驻留 / 开机自启），设置页读写
+  app: {
+    getPreferences: () => ipcRenderer.invoke('finresearch:app:get-prefs'),
+    setPreferences: (patch) => ipcRenderer.invoke('finresearch:app:set-prefs', patch),
+  },
 });

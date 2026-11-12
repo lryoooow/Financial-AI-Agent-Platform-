@@ -44,6 +44,7 @@ node_modules/
 
 # --- 内部开发文档（不进公开产品仓库；本地保留）---
 CLAUDE.md
+memory/
 金融Agent平台规划.md
 金融Agent平台规划-工具层.md
 

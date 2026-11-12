@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+# v1.8.0：默认撰写模式改为单次流式；本脚本专测 v1.7 分段并行语义，显式固定 parallel
+os.environ["REPORT_WRITE_MODE"] = "parallel"
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///" + tempfile.mkdtemp() + "/t.db")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))

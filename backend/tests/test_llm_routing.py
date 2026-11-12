@@ -54,12 +54,22 @@ def test_reasoning_effort_flows_via_extra_body(monkeypatch):
 
 
 def test_reasoning_effort_invalid_value_is_not_sent(monkeypatch):
-    """乱档位一律不发（严格端点对未知参数会 400），超时/温度也不放宽。"""
+    """乱档位一律不发（严格端点对未知参数会 400），普通模型超时/温度也不放宽。"""
     captured = _capture_build(monkeypatch)
-    llm_mod.build_llm(override={**_RELAY, "model": "gpt-5.5", "reasoning_effort": "ultra"})
+    llm_mod.build_llm(override={**_RELAY, "model": "gpt-4o", "reasoning_effort": "ultra"})
     assert "extra_body" not in captured
     assert captured["timeout"] == 120.0
-    assert captured["temperature"] == 0.7  # 白名单普通模型维持 0.7
+    assert captured["temperature"] == 0.7  # 白名单普通模型（GPT-4o）维持 0.7
+
+
+def test_gpt5_always_uses_temperature_one_and_long_timeout(monkeypatch):
+    """GPT-5 系列推理模型强制默认温度 1.0（传 0.7 会 HTTP 400）并按推理模型放宽超时。"""
+    captured = _capture_build(monkeypatch)
+    llm_mod.build_llm(override={**_RELAY, "model": "gpt-5.5"})
+    assert captured["temperature"] == 1.0
+    assert captured["timeout"] == 300.0
+    assert llm_mod.is_reasoning_model("gpt-5.5") is True
+    assert llm_mod.is_reasoning_model("gpt-5.4-mini") is True
 
 
 def test_thinking_suffixed_model_gets_long_timeout_without_effort(monkeypatch):

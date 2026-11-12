@@ -17,10 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 def compute_ta(klines: list) -> dict:
-    """从 K 线字典列表计算技术指标。"""
+    """从 K 线字典列表计算技术指标（至少需要 15 根有效 K 线，避免单根 K 线产出失真指标）。"""
     try:
         if not klines:
             raise ValueError("K 线为空")
+        if len(klines) < 15:
+            raise ValueError(f"K 线样本不足（当前 {len(klines)} 根，至少需 15 根）")
         df = pd.DataFrame(klines)
         data = _compute_indicators_df(df)
         return {

@@ -76,6 +76,7 @@ export function loadPickerOptions(): PickerOption[] {
         model,
         accent: p.accent,
         llm: {
+          provider_id: p.id,
           base_url: baseUrl,
           api_key: (s.apiKey || "").trim(),
           model,
@@ -126,7 +127,7 @@ export function ModelPicker({
   onChange,
   onGoSettings,
 }: {
-  active?: { provider: string; model: string } | null;
+  active?: { provider: string; model: string; modelId?: string } | null;
   onChange: (llm: LlmConfig | null) => void;
   onGoSettings: () => void;
 }) {
@@ -164,7 +165,8 @@ export function ModelPicker({
       if (i >= 0) return i;
     }
     if (active) {
-      const i = options.findIndex((o) => o.provider === active.provider && o.model === active.model);
+      const targetId = active.modelId || active.model;
+      const i = options.findIndex((o) => o.provider === active.provider && o.model === targetId);
       if (i >= 0) return i;
     }
     return 0;

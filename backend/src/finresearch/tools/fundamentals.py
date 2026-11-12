@@ -10,34 +10,35 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import threading
 import time
 from typing import Optional
 
 from ..cache import slow_cache
-from . import make_provenance, now_iso
-from .entity import normalize_ticker, to_market_ticker
+from . import clean_for_json, make_provenance, now_cst, now_iso
+from .entity import BJ_PREFIXES, SH_PREFIXES, normalize_ticker, to_market_ticker
 
 logger = logging.getLogger(__name__)
 
-# 直连会话（连接复用 + 统一 UA/Referer）。旧实现每次裸 requests.get 新建 TCP+TLS，
-# 且无 UA —— push2 对无 UA 请求更易直接断开（审计实测本网络 RemoteDisconnected）。
-_DIRECT_SESSION = None
+# 线程局部直连会话（连接复用 + 统一 UA/Referer，避免多线程并发共享单个 requests.Session 的非线程安全池）。
+_SESSION_LOCAL = threading.local()
 # 直连熔断：push2/qt 接口在部分网络持续不可达，不熔断则每次研究连烧 2 个必败请求。
 _DIRECT_FAIL_AT = 0.0
 _DIRECT_BREAKER_S = 300.0
 
 
 def _direct_session():
-    global _DIRECT_SESSION
-    if _DIRECT_SESSION is None:
+    sess = getattr(_SESSION_LOCAL, "session", None)
+    if sess is None:
         import requests
 
-        _DIRECT_SESSION = requests.Session()
-        _DIRECT_SESSION.headers.update({
+        sess = requests.Session()
+        sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://quote.eastmoney.com/",
         })
-    return _DIRECT_SESSION
+        _SESSION_LOCAL.session = sess
+    return sess
 
 
 def _company_profile_direct(raw: str) -> dict:
@@ -54,7 +55,7 @@ def _company_profile_direct(raw: str) -> dict:
         raise ConnectionError("公司资料直连接口近 5 分钟内失败，熔断中（直接走行情名称兜底）")
     # 核验修复（B7 补齐第五处）：北交所 920xxx 的东财 secid 市场号是 0，旧判定会把
     # "9" 开头一律归沪市（1），920 走该兜底拿到空档案。
-    market = 0 if raw.startswith(("43", "83", "87", "88", "92")) else (1 if raw.startswith(("6", "9")) else 0)
+    market = 0 if raw.startswith(BJ_PREFIXES) else (1 if raw.startswith(SH_PREFIXES) else 0)
     fields = "f57,f58,f84,f85,f127,f116,f117,f189"
     try:
         resp = _direct_session().get(
@@ -110,16 +111,42 @@ def get_company_profile(code: str) -> dict:
             # 移除的代价极小：巨潮只给 简称/行业/上市日期，总市值还是空的；而下面第 94 行的
             # 行情兜底给的是 简称/行业/**真实总市值**，比它还全，只少一个上市时间。
             # 用一个上市时间换"进程不会被打死"，非常划算。
-        name = rec.get("股票简称", "")
-        industry = rec.get("行业", "")
-        market_cap = rec.get("总市值", "")
+        def _clean_str(val) -> str:
+            v = clean_for_json(val)
+            if v is None:
+                return ""
+            s = str(v).strip()
+            return "" if s.lower() in ("nan", "none", "null", "-") else s
+
+        def _fmt_cap(val) -> str:
+            v = clean_for_json(val)
+            if v is None:
+                return ""
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if not math.isfinite(fv) or fv <= 0:
+                    return ""
+                return f"{fv / 1e8:.2f}亿" if fv >= 1e8 else f"{fv:.0f}"
+            s = _clean_str(v)
+            try:
+                fv = float(s)
+                if math.isfinite(fv) and fv > 0:
+                    return f"{fv / 1e8:.2f}亿" if fv >= 1e8 else f"{fv:.0f}"
+            except (TypeError, ValueError):
+                pass
+            return s
+
+        clean_rec = clean_for_json(rec) if isinstance(rec, dict) else {}
+        name = _clean_str(clean_rec.get("股票简称", ""))
+        industry = _clean_str(clean_rec.get("行业", ""))
+        market_cap = _fmt_cap(clean_rec.get("总市值", ""))
         return {
             "code": to_market_ticker(raw),
             "name": name,
             "industry": industry,
             "market_cap": market_cap,
-            "list_date": rec.get("上市时间", ""),
-            "extra": rec,
+            "list_date": _clean_str(clean_rec.get("上市时间", "")),
+            "extra": clean_rec,
             "provenance": make_provenance(
                 source=source, endpoint=endpoint, raw_value=raw
             ),
@@ -185,23 +212,69 @@ def period_label(period: str, year: str = "") -> str:
     return y if m == "12" else f"{y}{_PERIOD_LABELS.get(m, p[5:])}"
 
 
-def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
-    """取最近 n 年财务指标（带缓存）。返回 list[dict]。
+def _eastmoney_main_finance_df(raw: str):
+    """东方财富 F10 主要财务指标直连兜底（尤其覆盖新浪财务接口常空白的北交所 920xxx 标的）。"""
+    import pandas as pd
 
-    v1.6.3（P1 修复）：同年**优先取年报**（报告期 12-31）。当年尚无年报时回落最新
-    报告期，并在行上标记 `_interim=True`。
-    v1.7.1（审计 A01）：中期行额外挂 `_prior_same_period` —— 上一年**同一报告期**
-    的原始行（如 2026-06-30 ↔ 2025-06-30）。上一年那一行在表里已被年报替换，
-    不挂出来的话，消费方只能拿「中报 vs 上年年报」相减，冒充同比。
-    """
+    from .market_provider import configure_market_network
+
+    configure_market_network()
+    secucode = to_market_ticker(raw)
+    resp = _direct_session().get(
+        "https://datacenter-web.eastmoney.com/api/data/v1/get",
+        params={
+            "reportName": "RPT_F10_FINANCE_MAINFINADATA",
+            "columns": "REPORT_DATE,TOTALOPERATEREVE,PARENTNETPROFIT,KCFJCXSYJLR,TOTALOPERATEREVETZ,PARENTNETPROFITTZ,ROEJQ,XSMLL,ZCFZL",
+            "filter": f'(SECUCODE="{secucode}")',
+            "pageNumber": "1",
+            "pageSize": "40",
+            "sortTypes": "-1",
+            "sortColumns": "REPORT_DATE",
+            "source": "HSF10",
+            "client": "PC",
+        },
+        timeout=8,
+    )
+    resp.raise_for_status()
+    data = ((resp.json() or {}).get("result") or {}).get("data") or []
+    if not data:
+        return None
+    mapped = []
+    for item in data:
+        mapped.append({
+            "日期": item.get("REPORT_DATE"),
+            "营业总收入(元)": item.get("TOTALOPERATEREVE"),
+            "归母净利润": item.get("PARENTNETPROFIT"),
+            "扣除非经常性损益后的净利润(元)": item.get("KCFJCXSYJLR"),
+            "营业收入同比增长率(%)": item.get("TOTALOPERATEREVETZ"),
+            "归母净利润同比增长率(%)": item.get("PARENTNETPROFITTZ"),
+            "加权净资产收益率(%)": item.get("ROEJQ"),
+            "销售毛利率(%)": item.get("XSMLL"),
+            "资产负债率(%)": item.get("ZCFZL"),
+        })
+    return pd.DataFrame(mapped)
+
+
+def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
+    """取最近 n 年财务指标（带缓存）。返回 list[dict]。"""
     cache_key = f"fin_indicator:{raw}:{n}"
     cached = slow_cache.get(cache_key)
     if cached is not None:
         return cached
     import akshare as ak
 
-    start_year = str(dt.date.today().year - max(1, int(n)))
-    df = ak.stock_financial_analysis_indicator(symbol=raw, start_year=start_year)
+    start_year = str(now_cst().year - max(1, int(n)))
+    df = None
+    try:
+        df = ak.stock_financial_analysis_indicator(symbol=raw, start_year=start_year)
+    except Exception as e:  # noqa: BLE001
+        logger.info("stock_financial_analysis_indicator 失败，尝试东财 F10 财务兜底：%s", e)
+    if df is None or df.empty:
+        try:
+            df = _eastmoney_main_finance_df(raw)
+        except Exception as fb_err:  # noqa: BLE001
+            logger.info("东财 F10 财务兜底也未取到数据：%s", fb_err)
+            df = None
     if df is None or df.empty:
         return None
     # 第一列通常是日期（"日期"）；按名字优先，避免上游列序变化
@@ -326,12 +399,24 @@ def get_financial_indicators(code: str) -> dict:
         # 事实块与正文对报告期的表达一致，不让中期列伪装成整年）
         years = [period_label(p, str(r.get("_year", ""))) for p, r in zip(periods, rows)]
 
+        def _valid_cell(val) -> bool:
+            if val in (None, "", "nan", "NaN", "None", "-"):
+                return False
+            if isinstance(val, (int, float)):
+                return math.isfinite(float(val))
+            try:
+                return math.isfinite(float(val))
+            except Exception:  # noqa: BLE001
+                return True
+
         def pick(r, *keys):
             for k in keys:
-                if k in r and r[k] not in (None, "", "nan"):
+                if k in r and r[k] not in (None, "", "nan", "NaN", "None"):
                     try:
                         value = float(r[k])
-                        return value if math.isfinite(value) else None
+                        if math.isfinite(value):
+                            return value
+                        continue  # 首选列为 NaN/Inf 时继续尝试备选列，绝不提前中断丢弃有效列
                     except Exception:  # noqa: BLE001
                         return r[k]
             return None
@@ -341,7 +426,12 @@ def get_financial_indicators(code: str) -> dict:
 
         def fmt_num(v, unit="亿"):
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
-                return f"{v/1e8:.2f}{unit}" if abs(v) > 1e6 else f"{v:.2f}"
+                fv = float(v)
+                if fv == 0.0:
+                    return f"0.00{unit}"
+                if abs(fv) >= 1e6:
+                    return f"{fv/1e8:.2f}{unit}"
+                return f"{fv/1e8:.4f}{unit}"
             return "—"
 
         # v1.6.0（审计 P0 修复 + 核验勘误）：净利润/增速侧按实测真实列名命中；
@@ -380,8 +470,7 @@ def get_financial_indicators(code: str) -> dict:
             if not period and rows[i].get("_interim"):
                 entry = {}
             if revenue_vals[i] == "—" and entry.get("revenue"):
-                v = entry["revenue"]
-                revenue_vals[i] = f"{v/1e8:.2f}亿" if abs(v) > 1e6 else f"{v:.2f}"
+                revenue_vals[i] = fmt_num(entry["revenue"])
                 income_filled.append(f"营收{y}")
             if gm_vals[i] == "—" and entry.get("gross_margin_pct") is not None:
                 gm_vals[i] = fmt_pct(entry["gross_margin_pct"])
@@ -393,7 +482,7 @@ def get_financial_indicators(code: str) -> dict:
         # 精确匹配不上，导致事实块/基本面段恒「未获取」而风险段却引用真值（同报告自相矛盾）。
         def _hit_col(keys):
             for k in keys:
-                if any(k in r and r[k] not in (None, "", "nan") for r in rows):
+                if any(k in r and _valid_cell(r[k]) for r in rows):
                     return k
             return ""
 

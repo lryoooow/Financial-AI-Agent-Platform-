@@ -33,6 +33,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agents.graph import init_checkpointer
+from .api.knowledge_routes import router as knowledge_router
 from .api.routes import router
 from .config import settings
 from .db.session import init_db
@@ -74,7 +75,13 @@ async def lifespan(app: FastAPI):
     await init_checkpointer()
     # 后台预加载搜索索引，消除对话首轮冷启动超时
     asyncio.get_event_loop().run_in_executor(None, _warmup_indexes)
+    # v1.8.0：本地知识库建库 + 存量报告回填（后台进行，不拖慢启动）
+    from .knowledge.service import init_and_backfill
+
+    _kb_task = asyncio.create_task(init_and_backfill())
     yield
+    if not _kb_task.done():
+        _kb_task.cancel()
     await close_checkpointer()
     logger.info("关闭。")
 
@@ -104,7 +111,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _api_no_store_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 app.include_router(router)
+app.include_router(knowledge_router)
 
 
 # ── 前端静态托管（打包后由后端一并提供 UI；dev 无 dist 时跳过）──
@@ -138,8 +155,8 @@ if _DIST:
 
     @app.get("/{full_path:path}")
     async def _spa(full_path: str):
-        # 让出 API 与内置文档
-        if full_path.startswith(("api/", "docs", "openapi", "redoc")):
+        # 让出 API 与内置文档（含裸 /api 路径）
+        if full_path == "api" or full_path.startswith(("api/", "docs", "openapi", "redoc")):
             raise HTTPException(404)
         # 防路径遍历：解析后必须仍在 _DIST 目录内，禁止 .. 跨越目录读取前端包外文件
         f = (_DIST / full_path).resolve()
@@ -148,9 +165,13 @@ if _DIST:
         except ValueError:
             raise HTTPException(404)
         # （路径遍历已在上方校验，f 已 resolve）
+        # v1.8.0：入口页必须 no-cache —— 此前不带缓存头，Electron 的 Chromium 按 Last-Modified
+        # 启发式缓存旧 index.html（及其引用的旧哈希脚本），升级安装后窗口仍显示旧界面。
+        # 带哈希的 /assets 走上面的 StaticFiles，内容变则文件名变，可放心缓存。
+        no_cache = {"Cache-Control": "no-cache, no-store, must-revalidate"}
         if full_path and f.is_file():
-            return FileResponse(f)
-        return FileResponse(_DIST / "index.html")
+            return FileResponse(f, headers=no_cache if f.suffix in {".html", ".json"} else None)
+        return FileResponse(_DIST / "index.html", headers=no_cache)
 else:
 
     @app.get("/")

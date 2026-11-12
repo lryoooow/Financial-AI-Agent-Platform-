@@ -22,33 +22,62 @@ export function ChartTooltip(ownProps: OwnProps) {
   const { active, payload, label } = ownProps as any;
   if (!active || !payload || !payload.length) return null;
 
-  const { kind, up, prevClose, ai } = ownProps;
-  const priceVal = payload.find((p: any) => p.dataKey === "price" || p.dataKey === "close")?.value;
-  const pct = prevClose != null && typeof priceVal === "number"
+  const { kind, prevClose, ai } = ownProps;
+  const rawRow = payload[0]?.payload as Record<string, any> | undefined;
+  const priceVal = kind === "kline"
+    ? rawRow?.close
+    : payload.find((p: any) => p.dataKey === "price" || p.dataKey === "close")?.value;
+  const dec = typeof priceVal === "number" && priceVal > 0 && priceVal < 5 ? 3 : 2;
+  const pct = prevClose != null && prevClose > 0 && typeof priceVal === "number"
     ? ((priceVal - prevClose) / prevClose) * 100
     : null;
+  const pointUp = pct != null ? pct >= 0 : (ownProps.up ?? true);
+
+  const klineRows: [string, number | null | undefined][] = kind === "kline" && rawRow
+    ? [
+        ["开", rawRow.open],
+        ["高", rawRow.high],
+        ["低", rawRow.low],
+        ["收", rawRow.close],
+        ["MA5", rawRow.ma5],
+        ["MA10", rawRow.ma10],
+        ["MA20", rawRow.ma20],
+      ]
+    : [];
 
   return (
-    <div className="rounded-lg border border-border bg-popover/95 backdrop-blur-sm shadow-xl px-3 py-2 text-xs min-w-[128px]">
+    <div className="rounded-lg border border-border bg-popover/95 backdrop-blur-sm shadow-xl px-3 py-2 text-xs min-w-[140px] max-w-[260px]">
       <div className="text-muted-foreground mb-1 tabular">{label}</div>
 
-      {payload.map((p: any) => (
-        <div key={String(p.dataKey)} className="flex items-center justify-between gap-4 tabular leading-5">
-          <span className="text-muted-foreground">
-            {kind === "intraday"
-              ? p.dataKey === "price" ? "现价" : p.dataKey === "avg" ? "均价" : String(p.dataKey)
-              : (KLINE_LABEL[p.dataKey] ?? String(p.dataKey))}
-          </span>
-          <span className="text-foreground">{fmt(Number(p.value), 2)}</span>
-        </div>
-      ))}
+      {kind === "kline" && klineRows.length > 0 ? (
+        klineRows
+          .filter(([, v]) => typeof v === "number" && Number.isFinite(v))
+          .map(([k, v]) => (
+            <div key={k} className="flex items-center justify-between gap-4 tabular leading-5">
+              <span className="text-muted-foreground">{k}</span>
+              <span className="text-foreground">{fmt(Number(v), dec)}</span>
+            </div>
+          ))
+      ) : (
+        payload.map((p: any) => (
+          <div key={String(p.dataKey)} className="flex items-center justify-between gap-4 tabular leading-5">
+            <span className="text-muted-foreground">
+              {kind === "intraday"
+                ? p.dataKey === "price" ? "现价" : p.dataKey === "avg" ? "均价" : String(p.dataKey)
+                : (KLINE_LABEL[p.dataKey] ?? String(p.dataKey))}
+            </span>
+            <span className="text-foreground">{fmt(Number(p.value), dec)}</span>
+          </div>
+        ))
+      )}
 
-      {kind === "intraday" && pct != null && (
+      {pct != null && (
         <div
           className="mt-1 pt-1 border-t border-border tabular text-[10px]"
-          style={{ color: up ? "var(--up)" : "var(--down)" }}
+          style={{ color: pointUp ? "var(--up)" : "var(--down)" }}
         >
-          较昨收 {pct >= 0 ? "+" : ""}{fmt(pct, 2)}%
+          {kind === "intraday" ? "较昨收 " : "涨跌幅 "}
+          {pct >= 0 ? "+" : ""}{fmt(pct, 2)}%
         </div>
       )}
 

@@ -16,6 +16,7 @@ push2.eastmoney 全市场表同一个症状）；申万三个层级的接口走�
 from __future__ import annotations
 
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -64,10 +65,10 @@ def _rows(level_name: str, fn_name: str, retries: int = 2) -> list:
     for _, r in df.iterrows():
         out.append({
             "level": level_name,
-            "code": str(r.get("行业代码", "") or ""),
-            "name": str(r.get("行业名称", "") or ""),
-            "parent": str(r.get("上级行业", "") or ""),
-            "constituents": int(r.get("成份个数") or 0),
+            "code": _s(r.get("行业代码")),
+            "name": _s(r.get("行业名称")),
+            "parent": _s(r.get("上级行业")),
+            "constituents": _i(r.get("成份个数")),
             "pe_static": _f(r.get("静态市盈率")),
             "pe_ttm": _f(r.get("TTM(滚动)市盈率")),
             "pb": _f(r.get("市净率")),
@@ -78,10 +79,26 @@ def _rows(level_name: str, fn_name: str, retries: int = 2) -> list:
     return out
 
 
+def _s(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and not math.isfinite(v):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() in ("nan", "none", "<na>") else s
+
+
+def _i(v) -> int:
+    f = _f(v)
+    return int(f) if f is not None else 0
+
+
 def _f(v) -> Optional[float]:
     try:
+        if v is None:
+            return None
         f = float(v)
-        return None if f != f else f  # NaN → None，不要把 nan 塞进 JSON
+        return f if math.isfinite(f) else None  # NaN / Inf → None，不要塞进 JSON
     except (TypeError, ValueError):
         return None
 

@@ -12,8 +12,7 @@
 {% endblock %}
 
 {% block styles %}
-<style>
-  /* 行情速览卡片 */
+  /* 行情速览卡片（置于父模板 <style> 块内，不重复包 <style> 标签） */
   .snapshot {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -59,36 +58,42 @@
 
   ul.risks li, ul.sources li { font-size: 13px; }
   .disclaimer { background: #f3f4f6; border-radius: 6px; }
-</style>
 {% endblock %}
 
 {% block summary %}
 <div class="summary-body">
-  {% for para in doc.summary.split("\n") if doc.summary %}
+  {% for para in (doc.summary or "").split("\n") if para.strip() %}
     <p>{{ para.strip() }}</p>
   {% endfor %}
 </div>
 <div class="provenance">
   本报告所有数值由本地工具库（akshare / pandas-ta-classic）计算并可溯源；数据时点：{{ doc.as_of }}。
 </div>
+{% endblock %}
+
+{% block catalyst %}
 {% if doc.catalyst %}
 <div class="catalyst"><b>潜在催化剂：</b>{{ doc.catalyst }}</div>
 {% endif %}
 {% endblock %}
 
-{% block valuation %}
-{# 行情速览：仅在 quote 字段存在时渲染；前端若注入 quote 则展示，否则整块跳过 #}
-{% if doc.quote %}
+{% block snapshot %}
+{# 行情速览：仅在有效行情快照存在时渲染，兼容 changePct / change_pct 及缺失键 #}
+{% if doc.quote and doc.quote.get('price') %}
+{% set raw_chg = doc.quote.get('changePct') if doc.quote.get('changePct') is not none else doc.quote.get('change_pct') %}
+{% set chg = raw_chg if raw_chg is not none else 0 %}
+{% set pe_val = doc.quote.get('pe') %}
+{% set pb_val = doc.quote.get('pb') %}
 <div class="snapshot">
-  <div class="cell"><div class="label">最新价</div><div class="num">{{ doc.quote.price }}</div></div>
-  <div class="cell"><div class="label">涨跌幅</div><div class="num {{ 'up' if doc.quote.changePct >= 0 else 'down' }}">{{ doc.quote.changePct }}%</div></div>
-  <div class="cell"><div class="label">PE（动态）</div><div class="num">{{ doc.quote.pe }}</div></div>
-  <div class="cell"><div class="label">PB</div><div class="num">{{ doc.quote.pb }}</div></div>
+  <div class="cell"><div class="label">最新价</div><div class="num">{{ doc.quote.get('price') }}</div></div>
+  <div class="cell"><div class="label">涨跌幅</div><div class="num {{ 'up' if chg >= 0 else 'down' }}">{{ chg }}%</div></div>
+  <div class="cell"><div class="label">PE（动态）</div><div class="num">{{ pe_val if (pe_val is not none and pe_val != 0) else '—' }}</div></div>
+  <div class="cell"><div class="label">PB</div><div class="num">{{ pb_val if (pb_val is not none and pb_val != 0) else '—' }}</div></div>
 </div>
 {% endif %}
+{% endblock %}
 
-<section>
-  <h2>财务概览（近五年）</h2>
+{% block financials %}
   <table class="fin">
     <thead><tr><th>项目</th>{% for y in doc.financials.years %}<th>{{ y }}</th>{% endfor %}</tr></thead>
     <tbody>
@@ -98,10 +103,9 @@
     </tbody>
   </table>
   <div class="limit-note">
-    注：以上财务数据来自 akshare 财务分析指标接口，未经人工调整；ROE/毛利率/资产负债率为百分比口径，
+    注：以上财务数据来自公开财务分析指标接口，未经人工调整；ROE/毛利率/资产负债率为百分比口径，
     营收/净利润为亿元口径。行业可比公司均值、历史分位数与 DCF 估值受限于当前数据维度，未在本表呈现。
   </div>
-</section>
 {% endblock %}
 
 {% block body %}
@@ -109,7 +113,7 @@
 {% for s in doc.sections %}
   <div class="section">
     <h3>{{ s.title }}</h3>
-    {% for para in s.body.split("\n") if para.strip() %}
+    {% for para in (s.body or "").split("\n") if para.strip() %}
       <p>{{ para.strip() }}</p>
     {% endfor %}
   </div>
@@ -117,10 +121,8 @@
 {% endblock %}
 
 {% block disclaimer %}
-<div class="disclaimer">
   <b>免责声明：</b>{{ doc.disclaimer }}
   本报告由 AI 辅助生成，所有结论与判断均基于公开行情与财务数据的程序化计算，
   可能存在指标滞后、数据缺失或模型偏差；报告中任何关于"偏多/偏空/中性""建议关注"的表述仅为分析观点，
   不构成任何买卖建议或具体操作指令。市场有风险，投资需谨慎。
-</div>
 {% endblock %}

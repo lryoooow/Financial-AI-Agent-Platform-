@@ -15,6 +15,8 @@ from typing import List, Optional
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel, Field, field_validator
 
+from . import now_cst
+
 logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "report_templates"
@@ -61,6 +63,8 @@ class ReportDoc(BaseModel):
     disclaimer: str
     as_of: str
     quote: Optional[dict] = None  # 1.2.3：行情速览卡片数据
+    llm_degraded: Optional[bool] = False
+    llm_fallback_reason: Optional[str] = ""
 
     @field_validator("as_of", "disclaimer")
     @classmethod
@@ -141,6 +145,6 @@ def build_doc(
         "risks": risks or ["（无显式风险项）"],
         "sources": sources or [{"title": "—", "url": "", "date": ""}],
         "disclaimer": DISCLAIMER,
-        "as_of": as_of or dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "as_of": as_of or now_cst().strftime("%Y-%m-%d %H:%M"),
         "quote": quote or {},
     }
