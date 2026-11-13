@@ -28,6 +28,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from ..core.rag import hybrid
+
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.RLock()
@@ -61,6 +63,16 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
 );
 CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc ON kb_chunks(doc_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(tokens, tokenize='unicode61');
+CREATE TABLE IF NOT EXISTS kb_deleted_refs (
+    kind TEXT NOT NULL,
+    ref_id TEXT NOT NULL,
+    PRIMARY KEY (kind, ref_id)
+);
+CREATE TABLE IF NOT EXISTS kb_memories (
+    id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, content TEXT NOT NULL,
+    importance REAL NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+    superseded_by TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
 """
 
 
@@ -93,9 +105,26 @@ def connect() -> Iterator[sqlite3.Connection]:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.executescript(_SCHEMA)
+                present = {row["name"] for row in conn.execute("PRAGMA table_info(kb_chunks)")}
+                for column, ddl in (
+                    ("chunk_index", "INTEGER"), ("embedding_blob", "BLOB"), ("source_file", "TEXT"),
+                ):
+                    if column not in present:
+                        conn.execute(f"ALTER TABLE kb_chunks ADD COLUMN {column} {ddl}")
+                conn.execute("UPDATE kb_chunks SET chunk_index=seq WHERE chunk_index IS NULL")
+                conn.execute("CREATE INDEX IF NOT EXISTS ix_kb_chunk_neighbors ON kb_chunks(doc_id, chunk_index)")
+                for row in conn.execute(
+                    "SELECT c.id, c.heading, c.text, d.title, d.ticker, d.name "
+                    "FROM kb_chunks c JOIN kb_documents d ON d.id=c.doc_id WHERE c.embedding_blob IS NULL LIMIT 500"
+                ).fetchall():
+                    conn.execute(
+                        "UPDATE kb_chunks SET embedding_blob=? WHERE id=?",
+                        (hybrid.embedding_bytes(dict(row)), row["id"]),
+                    )
                 from .profile import ensure_schema as _profile_schema
 
                 _profile_schema(conn)
+                conn.commit()
                 _SCHEMA_READY.add(key)
             yield conn
             conn.commit()
@@ -192,6 +221,7 @@ def split_text(text: str, limit: int = _CHUNK_MAX) -> list[str]:
 
 
 TEMPLATE_LABELS = {
+    "market_recap": "收盘复盘",
     "equity_deep": "个股深度",
     "industry": "行业研究",
     "earnings": "财报点评",
@@ -250,9 +280,12 @@ def upsert_document(
     template: str = "",
     as_of: str = "",
     meta: Optional[dict] = None,
-) -> str:
+    source_file: str = "",
+) -> str | None:
     """写入/覆盖一份文档（同 kind+ref_id 先删后写，保证重复入库幂等）。返回 doc_id。"""
     with connect() as conn:
+        if conn.execute("SELECT 1 FROM kb_deleted_refs WHERE kind=? AND ref_id=?", (kind, ref_id)).fetchone():
+            return None
         row = conn.execute(
             "SELECT id FROM kb_documents WHERE kind=? AND ref_id=?", (kind, ref_id)
         ).fetchone()
@@ -268,8 +301,11 @@ def upsert_document(
         context = f"{title} {name} {ticker} {TEMPLATE_LABELS.get(template, '')}"
         for seq, (heading, text) in enumerate(chunks):
             cur = conn.execute(
-                "INSERT INTO kb_chunks(doc_id, seq, heading, text) VALUES(?,?,?,?)",
-                (doc_id, seq, heading, text),
+                "INSERT INTO kb_chunks(doc_id, seq, heading, text, chunk_index, embedding_blob, source_file)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (doc_id, seq, heading, text, seq, hybrid.embedding_bytes({
+                    "title": title, "name": name, "ticker": ticker, "heading": heading, "text": text,
+                }), source_file),
             )
             conn.execute(
                 "INSERT INTO kb_fts(rowid, tokens) VALUES(?, ?)",
@@ -314,6 +350,7 @@ def index_conversation_summary(conversation_id: str, title: str, summary: str, g
 def delete_by_ref(kind: str, ref_id: str) -> bool:
     try:
         with connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO kb_deleted_refs(kind, ref_id) VALUES(?,?)", (kind, ref_id))
             row = conn.execute(
                 "SELECT id FROM kb_documents WHERE kind=? AND ref_id=?", (kind, ref_id)
             ).fetchone()
@@ -357,83 +394,113 @@ def _escape_like(val: str) -> str:
 
 
 # ── 检索 ─────────────────────────────────────────────────
+
 def search(
-    query: str,
-    *,
-    limit: int = 6,
-    ticker: str = "",
-    kind: str = "",
+    query: str, *, limit: int = 6, ticker: str = "", kind: str = "",
 ) -> list[dict[str, Any]]:
-    """bm25 检索，返回命中块（同一文档最多 2 块，窗口函数先按文档限流，避免超长单篇报告挤掉其余文档）。"""
+    """Fuse FTS and vector ranks, gate similarity, diversify, then fetch neighbors."""
     match = build_match(query)
     if not match:
         return []
     limit = max(1, min(20, int(limit)))
-    where_sql = " WHERE kb_fts MATCH ?"
-    args: list[Any] = [match]
+    clauses = []
+    args: list[Any] = []
     if ticker:
-        raw_ticker = ticker.strip().upper()
-        code = _escape_like(raw_ticker.split(".")[0])
-        where_sql += " AND (d.ticker LIKE ? ESCAPE '\\' OR d.ticker = ?)"
-        args += [code + "%", raw_ticker]
+        raw = ticker.strip().upper()
+        clauses.append("(d.ticker LIKE ? ESCAPE '\\' OR (d.kind='external' AND d.ticker=''))")
+        args.append(_escape_like(raw.split(".")[0]) + "%")
     if kind:
-        where_sql += " AND d.kind = ?"
+        clauses.append("d.kind=?")
         args.append(kind)
-    sql = (
-        "WITH matched AS MATERIALIZED ("
-        " SELECT c.id AS chunk_id, c.heading, c.text, d.id AS doc_id, d.kind, d.ref_id, d.title,"
-        " d.ticker, d.name, d.template, d.as_of, bm25(kb_fts) AS score"
-        " FROM kb_fts JOIN kb_chunks c ON c.id = kb_fts.rowid JOIN kb_documents d ON d.id = c.doc_id"
-        + where_sql
-        + ") SELECT * FROM ("
-        " SELECT matched.*, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY score) AS doc_rn"
-        " FROM matched"
-        ") ranked WHERE doc_rn <= 2 ORDER BY score LIMIT ?"
-    )
-    args.append(limit)
+    where = " AND " + " AND ".join(clauses) if clauses else ""
     try:
         with connect() as conn:
-            rows = conn.execute(sql, args).fetchall()
-    except sqlite3.OperationalError as e:
-        logger.warning("知识库检索失败：%s", e)
+            rows = [
+                dict(row) for row in conn.execute(
+                    "SELECT c.id AS chunk_id, c.heading, c.text, c.chunk_index, c.embedding_blob, c.source_file,"
+                    " d.id AS doc_id, d.kind, d.ref_id, d.title, d.ticker, d.name, d.template, d.as_of"
+                    " FROM kb_chunks c JOIN kb_documents d ON d.id=c.doc_id WHERE 1=1" + where + " ORDER BY c.id",
+                    args,
+                )
+            ]
+            lexical = [
+                row[0] for row in conn.execute(
+                    "SELECT c.id FROM kb_fts JOIN kb_chunks c ON c.id=kb_fts.rowid"
+                    " JOIN kb_documents d ON d.id=c.doc_id WHERE kb_fts MATCH ?" + where
+                    + " ORDER BY bm25(kb_fts), c.id LIMIT ?",
+                    [match, *args, max(60, limit * 6)],
+                )
+            ]
+            chosen = hybrid.rank(query, rows, lexical, limit)
+            for row in chosen:
+                row["adjacent"] = fetch_adjacent_chunks(conn, row["doc_id"], row["chunk_index"])
+    except sqlite3.OperationalError:
+        logger.warning("知识库检索暂不可用")
         return []
-    per_doc: dict[str, int] = {}
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        if per_doc.get(r["doc_id"], 0) >= 2:
-            continue
-        per_doc[r["doc_id"]] = per_doc.get(r["doc_id"], 0) + 1
-        out.append({
-            "doc_id": r["doc_id"],
-            "kind": r["kind"],
-            "report_id": r["ref_id"] if r["kind"] == "report" else "",
-            "conversation_id": r["ref_id"] if r["kind"] == "conversation" else "",
-            "title": r["title"],
-            "ticker": r["ticker"],
-            "name": r["name"],
-            "template": r["template"],
-            "as_of": r["as_of"],
-            "heading": r["heading"],
-            "text": r["text"],
-            "score": round(-float(r["score"]), 3),
-        })
-        if len(out) >= limit:
-            break
-    return out
+    return [
+        {
+            **{key: row[key] for key in (
+                "doc_id", "kind", "title", "ticker", "name", "template", "as_of", "heading",
+                "text", "score", "chunk_id", "chunk_index", "adjacent", "source_file",
+            )},
+            "report_id": row["ref_id"] if row["kind"] == "report" else "",
+            "conversation_id": row["ref_id"] if row["kind"] == "conversation" else "",
+        }
+        for row in chosen
+    ]
+
+
+def fetch_adjacent_chunks(conn: sqlite3.Connection, doc_id: str, chunk_index: int) -> list[dict]:
+    return [
+        {"chunk_index": row["chunk_index"], "heading": row["heading"], "text": row["text"]}
+        for row in conn.execute(
+            "SELECT chunk_index, heading, text FROM kb_chunks"
+            " WHERE doc_id=? AND chunk_index IN (?, ?) ORDER BY chunk_index",
+            (doc_id, chunk_index - 1, chunk_index + 1),
+        )
+    ]
+
+
+def list_external_documents() -> list[dict]:
+    with connect() as conn:
+        return [
+            dict(row) for row in conn.execute(
+                "SELECT d.id, d.title, d.ticker, d.created_at, COUNT(c.id) AS chunks FROM kb_documents d"
+                " LEFT JOIN kb_chunks c ON c.doc_id=d.id WHERE d.kind='external'"
+                " GROUP BY d.id ORDER BY d.created_at DESC"
+            )
+        ]
+
+
+def delete_external_document(doc_id: str) -> bool:
+    with connect() as conn:
+        row = conn.execute("SELECT ref_id FROM kb_documents WHERE id=? AND kind='external'", (doc_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute("INSERT OR IGNORE INTO kb_deleted_refs VALUES('external', ?)", (row["ref_id"],))
+        _delete_doc(conn, doc_id)
+        return True
 
 
 def stats() -> dict[str, Any]:
     try:
+        import datetime as dt
+
+        cst = dt.timezone(dt.timedelta(hours=8))
         with connect() as conn:
             docs = {r["kind"]: r["n"] for r in conn.execute("SELECT kind, COUNT(*) AS n FROM kb_documents GROUP BY kind")}
             chunks = conn.execute("SELECT COUNT(*) AS n FROM kb_chunks").fetchone()["n"]
+            memories = conn.execute("SELECT COUNT(*) AS n FROM kb_memories WHERE superseded_by IS NULL").fetchone()["n"]
             last = conn.execute("SELECT MAX(created_at) AS t FROM kb_documents").fetchone()["t"]
+        updated = dt.datetime.fromtimestamp(float(last), tz=cst).strftime("%Y-%m-%d %H:%M") if last else ""
         return {
             "reports": int(docs.get("report", 0)),
             "conversations": int(docs.get("conversation", 0)),
+            "external": int(docs.get("external", 0)),
+            "memories": int(memories),
             "chunks": int(chunks),
-            "updated_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "",
+            "updated_at": updated,
         }
     except sqlite3.Error as e:
         logger.warning("知识库统计查询失败：%s", e)
-        return {"reports": 0, "conversations": 0, "chunks": 0, "updated_at": ""}
+        return {"reports": 0, "conversations": 0, "external": 0, "memories": 0, "chunks": 0, "updated_at": ""}

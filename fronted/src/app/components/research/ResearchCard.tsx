@@ -5,8 +5,10 @@ import {
 } from "lucide-react";
 import { TEMPLATES, type TemplateId, type ReportDoc } from "../../data/report";
 import { fmt, signed, trendClass } from "../../lib/format";
+import { StructuredText } from "../../lib/markdown";
 import { api, downloadReportFile, type ResearchRef } from "../../api/client";
 import { useResearchStream } from "../../hooks/useResearchStream";
+import { SharePosterView } from "./SharePosterView";
 
 /**
  * v1.8.0：研究卡片 —— 研究任务以卡片形式嵌入「研究对话」。
@@ -42,6 +44,7 @@ export interface PartialSection {
 }
 
 export const SECTION_ORDER: Record<TemplateId, string[]> = {
+  market_recap: ["宽基指数", "成交与广度", "申万一级行业", "当日市场快讯"],
   equity_deep: ["技术面分析", "基本面分析", "估值分析", "行业与公司分析"],
   industry: ["行业景气与竞争格局"],
   earnings: ["业绩快评"],
@@ -49,6 +52,7 @@ export const SECTION_ORDER: Record<TemplateId, string[]> = {
 };
 
 const SUMMARY_LABEL: Record<TemplateId, string> = {
+  market_recap: "收盘复盘摘要",
   equity_deep: "个股深度摘要",
   industry: "行业研究摘要",
   earnings: "财报点评摘要",
@@ -94,17 +98,18 @@ export function ResearchCard({
   initialReportId?: string | null;
   initialError?: string | null;
   onDone?: (r: { id: string; name: string; code: string; template: string; date: string; summary: string }) => void;
-  onStatusChange?: (phase: "running" | "done" | "error") => void;
+  onStatusChange?: (phase: "running" | "done" | "error" | "disconnected") => void;
   defaultTrailOpen?: boolean;
 }) {
   const template = templateOf(research.template);
   const isInitialDone = initialStatus === "done" && !!initialReportId;
   const isInitialError = initialStatus === "error";
-  const [phase, setPhase] = useState<"running" | "done" | "error">(
+  const [phase, setPhase] = useState<"running" | "done" | "error" | "disconnected">(
     isInitialDone ? "done" : isInitialError ? "error" : "running",
   );
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [doc, setDoc] = useState<ReportDoc | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
   const [loadingSavedDoc, setLoadingSavedDoc] = useState<boolean>(isInitialDone);
   const [reportId, setReportId] = useState(initialReportId || "");
   const [stock, setStock] = useState<CurrentStock>({ code: research.code, name: research.name || research.code });
@@ -124,10 +129,22 @@ export function ResearchCard({
   onStatusChangeRef.current = onStatusChange;
   // 已完成的历史任务打开时不再重复触发 onDone（避免每次点历史任务都刷一遍报告库）
   const notifiedRef = useRef(isInitialDone);
+  const mountedPhaseRef = useRef(false);
 
   useEffect(() => {
+    if (!mountedPhaseRef.current) {
+      mountedPhaseRef.current = true;
+      return;
+    }
     onStatusChangeRef.current?.(phase);
   }, [phase]);
+
+  // 若 SSE 半开静默而外层轮询已观测到任务落库完成，主动触发一次终态重连以加载报告
+  useEffect(() => {
+    if ((phase === "running" || phase === "disconnected") && initialStatus === "done") {
+      setConnectNonce((n) => n + 1);
+    }
+  }, [initialStatus, phase]);
 
   // 报告在「报告库」被真删除时同步更新本卡片，防止悬空下载或自动重连
   useEffect(() => {
@@ -187,13 +204,52 @@ export function ResearchCard({
       finished = true;
       stream.close();
     };
+    interface ReplayBuffer {
+      toolCalls: ToolCall[];
+      typed: string;
+      thinking: { text: string; chars: number } | null;
+      sections: PartialSection[];
+      stockPatch: Partial<CurrentStock>;
+    }
+    let replayBuf: ReplayBuffer | null = null;
+
+    const commitReplayIfActive = () => {
+      if (!replayBuf) return;
+      const snap = replayBuf;
+      replayBuf = null;
+      setToolCalls(snap.toolCalls);
+      setTyped(snap.typed);
+      setThinking(snap.thinking);
+      setSections(snap.sections);
+      if (Object.keys(snap.stockPatch).length > 0) {
+        setStock((cur) => ({ ...cur, ...snap.stockPatch }));
+      }
+      setDoc(null);
+      setError("");
+      setPhase("running");
+    };
+
+    const applyToolCalls = (fn: (calls: ToolCall[]) => ToolCall[]) => {
+      if (replayBuf) {
+        replayBuf.toolCalls = fn(replayBuf.toolCalls);
+      } else {
+        setToolCalls(fn);
+      }
+    };
+    const applySections = (fn: (items: PartialSection[]) => PartialSection[]) => {
+      if (replayBuf) {
+        replayBuf.sections = fn(replayBuf.sections);
+      } else {
+        setSections(fn);
+      }
+    };
     const settleOpenTools = (finalStatus: "ok" | "error") => {
-      setToolCalls((calls) =>
+      applyToolCalls((calls) =>
         calls.map((c) => (c.status === "start" ? { ...c, status: finalStatus } : c)),
       );
     };
     const emit = (text: string) =>
-      setToolCalls((calls) => {
+      applyToolCalls((calls) => {
         if (!calls.length) return [{ name: "_task", label: "研究任务", status: "start", events: [{ text, time: now() }] }];
         const last = calls[calls.length - 1];
         return [...calls.slice(0, -1), { ...last, events: [...last.events, { text, time: now() }] }];
@@ -203,22 +259,32 @@ export function ResearchCard({
       if (finished) return;
       switch (ev.type) {
         case "replay":
-          // 每个连接以 replay 开头、随后是压缩历史：先清空再重建（重连幂等）
-          setToolCalls([]);
-          setTyped("");
-          setThinking(null);
-          setSections([]);
-          setDoc(null);
-          setError("");
-          setPhase("running");
+          // 重连回放先在内存缓冲重建，待 replay_end / done / error 到达时一次性原子替换，杜绝重连白屏闪烁
+          replayBuf = { toolCalls: [], typed: "", thinking: null, sections: [], stockPatch: {} };
+          break;
+        case "replay_end":
+          commitReplayIfActive();
           break;
         case "sections_reset":
-          setTyped("");
-          setThinking(null);
-          setSections([]);
+          if (replayBuf) {
+            replayBuf.typed = "";
+            replayBuf.thinking = null;
+            replayBuf.sections = [];
+          } else {
+            setTyped("");
+            setThinking(null);
+            setSections([]);
+          }
           break;
+        case "section_reset": {
+          const title = ev.title ?? "分析章节";
+          applySections((items) => upsertSection(items, title, template, (cur) => (
+            cur.status === "done" ? cur : { ...cur, body: "", thinking: undefined, thinkingChars: undefined }
+          )));
+          break;
+        }
         case "tool_call":
-          setToolCalls((calls) => {
+          applyToolCalls((calls) => {
             if (ev.status === "start") {
               const placeholder = calls.length === 1 && calls[0].name === "_task" ? calls[0].events : [];
               const base = calls.filter((c) => c.name !== "_task");
@@ -239,32 +305,47 @@ export function ResearchCard({
           break;
         case "summary":
           // 替换语义：单次流式下首帧只带标的头信息（text 为空），正文随后由 summary_token 流出
-          setTyped(ev.text ?? "");
-          if (ev.name || ev.ticker) {
-            setStock((cur) => ({
-              ...cur,
-              name: ev.name || cur.name,
-              code: ev.ticker || cur.code,
-              price: ev.price ?? cur.price,
-              change: ev.change ?? cur.change,
-              changePct: ev.changePct ?? cur.changePct,
-            }));
+          if (replayBuf) {
+            replayBuf.typed = ev.text ?? "";
+            if (ev.name) replayBuf.stockPatch.name = ev.name;
+            if (ev.ticker) replayBuf.stockPatch.code = ev.ticker;
+            if (ev.price != null) replayBuf.stockPatch.price = ev.price;
+            if (ev.change != null) replayBuf.stockPatch.change = ev.change;
+            if (ev.changePct != null) replayBuf.stockPatch.changePct = ev.changePct;
+          } else {
+            setTyped(ev.text ?? "");
+            if (ev.name || ev.ticker) {
+              setStock((cur) => ({
+                ...cur,
+                name: ev.name || cur.name,
+                code: ev.ticker || cur.code,
+                price: ev.price ?? cur.price,
+                change: ev.change ?? cur.change,
+                changePct: ev.changePct ?? cur.changePct,
+              }));
+            }
           }
           break;
         case "summary_token":
-          setTyped((t) => t + (ev.text ?? ""));
-          break;
         case "token":
-          setTyped((t) => t + (ev.text ?? ""));
+          if (replayBuf) {
+            replayBuf.typed += ev.text ?? "";
+          } else {
+            setTyped((t) => t + (ev.text ?? ""));
+          }
           break;
         case "report_thinking":
-          setThinking({ text: ev.text ?? "", chars: ev.chars ?? 0 });
+          if (replayBuf) {
+            replayBuf.thinking = { text: ev.text ?? "", chars: ev.chars ?? 0 };
+          } else {
+            setThinking({ text: ev.text ?? "", chars: ev.chars ?? 0 });
+          }
           break;
         case "section_queued":
         case "section_start": {
           const title = ev.title ?? "分析章节";
           const status = ev.type === "section_start" ? "writing" : "queued";
-          setSections((items) => upsertSection(items, title, template, (cur) => ({
+          applySections((items) => upsertSection(items, title, template, (cur) => ({
             ...cur,
             status: cur.status === "done" ? "done" : cur.status === "writing" ? "writing" : status,
           })));
@@ -272,7 +353,7 @@ export function ResearchCard({
         }
         case "section_thinking": {
           const title = ev.title ?? "分析章节";
-          setSections((items) => upsertSection(items, title, template, (cur) => (
+          applySections((items) => upsertSection(items, title, template, (cur) => (
             cur.status === "done" ? cur : { ...cur, status: "writing", thinking: ev.text ?? "", thinkingChars: ev.chars ?? 0 }
           )));
           break;
@@ -280,17 +361,18 @@ export function ResearchCard({
         case "section_token": {
           const title = ev.title ?? "分析章节";
           const token = ev.text ?? "";
-          setSections((items) => upsertSection(items, title, template, (cur) => (
+          applySections((items) => upsertSection(items, title, template, (cur) => (
             cur.status === "done" ? cur : { ...cur, status: "writing", body: cur.body + token }
           )));
           break;
         }
         case "section": {
           const title = ev.title ?? "分析章节";
-          setSections((items) => upsertSection(items, title, template, () => ({ title, body: ev.body ?? "", status: "done" })));
+          applySections((items) => upsertSection(items, title, template, () => ({ title, body: ev.body ?? "", status: "done" })));
           break;
         }
         case "done": {
+          commitReplayIfActive();
           const rep = ev.report as ReportDoc & { ticker?: string; name?: string };
           settleOpenTools("ok");
           setDoc(rep);
@@ -312,15 +394,17 @@ export function ResearchCard({
           break;
         }
         case "error":
+          commitReplayIfActive();
           settleOpenTools("error");
           setError(ev.message ?? "研究管线失败");
           setPhase("error");
           finish();
           break;
         case "__disconnected__":
+          replayBuf = null;
           settleOpenTools("error");
           setError("研究流连接中断（任务仍在后台运行），可点击「重新连接」恢复。");
-          setPhase("error");
+          setPhase("disconnected");
           finish();
           break;
         default:
@@ -346,8 +430,8 @@ export function ResearchCard({
         <span className="text-xs px-2 py-0.5 rounded bg-accent text-gold shrink-0">{label}</span>
         <span className="text-sm truncate">{stock.name}<span className="text-muted-foreground tabular ml-1 text-xs">{stock.code !== stock.name ? stock.code : ""}</span></span>
         <span className={`ml-auto flex items-center gap-1 text-[11px] shrink-0 ${phase === "done" ? "text-down" : phase === "error" ? "text-up" : "text-gold"}`}>
-          {phase === "done" ? <Check className="size-3.5" /> : phase === "error" ? <ShieldAlert className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
-          {phase === "done" ? "已完成 · 已入知识库" : phase === "error" ? "未完成" : (activeTool?.label || "研究进行中")}
+          {phase === "done" ? <Check className="size-3.5" /> : phase === "error" || phase === "disconnected" ? <ShieldAlert className="size-3.5" /> : <Loader2 className="size-3.5 animate-spin" />}
+          {phase === "done" ? "已完成 · 已入知识库" : phase === "disconnected" ? "连接中断" : phase === "error" ? "未完成" : (activeTool?.label || "研究进行中")}
         </span>
         {running && (
           <button
@@ -357,8 +441,10 @@ export function ResearchCard({
               setCancelling(true);
               api.cancelResearch(research.task_id)
                 .then((res) => {
-                  if (res?.status === "done") {
-                    // 取消请求到达前任务已落库完成：保留/加载成品报告，不误标为「已取消」
+                  if (res?.status === "done" || res?.status === "error") {
+                    // 取消请求到达前任务已落库完成或已报错：重连终态回放以加载真实终态，避免把真实报错覆盖为「已取消」
+                    stream.close();
+                    setConnectNonce((n) => n + 1);
                     return;
                   }
                   stream.close();
@@ -448,12 +534,14 @@ export function ResearchCard({
               sections={doc ? (doc.sections || []).map((s) => ({ ...s, status: "done" as const })) : sections}
               template={template}
               running={running}
+              incomplete={phase === "error" || phase === "disconnected"}
             />
           )}
 
           {phase === "done" && reportId && (
             <div className="flex flex-wrap items-center gap-1.5 px-4 pb-3 -mt-2">
               <span className="text-[11px] text-muted-foreground mr-1">导出</span>
+              {doc && <button type="button" className="rounded bg-action px-2 py-1 text-xs text-gold-foreground" onClick={() => setShareOpen(true)}>微信高清长图</button>}
               {(["docx", "pdf", "txt", "md"] as const).map((f) => (
                 <button
                   key={f}
@@ -468,6 +556,7 @@ export function ResearchCard({
                 </button>
               ))}
               {exportErr && <span className="text-[11px] text-destructive ml-2">{exportErr}</span>}
+              {doc && <SharePosterView open={shareOpen} onOpenChange={setShareOpen} report={doc} name={stock.name} />}
             </div>
           )}
         </>
@@ -476,7 +565,7 @@ export function ResearchCard({
   );
 }
 
-export function ResearchReportView({ doc, stock, summary, thinking, sections, template, running }: {
+export function ResearchReportView({ doc, stock, summary, thinking, sections, template, running, incomplete = false }: {
   doc: ReportDoc | null;
   stock: CurrentStock;
   summary: string;
@@ -484,6 +573,7 @@ export function ResearchReportView({ doc, stock, summary, thinking, sections, te
   sections: PartialSection[];
   template: TemplateId;
   running: boolean;
+  incomplete?: boolean;
 }) {
   const expected = SECTION_ORDER[template] ?? [];
   const finYears = doc?.financials?.years ?? [];
@@ -502,7 +592,6 @@ export function ResearchReportView({ doc, stock, summary, thinking, sections, te
   const anySectionStarted = sections.some((s) => s.status === "writing" || s.status === "done");
   const summaryStreaming = running && !anySectionStarted;
   const observationLabel = template === "risk" ? "监测重点" : template === "earnings" ? "后续观察" : template === "industry" ? "行业催化" : "催化剂";
-  const caret = <span className="inline-block w-[2px] h-[1em] align-[-0.15em] ml-0.5 bg-gold animate-pulse" />;
 
   return (
     <div className="px-5 py-4 max-w-3xl">
@@ -529,7 +618,9 @@ export function ResearchReportView({ doc, stock, summary, thinking, sections, te
       <div className="mt-4 rounded-lg border border-gold/20 bg-accent/40 p-3.5">
         <div className="text-xs text-gold mb-1.5">{SUMMARY_LABEL[template]}</div>
         {summary ? (
-          <p className="text-sm leading-relaxed text-foreground/90 whitespace-pre-wrap">{summary}{summaryStreaming && caret}</p>
+          <div className="text-sm leading-relaxed text-foreground/90">
+            <StructuredText content={summary} streaming={summaryStreaming} citations={sourceItems} />
+          </div>
         ) : running && thinking ? (
           <div className="text-xs text-muted-foreground">
             <div className="flex items-center gap-2">
@@ -586,10 +677,13 @@ export function ResearchReportView({ doc, stock, summary, thinking, sections, te
               <Clock3 className="size-3.5" /> 排队中 · 前序章节写完后紧接着开始
             </div>
           ) : (sec.body || "").trim() ? (
-            <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">
-              {sec.body}
-              {running && sec.status === "writing" && caret}
-            </p>
+            <div className="text-sm leading-relaxed text-foreground/80">
+              <StructuredText
+                content={sec.body}
+                streaming={running && sec.status === "writing"}
+                citations={sourceItems}
+              />
+            </div>
           ) : running && sec.thinking ? (
             <div className="text-xs text-muted-foreground">
               <div className="flex items-center gap-2">
@@ -602,6 +696,8 @@ export function ResearchReportView({ doc, stock, summary, thinking, sections, te
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <Loader2 className="size-3.5 animate-spin text-gold" /> 正在生成本章节…
             </div>
+          ) : incomplete ? (
+            <p className="text-xs text-muted-foreground">任务未完成，本章节未生成。</p>
           ) : (
             <p className="text-xs text-muted-foreground">本章节暂无可展示内容（数据不足或撰写失败）。</p>
           )}

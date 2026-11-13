@@ -1,3 +1,4 @@
+import { isImeKeyEvent } from "../../lib/ime";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { KeyRound, Link2, Eye, EyeOff, Loader2, CheckCircle2, AlertCircle, RefreshCw, Zap, Check, Star, Globe, Flag, Plus, X, Gauge } from "lucide-react";
@@ -5,7 +6,7 @@ import { PROVIDERS, type Provider, type ModelInfo, type Region } from "../../dat
 import { api } from "../../api/client";
 
 type Status = "idle" | "testing" | "connected" | "error";
-interface Cfg { baseUrl: string; apiKey: string; reasoningEffort: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
+interface Cfg { baseUrl: string; apiKey: string; reasoningEffort: string; fallbackModelsText: string; status: Status; latency: number; message: string; models: ModelInfo[]; fetching: boolean; selectedModel: string; }
 
 const MASKED_KEY_RE = /^•{8}(?:.{4})?$/;
 
@@ -53,6 +54,7 @@ export function Settings({ active, onActivate }: Props) {
         baseUrl: s.baseUrl || p.baseUrl,
         apiKey: s.apiKey || "",
         reasoningEffort: s.reasoningEffort || "",
+        fallbackModelsText: Array.isArray(s.fallbackModels) ? s.fallbackModels.join(", ") : "",
         status: hasUsableConfig ? "connected" as Status : "idle" as Status,
         latency: 0,
         message: hasUsableConfig ? "已保存配置" : "",
@@ -83,6 +85,7 @@ export function Settings({ active, onActivate }: Props) {
             baseUrl: s.baseUrl || p.baseUrl,
             apiKey: s.apiKey || "",
             reasoningEffort: s.reasoningEffort || "",
+        fallbackModelsText: Array.isArray(s.fallbackModels) ? s.fallbackModels.join(", ") : "",
             status: hasUsableConfig ? "connected" as Status : "idle" as Status,
             latency: 0,
             message: hasUsableConfig ? "已从本地恢复配置" : "",
@@ -118,6 +121,7 @@ export function Settings({ active, onActivate }: Props) {
       baseUrl: c.baseUrl,
       apiKey: maskKeyForCache(c.apiKey),
       reasoningEffort: c.reasoningEffort,
+      fallbackModels: [...new Set(c.fallbackModelsText.split(/[,，]+/).map((id) => id.trim()).filter(Boolean))].slice(0, 4),
       selectedModel: c.selectedModel,
       models: c.models,
     }]));
@@ -133,6 +137,7 @@ export function Settings({ active, onActivate }: Props) {
       baseUrl: c.baseUrl,
       apiKey: c.apiKey,
       reasoningEffort: c.reasoningEffort,
+      fallbackModels: [...new Set(c.fallbackModelsText.split(/[,，]+/).map((id) => id.trim()).filter(Boolean))].slice(0, 4),
       selectedModel: c.selectedModel,
       models: c.models,
     }]));
@@ -316,7 +321,7 @@ export function Settings({ active, onActivate }: Props) {
   const statusDot = (s: Status) => s === "connected" ? "var(--down)" : s === "error" ? "var(--up)" : s === "testing" ? "var(--gold)" : "var(--muted-foreground)";
 
   return (
-    <div className="h-full grid grid-cols-1 lg:grid-cols-[300px_1fr] gap-4 p-5 overflow-hidden">
+    <div className="h-full grid grid-cols-1 md:grid-cols-[210px_minmax(0,1fr)] gap-3 p-4 overflow-auto">
       {saveError && (
         <div className="col-span-full rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive flex items-start gap-2">
           <AlertCircle className="size-3.5 shrink-0 mt-0.5" />
@@ -376,7 +381,12 @@ export function Settings({ active, onActivate }: Props) {
               </label>
               <input
                 value={cfg.baseUrl}
-                onChange={(e) => patch(selectedId, { baseUrl: e.target.value })}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  const endpoint = (value: string) => value.trim().replace(/\/+$/, "");
+                  patch(selectedId, { baseUrl: next, ...(endpoint(next) !== endpoint(cfg.baseUrl) ?
+                    { apiKey: "", fallbackModelsText: "", status: "idle", message: "" } : {}) });
+                }}
                 placeholder={provider.baseUrl ? "" : "https://your-relay.example.com/v1"}
                 className="w-full rounded-lg bg-input border border-border px-3 py-2.5 text-sm font-mono outline-none focus:border-gold/40 transition-colors placeholder:text-muted-foreground/70"
                 spellCheck={false}
@@ -442,7 +452,7 @@ export function Settings({ active, onActivate }: Props) {
                   {showKey && !isMaskedApiKey(cfg.apiKey) ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
                 </button>
               </div>
-              <p className="text-[10.5px] text-muted-foreground/70 mt-1.5">密钥经 Windows DPAPI 加密后仅保存在本机数据库，永不上传或明文外泄。</p>
+              <p className="mt-1.5 text-xs text-muted-foreground">密钥加密保存在景渊的数据库中，调用模型时用于向配置的端点认证。</p>
             </div>
 
             {/* 测试连通性 */}
@@ -475,7 +485,7 @@ export function Settings({ active, onActivate }: Props) {
                 <button
                   onClick={fetchModels}
                   disabled={!cfg.apiKey.trim() || cfg.fetching}
-                  className="flex items-center gap-1.5 rounded-lg bg-gold px-3 py-1.5 text-xs text-[#17140a] hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                  className="flex items-center gap-1.5 rounded-lg bg-gold px-3 py-1.5 text-xs text-gold-foreground hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
                 >
                   {cfg.fetching ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
                   拉取最新模型
@@ -525,11 +535,16 @@ export function Settings({ active, onActivate }: Props) {
 
               {/* v1.6.4：手动添加模型 —— 中转站主路径（模型名不规律、/v1/models 未必开放）；
                   预设厂商同样可用（新模型未进静态清单、或 URL 已改指向中转时） */}
+              <label className="grid gap-1 pt-2 text-xs text-muted-foreground">
+                同一供应商的备用模型（按顺序，最多四个，以逗号分隔）
+                <input className="rounded border bg-input px-2 py-1.5 font-mono text-foreground" value={cfg.fallbackModelsText}
+                  onChange={(event) => patch(selectedId, { fallbackModelsText: event.target.value })} />
+              </label>
               <div className="mt-3 flex items-center gap-2">
                 <input
                   value={newModelId}
                   onChange={(e) => setNewModelId(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) addManualModel(); }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !isImeKeyEvent(e.nativeEvent)) addManualModel(); }}
                   placeholder="手动添加模型 ID，如 gpt-4o / claude-sonnet-5（按中转站的模型名填）"
                   className="flex-1 rounded-lg bg-input border border-border px-3 py-2 text-xs font-mono outline-none focus:border-gold/40 transition-colors"
                   spellCheck={false}

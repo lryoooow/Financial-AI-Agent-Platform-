@@ -24,10 +24,16 @@ declare global {
     setPreferences: (p: Partial<Pick<FinResearchDesktopPrefs, "closeToTray" | "autoLaunch">>) => Promise<FinResearchDesktopPrefs>;
   }
 
+  interface FinResearchClipboard {
+    writeImageDataUrl: (dataUrl: string) => Promise<boolean>;
+  }
+
   interface Window {
     finresearch?: {
+      platform: string;
       window: FinResearchWindow;
       app?: FinResearchApp;
+      clipboard?: FinResearchClipboard;
     };
   }
 }

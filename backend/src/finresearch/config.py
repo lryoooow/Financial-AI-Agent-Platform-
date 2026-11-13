@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 from pydantic import Field
@@ -28,6 +29,10 @@ class Settings(BaseSettings):
     llm_api_key: Optional[str] = Field(default=None)
     llm_model: str = Field(default="deepseek-chat")
     chart_analyze_model: Optional[str] = Field(default=None)
+    embedding_base_url: Optional[str] = Field(default=None)
+    embedding_model: Optional[str] = Field(default=None)
+    embedding_api_key: Optional[str] = Field(default=None, repr=False)
+    fin_pgvector_url: Optional[str] = Field(default=None, repr=False)
 
     # 可选付费源
     tushare_token: Optional[str] = Field(default=None)
@@ -46,6 +51,15 @@ class Settings(BaseSettings):
 
     # 前端构建产物目录（桌面打包后由后端托管；dev 可指向 fronted/dist）
     frontend_dist: Optional[str] = Field(default=None)
+    finresearch_data_dir: Optional[str] = Field(default=None)
+    fin_access_token: Optional[str] = Field(default=None, repr=False)
+    fin_secret_key: Optional[str] = Field(default=None, repr=False)
+    fin_cors_origins: str = Field(default="")
+    fin_trusted_hosts: str = Field(default="")
+    fin_web: bool = Field(default=False)
+    fin_allow_stdio_mcp: bool = Field(default=False)
+    fin_allow_private_endpoints: bool = Field(default=False)
+    fin_forwarded_allow_ips: str = Field(default="127.0.0.1,::1")
 
     # agent loop 上限（对话与研究共用）。
     # 原先还有一个 recursion_limit=25，那是固定管线图的递归上限；图已移除，该项零引用，一并删掉。
@@ -113,14 +127,21 @@ settings = get_settings()
 
 
 def app_data_dir() -> str:
-    """用户数据目录（存 SQLite、用户数据）；Windows 用 %APPDATA%/FinResearch。"""
-    if sys.platform == "win32":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    """Resolve the data directory using the same precedence as the desktop shell."""
+    explicit = (os.environ.get("FINRESEARCH_DATA_DIR") or settings.finresearch_data_dir or "").strip()
+    if explicit:
+        directory = Path(explicit).expanduser().resolve()
     else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    d = os.path.join(base, "FinResearch")
-    os.makedirs(d, exist_ok=True)
-    return d
+        home = Path.home()
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
+        elif sys.platform == "darwin":
+            base = home / "Library" / "Application Support"
+        else:
+            base = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+        directory = base / "FinResearch"
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
 
 
 def resolve_db_url() -> str:

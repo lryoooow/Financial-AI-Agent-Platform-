@@ -26,9 +26,9 @@ from typing import List, Optional
 import pandas as pd
 
 from ..cache import quote_cache
-from . import make_provenance, now_iso
+from . import clean_for_json, make_provenance, now_iso
 from . import market_provider
-from .entity import BJ_PREFIXES, SH_PREFIXES, normalize_ticker, to_market_ticker
+from .entity import BJ_PREFIXES, SH_PREFIXES, normalize_ticker, stock_ticker, to_market_ticker
 from .market_provider import _fmt_amount, _fmt_volume, _opt_n
 
 logger = logging.getLogger(__name__)
@@ -184,7 +184,10 @@ def _get_spot_row(code: str) -> Optional[dict]:
 
 def get_realtime_quote(code: str) -> dict:
     """实时快照（前端 Stock 形状）。Sina 直连 → Tencent 直连 → AkShare 兜底。"""
-    raw = normalize_ticker(code)
+    try:
+        raw = normalize_ticker(stock_ticker(code))
+    except ValueError as exc:
+        return _empty_stock("", code, str(exc))
     attempts: list[dict] = []
     t0 = time.perf_counter()
 
@@ -194,7 +197,7 @@ def get_realtime_quote(code: str) -> dict:
         _record("quote", source, True)
         result["provenance"] = _enrich(
             result.get("provenance", {}),
-            trading_date=result.get("trading_date") or _today(),
+            trading_date=result.get("trading_date") or "",
             attempts=list(attempts),
         )
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
@@ -213,13 +216,21 @@ def get_realtime_quote(code: str) -> dict:
         if missing:
             try:
                 tx = market_provider.tencent_realtime(raw)
-                merged = [f for f in missing if tx.get(f) not in (None, 0.0, "", "—")]
+                day = result.get("trading_date")
+                merged = [
+                    f for f in missing
+                    if day and tx.get("trading_date") == day and tx.get(f) not in (None, 0.0, "", "—")
+                ]
                 for f in merged:
                     result[f] = tx[f]
                 if merged:
                     prov = result.get("provenance") or {}
                     note = prov.get("note") or ""
                     prov["note"] = (note + f"；{','.join(merged)} 由腾讯源补全").lstrip("；")
+                    prov["field_sources"] = {
+                        field: {"source": "tencent", "as_of": tx.get("as_of"), "trading_date": day}
+                        for field in merged
+                    }
                     result["provenance"] = prov
                     _record("quote", "tencent-merge", True)
             except Exception as e:  # noqa: BLE001
@@ -267,15 +278,13 @@ def get_realtime_quote(code: str) -> dict:
             "pb": _f(row.get("市净率")),
             "roe": 0.0,  # 快照无 ROE，由基本面接口补
             "industry": _clean_str(row.get("行业")),
-            "as_of": now_iso(),
-            "trading_date": _today(),
+            "as_of": "",
+            "trading_date": "",
             "provenance": make_provenance(source="akshare", endpoint="stock_zh_a_spot_em", raw_value=raw),
         }
         # v1.6.0（审计 E2）：akshare 全市场快照无逐行数据时点，盘前/盘后取到的是上一交易
         # 日的旧快照却被盖上今日戳（_ensure_fresh 因此失去判旧能力）。如实标注，不伪造时点。
-        _now_hm = _now_cst().strftime("%H:%M")
-        if not ("09:15" <= _now_hm <= "15:05"):
-            result["provenance"]["note"] = "盘前/盘后获取的全市场快照，实际数据时点可能为上一交易日"
+        result["provenance"]["note"] = "全市场快照未提供该标的数据时点。"
         return finish(result, "akshare")
     except Exception as e:  # noqa: BLE001
         attempts.append({"source": "akshare", "ok": False, "error": str(e)})
@@ -332,12 +341,23 @@ def _classify(code: str) -> str:
 # ────────────────────────────────────────────────────────────
 # 分时（直连优先：Sina(5min) → Eastmoney(重采样5min) → AkShare 兜底）
 # ────────────────────────────────────────────────────────────
-def get_intraday(code: str) -> dict:
+def get_intraday(code: str, days: int = 1) -> dict:
     """分时（09:30–15:00，5 分钟一点聚合，带均价线）。
 
     直连优先：Sina(scale=5) → Eastmoney(1min 重采样 5min，BJ 跳过) → AkShare 兜底。
     """
+    try:
+        stock_ticker(code)
+    except ValueError as exc:
+        return {"data": [], "trading_date": "", "provenance": make_provenance(source="local", endpoint="intraday", error=str(exc))}
     raw = normalize_ticker(code)
+    if days == 5:
+        try:
+            return market_provider.eastmoney_intraday(raw, days=5)
+        except Exception:
+            return {"data": [], "trading_date": "", "provenance": make_provenance(
+                source="eastmoney-direct", endpoint="trends2", error="五日分时暂不可用",
+            )}
     attempts: list[dict] = []
     t0 = time.perf_counter()
 
@@ -435,9 +455,42 @@ def get_intraday(code: str) -> dict:
 # ────────────────────────────────────────────────────────────
 # 日 K 线（直连优先：Tencent(qfq) → Eastmoney(qfq,BJ跳过) → Sina(不复权) → AkShare 兜底）
 # ────────────────────────────────────────────────────────────
-def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
+def _aggregate_kline(daily: dict, period: str, n: int) -> dict:
+    data = daily.get("data") or []
+    if not data:
+        return {**daily, "period": period}
+    frame = pd.DataFrame(data)
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.sort_values("date").set_index("date")
+    groups = frame.groupby(frame.index.to_period("W-FRI" if period == "weekly" else "M"))
+    bars = groups.agg(
+        open=("open", "first"), close=("close", "last"), high=("high", "max"),
+        low=("low", "min"), volume=("volume", "sum"),
+    )
+    bars["date"] = groups.apply(lambda group: group.index[-1]).astype(str)
+    for window in (5, 10, 20, 60):
+        bars[f"ma{window}"] = bars["close"].rolling(window).mean()
+    rows = clean_for_json(bars.tail(n).to_dict(orient="records"))
+    return {**daily, "data": rows, "period": period}
+
+
+def get_kline(code: str, n: int = 60, adjust: str = "qfq", *, period: str = "daily") -> dict:
     """日 K 线（带 ma5/ma10/ma20）。直连优先，AkShare 兜底。"""
+    try:
+        stock_ticker(code)
+    except ValueError as exc:
+        return {"data": [], "trading_date": "", "provenance": make_provenance(source="local", endpoint="kline", error=str(exc))}
     raw = normalize_ticker(code)
+    if period in ("weekly", "monthly"):
+        if not _is_bj(raw):
+            try:
+                result = market_provider.eastmoney_kline(raw, n=n, adjust=adjust, period=period)
+                _ensure_fresh(result, kind="kline")
+                return {**result, "period": period, "adjust": adjust}
+            except Exception:
+                logger.debug("东财 %s K线不可用，尝试从日线聚合", period)
+        daily = get_kline(code, min(3600, (n + 60) * (5 if period == "weekly" else 23)), adjust)
+        return _aggregate_kline(daily, period, n)
     adjust_map = {"qfq": "前复权", "hfq": "后复权", "": ""}
     attempts: list[dict] = []
     t0 = time.perf_counter()
@@ -452,6 +505,12 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
             attempts=list(attempts),
         )
         result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
+        raw_provenance = result["provenance"].get("raw_value")
+        result["adjust"] = "" if source == "sina" else adjust
+        if isinstance(raw_provenance, dict) and raw_provenance.get("adjust") in ("", "qfq", "hfq"):
+            result["adjust"] = raw_provenance["adjust"]
+        if isinstance(raw_provenance, dict) and raw_provenance.get("adjust") == "none":
+            result["adjust"] = ""
         return result
 
     # 1) Tencent 直连（前复权，BJ 正确）
@@ -496,6 +555,7 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
         df["ma5"] = df["收盘"].rolling(5).mean()
         df["ma10"] = df["收盘"].rolling(10).mean()
         df["ma20"] = df["收盘"].rolling(20).mean()
+        df["ma60"] = df["收盘"].rolling(60).mean()
         df = df.tail(int(n)).reset_index(drop=True)
         dts = pd.to_datetime(df["日期"])
         out = []
@@ -506,7 +566,7 @@ def get_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "open": _f(row["开盘"]), "close": _f(row["收盘"]),
                 "high": _f(row["最高"]), "low": _f(row["最低"]),
                 "volume": int(_f(row["成交量"])),
-                "ma5": _opt_n(row["ma5"]), "ma10": _opt_n(row["ma10"]), "ma20": _opt_n(row["ma20"]),
+                "ma5": _opt_n(row["ma5"]), "ma10": _opt_n(row["ma10"]), "ma20": _opt_n(row["ma20"]), "ma60": _opt_n(row["ma60"]),
             })
         prov = make_provenance(
             source="akshare", endpoint="stock_zh_a_hist",
@@ -643,9 +703,9 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
         if macd_df is not None and not macd_df.empty and "MACDh_12_26_9" in macd_df:
             last_h = macd_df["MACDh_12_26_9"].iloc[-1]
             if pd.notna(last_h):
-                macd_hist = _f(last_h)
+                macd_hist = _f(last_h) * 2.0
                 if len(macd_df) >= 2 and pd.notna(macd_df["MACDh_12_26_9"].iloc[-2]):
-                    prev_macd_hist = _f(macd_df["MACDh_12_26_9"].iloc[-2])
+                    prev_macd_hist = _f(macd_df["MACDh_12_26_9"].iloc[-2]) * 2.0
         rsi_s = hldf.ta.rsi(length=14)
         if rsi_s is not None and len(rsi_s) and pd.notna(rsi_s.iloc[-1]):
             rsi_v = _f(rsi_s.iloc[-1])
@@ -665,7 +725,7 @@ def _compute_indicators_df(df: pd.DataFrame) -> List[dict]:
         ema26 = close.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
         dea = dif.ewm(span=9, adjust=False).mean()
-        hist_series = dif - dea
+        hist_series = (dif - dea) * 2.0
         macd_hist = _f(hist_series.iloc[-1])
         if len(hist_series) >= 2:
             prev_macd_hist = _f(hist_series.iloc[-2])

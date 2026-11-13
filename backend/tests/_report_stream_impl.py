@@ -62,7 +62,10 @@ async def run_case(tokens, label):
 
 
 async def main():
-    body, source, toks = await run_case(["公司", "基本面", "稳健", "，", "营收", "增长", "。"], "normal")
+    body, source, toks = await run_case(
+        ["公司", "基本面", "稳健", "，", "营收", "增长", "。", "应继续", "关注后续", "公开披露的", "经营数据", "变化。"],
+        "normal",
+    )
     check(source == "llm", f"normal → source=llm (got {source})")
     check(len(toks) >= 5, f"normal → 逐 token 推送 (got {len(toks)})")
     check("".join(t["text"] for t in toks) == body, "normal → 推送 token 拼接 == 最终 body")

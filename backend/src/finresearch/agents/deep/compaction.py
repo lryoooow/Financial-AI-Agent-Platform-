@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ...core.guardrails.errors import public_failure
 from ...tools.context import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,7 @@ def decide(messages: list[Any], incoming_text: str, window: int, threshold_pct: 
 
 async def summarize(llm: Any, messages: list[Any], previous: str, window: int, timeout: float) -> tuple[str, bool]:
     """生成交接摘要。返回 (摘要, 是否模型生成)。失败回落确定性摘要，绝不抛错。"""
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from ...engine.framework import HumanMessage, SystemMessage
 
     from ...llm import strip_think
 
@@ -182,7 +183,7 @@ async def summarize(llm: Any, messages: list[Any], previous: str, window: int, t
             raise ValueError("摘要过短")
         return text[: SUMMARY_MAX_CHARS + 200], True
     except Exception as e:  # noqa: BLE001
-        logger.warning("对话压缩摘要失败，使用确定性兜底：%s", e)
+        logger.warning("对话压缩摘要失败，使用确定性兜底：%s", public_failure(e))
         return fallback_summary(messages, previous), False
 
 

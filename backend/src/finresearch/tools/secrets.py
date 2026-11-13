@@ -24,9 +24,13 @@ import re
 import socket
 import uuid
 from functools import lru_cache
+from pathlib import Path
+
+from ..config import app_data_dir, settings
 
 _PREFIX = "enc:"
 _DPAPI_PREFIX = "dpapi:"
+_FERNET_PREFIX = "fernet:"
 _DPAPI_V2_ENTROPY = b"finresearch-dpapi-v2"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 _MASK_PREFIX = "••••••••"
@@ -185,20 +189,42 @@ def _dpapi_unprotect(stored: str) -> str:
         return _dpapi_unprotect_raw(blob, _machine_fingerprint()).decode("utf-8")
 
 
+@lru_cache(maxsize=8)
+def _fernet(explicit: str, directory: str):
+    from cryptography.fernet import Fernet
+
+    if explicit:
+        key = hashlib.sha256(b"jingyuan-secret-v2\0" + explicit.encode()).digest()
+    else:
+        path = Path(directory) / ".secret-key"
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            key = path.read_bytes()
+        else:
+            key = os.urandom(32)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(key)
+        if len(key) != 32:
+            raise ValueError("Local encryption key is invalid")
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def _fernet_for_profile():
+    seed = (os.environ.get("FIN_SECRET_KEY") or settings.fin_secret_key or "").strip()
+    return _fernet(seed, "" if seed else app_data_dir())
+
+
 def encrypt_value(plaintext: str) -> str:
-    """加密单个字符串。Windows 首选 DPAPI（"dpapi:"），否则回落自研（"enc:"）。空串原样返回。"""
+    """Use the configured key, Windows DPAPI, or a random local Fernet key."""
     if not plaintext:
         return plaintext
-    if _dpapi_available():
+    if not (os.environ.get("FIN_SECRET_KEY") or settings.fin_secret_key) and _dpapi_available():
         try:
             return _dpapi_protect(plaintext)
         except Exception:  # noqa: BLE001
-            pass  # DPAPI 异常时回落旧方案，绝不因加密失败阻塞保存
-    pt = plaintext.encode("utf-8")
-    nonce = os.urandom(_NONCE_LEN)
-    ks = _keystream(_derive_key(), nonce, len(pt))
-    ct = bytes(a ^ b for a, b in zip(pt, ks))
-    return _PREFIX + base64.b64encode(nonce + ct).decode("ascii")
+            pass
+    return _FERNET_PREFIX + _fernet_for_profile().encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
 def decrypt_value(stored: str) -> str:
@@ -209,6 +235,11 @@ def decrypt_value(stored: str) -> str:
         try:
             return _dpapi_unprotect(stored)
         except Exception:  # noqa: BLE001
+            return ""
+    if stored.startswith(_FERNET_PREFIX):
+        try:
+            return _fernet_for_profile().decrypt(stored[len(_FERNET_PREFIX):].encode("ascii")).decode("utf-8")
+        except Exception:
             return ""
     if not stored.startswith(_PREFIX):
         return stored
@@ -258,7 +289,7 @@ def encrypt_config(config):
         if isinstance(key, str) and key:
             if is_masked_secret(key):
                 out[field] = ""
-            elif not key.startswith((_DPAPI_PREFIX, _PREFIX)):
+            elif not key.startswith((_DPAPI_PREFIX, _PREFIX, _FERNET_PREFIX)):
                 out[field] = encrypt_value(key)
     return out
 
@@ -291,14 +322,39 @@ def mask_config(config):
     return out
 
 
+def model_endpoint_identity(value: str) -> str:
+    """Canonical endpoint identifier for deciding whether a saved key can be reused."""
+    from urllib.parse import urlsplit
+
+    try:
+        url = urlsplit((value or "").strip())
+        if url.scheme not in ("http", "https") or not url.hostname:
+            return ""
+        if url.username is not None or url.password is not None or url.query or url.fragment:
+            return ""
+        host = url.hostname.lower().rstrip(".")
+        if ":" in host:
+            host = f"[{host}]"
+        port = url.port
+        default_port = 443 if url.scheme == "https" else 80
+        authority = f"{host}:{port}" if port and port != default_port else host
+        return f"{url.scheme}://{authority}{url.path.rstrip('/')}"
+    except (ValueError, AttributeError):
+        return ""
+
+
 def merge_masked_nested(incoming, existing):
     """保存嵌套配置时，若前端回传的是未改动的脱敏占位符，保留数据库中既有的密文/明文。"""
     if isinstance(incoming, dict):
         ex_dict = existing if isinstance(existing, dict) else {}
         out = {}
+        new_url = incoming.get("baseUrl", incoming.get("base_url"))
+        old_url = ex_dict.get("baseUrl", ex_dict.get("base_url"))
+        new_endpoint = model_endpoint_identity(new_url)
+        same_endpoint = new_url is None or bool(new_endpoint and new_endpoint == model_endpoint_identity(old_url))
         for k, v in incoming.items():
             if k in _KEY_FIELDS and isinstance(v, str) and is_masked_secret(v):
-                prev = ex_dict.get(k)
+                prev = ex_dict.get(k) if same_endpoint else None
                 out[k] = prev if isinstance(prev, str) and not is_masked_secret(prev) else ""
             else:
                 out[k] = merge_masked_nested(v, ex_dict.get(k))
@@ -339,7 +395,7 @@ def encrypt_nested(obj):
             if k in _KEY_FIELDS and isinstance(v, str) and v:
                 if is_masked_secret(v):
                     out[k] = ""
-                elif v.startswith((_DPAPI_PREFIX, _PREFIX)):
+                elif v.startswith((_DPAPI_PREFIX, _PREFIX, _FERNET_PREFIX)):
                     out[k] = v
                 else:
                     out[k] = encrypt_value(v)

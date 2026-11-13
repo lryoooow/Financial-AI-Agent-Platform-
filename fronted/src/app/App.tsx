@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from "react";
+import { CommandPalette } from "./components/CommandPalette";
+import { TickerTape } from "./components/TickerTape";
+import { ConfirmProvider } from "./components/ui/confirm";
+import { WebAuthGate } from "./components/WebAuthGate";
+import { ModelPicker } from "./components/ModelPicker";
+import { isImeKeyEvent } from "./lib/ime";
 import { TitleBar } from "./components/TitleBar";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { ChatDesk } from "./components/pages/ChatDesk";
 import { ResearchHub, type PendingResearch } from "./components/pages/ResearchHub";
 import { MarketView } from "./components/pages/MarketView";
+import { OverviewDashboard } from "./components/pages/OverviewDashboard";
 import { ReportsLibrary } from "./components/pages/ReportsLibrary";
 import { SettingsPage, START_PAGE_KEY } from "./components/pages/SettingsPage";
-import { api, type AppSettings } from "./api/client";
+import { api, type AppSettings, type MarketOverview } from "./api/client";
 import type { TemplateId } from "./data/report";
 
 interface ActiveModel { providerId: string; modelId: string; provider: string; model: string; accent: string; }
@@ -18,14 +25,32 @@ function isValidActiveModel(p: any): p is ActiveModel {
 }
 
 export default function App() {
-  // v1.8.2：深度研究独立成页并默认作为首屏入口，让用户开箱一眼可见
+  return <WebAuthGate><Workbench /></WebAuthGate>;
+}
+
+function Workbench() {
   const [page, setPage] = useState<PageId>(() => {
     try {
       const p = localStorage.getItem(START_PAGE_KEY);
-      return p === "research" || p === "chat" || p === "market" || p === "reports" ? p : "research";
-    } catch { return "research"; }
+      return p === "research" || p === "chat" || p === "market" || p === "reports" ? p : "overview";
+    } catch { return "overview"; }
   });
   // 行情页当前标的 + 行情页「深度研究」直接交给独立「深度研究」页执行
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("jingyuan.sidebar") === "collapsed");
+  const [knowledgeQuery, setKnowledgeQuery] = useState<{ query: string; nonce: number }>();
+  const [marketOverview, setMarketOverview] = useState<MarketOverview>();
+  const [reportSelection, setReportSelection] = useState<{ id: string; nonce: number }>();
+  useEffect(() => {
+    const shortcuts = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || isImeKeyEvent(event) || event.repeat) return;
+      if (event.key.toLowerCase() === "k") { event.preventDefault(); setPaletteOpen((open) => !open); }
+      if (event.key.toLowerCase() === "b") { event.preventDefault(); setSidebarCollapsed((collapsed) => !collapsed); }
+    };
+    window.addEventListener("keydown", shortcuts);
+    return () => window.removeEventListener("keydown", shortcuts);
+  }, []);
+  useEffect(() => { localStorage.setItem("jingyuan.sidebar", sidebarCollapsed ? "collapsed" : "expanded"); }, [sidebarCollapsed]);
   const [marketCode, setMarketCode] = useState("600519.SH");
   const [pendingResearch, setPendingResearch] = useState<PendingResearch | null>(null);
   const [chatDraft, setChatDraft] = useState<{ text: string; nonce: number } | null>(null);
@@ -90,11 +115,25 @@ export default function App() {
   const vis = (id: PageId) => (page === id ? "h-full" : "h-full hidden");
 
   return (
+    <ConfirmProvider>
     <div className="size-full flex flex-col bg-background text-foreground overflow-hidden">
-      <TitleBar />
+      <TitleBar onSearch={() => setPaletteOpen(true)} modelSelector={<ModelPicker active={activeModel} onChange={() => {}} onGoSettings={() => setPage("settings")} />} />
+      <TickerTape market={marketOverview} onMarket={setMarketOverview} />
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen}
+        onQuote={(hit) => { setMarketCode(hit.code); setPage("market"); }}
+        onResearch={(hit) => { setPendingResearch({ code: hit.code, name: hit.name, nonce: Date.now(), autoStart: true }); setPage("research"); }}
+        onKnowledge={(query) => { setKnowledgeQuery({ query, nonce: Date.now() }); setPage("reports"); }}
+      />
       <div className="flex-1 flex min-h-0">
-        <Sidebar page={page} onNavigate={setPage} runningResearchCount={runningResearchCount} />
+        <Sidebar page={page} onNavigate={setPage} runningResearchCount={runningResearchCount}
+          collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed((value) => !value)} />
         <main className="flex-1 min-w-0 relative">
+          <div className={vis("overview")}>
+            <OverviewDashboard visible={page === "overview"} market={marketOverview} onMarket={setMarketOverview}
+              onSelect={(code) => { setMarketCode(code); setPage("market"); }} onSearch={() => setPaletteOpen(true)}
+              onRecap={() => { setPendingResearch({ code: "market", name: "A 股收盘复盘", template: "market_recap", nonce: Date.now(), autoStart: true }); setPage("research"); }}
+              onResearch={() => setPage("research")} onReport={(id) => { setReportSelection({ id, nonce: Date.now() }); setPage("reports"); }} />
+          </div>
           <div className={vis("research")}>
             <ResearchHub
               activeModel={activeModel}
@@ -125,6 +164,7 @@ export default function App() {
             <MarketView
               code={marketCode}
               visible={page === "market"}
+              indices={marketOverview?.indices}
               onSelect={setMarketCode}
               onResearch={(code, name) => {
                 setPendingResearch({ code, name, nonce: Date.now(), autoStart: true });
@@ -135,6 +175,8 @@ export default function App() {
           <div className={vis("reports")}>
             <ReportsLibrary
               tick={reportsTick}
+              initialQuery={knowledgeQuery}
+              initialReportId={reportSelection}
               visible={page === "reports"}
               onNew={() => {
                 setNewResearchNonce((n) => n + 1);
@@ -158,5 +200,6 @@ export default function App() {
         </main>
       </div>
     </div>
+    </ConfirmProvider>
   );
 }

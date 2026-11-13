@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { api } from "../api/client";
 
 /**
@@ -13,15 +13,25 @@ import { api } from "../api/client";
  * __disconnected__（调用方仍可切页/刷新触发挂载重连兜底）。
  */
 const MAX_RETRIES = 3;
+const WATCHDOG_MS = 28_000;
 
 export function useResearchStream() {
   const esRef = useRef<EventSource | null>(null);
   const retryRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
+  const watchdogRef = useRef<number | null>(null);
   // 最近一次 connect 的参数 + 回调（重连时复用）
   const lastRef = useRef<{ taskId: string; code: string; template: string; onEvent: (ev: any) => void } | null>(null);
 
+  const clearWatchdog = useCallback(() => {
+    if (watchdogRef.current !== null) {
+      window.clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+  }, []);
+
   const close = useCallback(() => {
+    clearWatchdog();
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
@@ -30,7 +40,7 @@ export function useResearchStream() {
     esRef.current = null;
     retryRef.current = 0;
     lastRef.current = null;
-  }, []);
+  }, [clearWatchdog]);
 
   const connect = useCallback(
     (taskId: string, code: string, template: string, onEvent: (ev: any) => void) => {
@@ -41,15 +51,12 @@ export function useResearchStream() {
       const open = () => {
         const last = lastRef.current;
         if (!last) return;
-        const es = new EventSource(api.researchStreamUrl(last.taskId, last.code, last.template));
-        es.onmessage = (e: MessageEvent) => {
-          retryRef.current = 0; // 收到数据即视为连接健康，重试计数清零
-          try {
-            last.onEvent(JSON.parse(e.data));
-          } catch { /* 非 JSON 帧忽略（后端约定每帧一个 JSON 事件） */ }
-        };
-        es.onerror = () => {
+        clearWatchdog();
+        const es = new EventSource(api.researchStreamUrl(last.taskId, last.code, last.template), { withCredentials: true });
+
+        const handleDisconnect = () => {
           const wasOurs = esRef.current === es;
+          clearWatchdog();
           try { es.close(); } catch { /* noop */ }
           if (esRef.current === es) esRef.current = null;
           if (!wasOurs || !lastRef.current) return;
@@ -69,15 +76,44 @@ export function useResearchStream() {
             lastRef.current.onEvent({ type: "__disconnected__" });
           }
         };
+
+        const armWatchdog = () => {
+          clearWatchdog();
+          watchdogRef.current = window.setTimeout(() => {
+            watchdogRef.current = null;
+            if (esRef.current === es) handleDisconnect();
+          }, WATCHDOG_MS);
+        };
+
+        armWatchdog();
+        es.onmessage = (e: MessageEvent) => {
+          armWatchdog();
+          try {
+            const parsed = JSON.parse(e.data);
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              parsed.type &&
+              parsed.type !== "replay" &&
+              parsed.type !== "replay_end" &&
+              parsed.type !== "heartbeat"
+            ) {
+              retryRef.current = 0;
+            }
+            last.onEvent(parsed);
+          } catch { /* 非 JSON 帧忽略（后端约定每帧一个 JSON 事件） */ }
+        };
+        es.onerror = handleDisconnect;
         esRef.current = es;
       };
 
       open();
     },
-    [close],
+    [clearWatchdog, close],
   );
 
   useEffect(() => close, [close]);
 
-  return { connect, close, isConnected: () => esRef.current !== null };
+  const isConnected = useCallback(() => esRef.current !== null, []);
+  return useMemo(() => ({ connect, close, isConnected }), [connect, close, isConnected]);
 }

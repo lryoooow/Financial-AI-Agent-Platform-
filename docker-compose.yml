@@ -1,0 +1,21 @@
+services:
+  jingyuan:
+    build: .
+    image: jingyuan:2.0.0
+    restart: unless-stopped
+    ports:
+      - "${FIN_BIND_ADDRESS:-127.0.0.1}:${FIN_PORT:-9527}:9527"
+    environment:
+      FIN_ACCESS_TOKEN: ${FIN_ACCESS_TOKEN:-}
+      FIN_SECRET_KEY: ${FIN_SECRET_KEY:-}
+      FIN_TRUSTED_HOSTS: ${FIN_TRUSTED_HOSTS:-}
+      FIN_CORS_ORIGINS: ${FIN_CORS_ORIGINS:-}
+      FIN_PGVECTOR_URL: ${FIN_PGVECTOR_URL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+    volumes:
+      - jingyuan-data:/data
+
+volumes:
+  jingyuan-data:

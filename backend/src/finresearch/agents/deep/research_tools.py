@@ -23,7 +23,7 @@ import json
 import logging
 from typing import Any, Optional
 
-from langchain_core.tools import tool
+from ...engine.tools_adapter import tool
 
 from ...tools import facts as facts_mod
 from ...tools.entity import to_market_ticker
@@ -34,6 +34,7 @@ from ..workers.entity_resolver import entity_node
 from ..workers.market import market_node
 from ..workers.report import _stream_push, _write_mode, report_node, summary_node
 from ..workers.research import research_node
+from ...engine.router import choose_route
 
 # 行业估值取数超时：与 deep/tools.py 的 _T_INDUSTRY 对齐（实测并行冷启动 5-12s）
 _T_INDUSTRY = 20.0
@@ -135,6 +136,7 @@ def build_research_tools(
     query: str = "",
 ):
     """按任务构造工具（task_id / 模板 / 模型配置闭包进去，模型不用也不该传这些）。"""
+    call_counts: dict[str, int] = {}
 
     @tool
     async def prefetch_basics(code: str) -> str:
@@ -151,12 +153,15 @@ def build_research_tools(
         Args:
             code: 标的代码，如 "600519.SH"；不确定就先用 resolve_entity 查。
         """
+        if call_counts.get("prefetch_basics", 0) >= 2:
+            return json.dumps({"error": "基础数据取数重试已达上限，请基于已有结果继续或结束任务。"}, ensure_ascii=False)
+        call_counts["prefetch_basics"] = call_counts.get("prefetch_basics", 0) + 1
         _stream_push("正在识别标的与交易状态…")
         ent = await entity_node({"code": code})
         if ent.get("error"):
             return json.dumps({"error": str(ent["error"])}, ensure_ascii=False)
         norm = ent.get("normalized_ticker") or code
-        state = {"code": code, "normalized_ticker": norm}
+        state = {"code": code, "normalized_ticker": norm, "blocked_tools": choose_route(query, template).blocked_tools}
 
         _stream_push("正在并行拉取实时行情、K线与财务资讯…")
         r_task = asyncio.create_task(research_node(state))
@@ -195,7 +200,7 @@ def build_research_tools(
         _put(task_id, "citations", research_out.get("citations", []))
         _put(task_id, "risk_flags", market_out.get("risk_flags", []))
         _put(task_id, "normalized_ticker", norm)
-        _put(task_id, "data_as_of", ent.get("data_as_of", ""))
+        _put(task_id, "data_as_of", (fv.get("quote") or {}).get("as_of") or "—（行情时点未获取）")
         _put(task_id, "facts", fv)
         _put(task_id, "timings", {
             **(research_out.get("timings") or {}),
@@ -217,12 +222,20 @@ def build_research_tools(
         Args:
             industry_name: 行业名称，如 "光伏" / "半导体" / "白酒"
         """
+        if call_counts.get("prefetch_industry", 0) >= 2:
+            return json.dumps({"error": "行业数据取数重试已达上限，请直接结束任务并说明数据源暂时不可用。"}, ensure_ascii=False)
+        call_counts["prefetch_industry"] = call_counts.get("prefetch_industry", 0) + 1
         _stream_push(f"正在检索「{industry_name}」申万行业估值与行业资讯…")
         # 行业估值 + 行业新闻并行取。行业新闻用行业名作关键词走 search_news 的东财源
         # （它接受任意关键词，不止个股代码）。
+        async def industry_news():
+            if "search_news" in choose_route(query, template).blocked_tools:
+                return None, 0, "user_scope"
+            return await _timed_call(_search_news, industry_name, timeout=6, label="industry_news", limit=10)
+
         iv_res, news_res = await asyncio.gather(
             _timed_call(_search_industry, industry_name, 8, timeout=_T_INDUSTRY, label="industry_valuation"),
-            _timed_call(_search_news, industry_name, timeout=6, label="industry_news", limit=10),
+            industry_news(),
         )
         iv, _iv_ms, iv_err = iv_res
         news, _news_ms, _news_err = news_res
@@ -300,9 +313,12 @@ def build_research_tools(
         "不展开"而不是编内容），你不需要自己写正文。
         返回生成结果摘要。
         """
+        if call_counts.get("compose_report", 0) >= 2:
+            return json.dumps({"error": "报告撰写调用次数已达上限，请直接结束任务。"}, ensure_ascii=False)
+        call_counts["compose_report"] = call_counts.get("compose_report", 0) + 1
         stored = _STORE.get(task_id) or {}
         if not stored.get("findings"):
-            return "还没有数据，请先调用 prefetch_basics。"
+            return json.dumps({"error": "还没有数据，请先调用 prefetch_basics。"}, ensure_ascii=False)
 
         state = {
             "code": stored.get("normalized_ticker", ""),
@@ -342,7 +358,7 @@ def build_research_tools(
         out = await report_node(state)
         doc = out.get("draft_report")
         if not doc:
-            return "报告生成失败：未产出草稿。"
+            return json.dumps({"error": "报告生成失败：未产出草稿。"}, ensure_ascii=False)
 
         _put(task_id, "draft_report", doc)
         _put(task_id, "timings", {

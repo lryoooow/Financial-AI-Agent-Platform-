@@ -47,11 +47,19 @@ async function parseJsonSafe<T>(r: Response, path: string): Promise<T> {
   }
 }
 
+function notifyAuthIfNeeded(status: number, payload?: any): void {
+  if (status === 401 || payload?.code === "AUTH_REQUIRED") {
+    try {
+      window.dispatchEvent(new Event("jingyuan:auth-required"));
+    } catch {}
+  }
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal, timeoutMs = 25_000): Promise<T> {
   const guard = withTimeoutSignal(timeoutMs, signal);
   let r: Response;
   try {
-    r = await fetch(`${API_BASE}${path}`, { signal: guard.signal, cache: "no-store" });
+    r = await fetch(`${API_BASE}${path}`, { signal: guard.signal, cache: "no-store", credentials: "include" });
   } catch (e) {
     guard.cleanup();
     if (guard.timedOut()) throw new Error("请求超时，请稍后重试");
@@ -64,7 +72,10 @@ async function getJson<T>(path: string, signal?: AbortSignal, timeoutMs = 25_000
       try {
         const body = await r.json();
         detail = body?.detail || body?.message || body?.error || "";
-      } catch {}
+        notifyAuthIfNeeded(r.status, body);
+      } catch {
+        notifyAuthIfNeeded(r.status);
+      }
       throw new Error(detail ? `${path} → ${r.status}: ${detail}` : `${path} → ${r.status}`);
     }
     return await parseJsonSafe<T>(r, path);
@@ -83,6 +94,7 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal, ti
       body: JSON.stringify(body),
       signal: guard.signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch (e) {
     guard.cleanup();
@@ -96,7 +108,10 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal, ti
       try {
         const payload = await r.json();
         detail = payload?.detail || payload?.message || payload?.error || "";
-      } catch {}
+        notifyAuthIfNeeded(r.status, payload);
+      } catch {
+        notifyAuthIfNeeded(r.status);
+      }
       throw new Error(detail ? `${path} → ${r.status}: ${detail}` : `${path} → ${r.status}`);
     }
     return await parseJsonSafe<T>(r, path);
@@ -105,16 +120,17 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal, ti
   }
 }
 
-async function putJson<T>(path: string, body: unknown, timeoutMs = 30_000): Promise<T> {
+async function putJson<T>(path: string, body: unknown, timeoutMs = 30_000, method: "PUT" | "PATCH" = "PUT"): Promise<T> {
   const guard = withTimeoutSignal(timeoutMs);
   let r: Response;
   try {
     r = await fetch(`${API_BASE}${path}`, {
-      method: "PUT",
+      method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: guard.signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch {
     guard.cleanup();
@@ -127,7 +143,10 @@ async function putJson<T>(path: string, body: unknown, timeoutMs = 30_000): Prom
       try {
         const payload = await r.json();
         detail = payload?.detail || payload?.message || payload?.error || "";
-      } catch {}
+        notifyAuthIfNeeded(r.status, payload);
+      } catch {
+        notifyAuthIfNeeded(r.status);
+      }
       throw new Error(detail ? `${path} → ${r.status}: ${detail}` : `${path} → ${r.status}`);
     }
     return await parseJsonSafe<T>(r, path);
@@ -161,6 +180,7 @@ async function deleteJson<T>(path: string, timeoutMs = 30_000): Promise<T> {
       method: "DELETE",
       signal: guard.signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch {
     guard.cleanup();
@@ -173,7 +193,10 @@ async function deleteJson<T>(path: string, timeoutMs = 30_000): Promise<T> {
       try {
         const payload = await r.json();
         detail = payload?.detail || payload?.message || payload?.error || "";
-      } catch {}
+        notifyAuthIfNeeded(r.status, payload);
+      } catch {
+        notifyAuthIfNeeded(r.status);
+      }
       throw new Error(detail ? `${path} → ${r.status}: ${detail}` : `${path} → ${r.status}`);
     }
     return await parseJsonSafe<T>(r, path);
@@ -189,6 +212,7 @@ export interface LlmConfig {
   model: string;
   /** 思考深度档位（low/medium/high）：仅用户在 Settings 显式选择时携带；空则不下发。 */
   reasoning_effort?: string;
+  fallback_models?: string[];
 }
 
 /** 与后端 llm.py _REASONING_PATTERNS 口径一致的客户端镜像。
@@ -204,6 +228,9 @@ export interface ResearchRef {
   code: string;
   template: string;
   name?: string;
+  status?: "pending" | "running" | "done" | "error";
+  report_id?: string | null;
+  error?: string | null;
 }
 
 export interface ChatMessage {
@@ -213,13 +240,20 @@ export interface ChatMessage {
   images?: string[]; // base64 data URL（多模态图片，重开对话可恢复）
   created_at: string;
   /** research_request = 研究请求气泡；research = 研究卡片（随 task 流式渲染报告） */
-  kind?: "research_request" | "research";
+  kind?: "research_request" | "research" | "hitl";
+  reasoning_summary?: string;
+  thinking_elapsed_ms?: number;
+  agent_trace?: ToolInvocation[];
+  tool_invocations?: ToolInvocation[];
+  artifacts?: ToolArtifact[];
+  approval?: HumanApproval;
+  turn_status?: "completed" | "aborted" | "awaiting_hitl" | "failed";
   research?: ResearchRef;
 }
 
 export interface KnowledgeHit {
   doc_id: string;
-  kind: "report" | "conversation";
+  kind: "report" | "conversation" | "external";
   report_id: string;
   conversation_id: string;
   title: string;
@@ -232,7 +266,7 @@ export interface KnowledgeHit {
   score: number;
 }
 
-export interface KnowledgeStats { reports: number; conversations: number; chunks: number; updated_at: string; }
+export interface KnowledgeStats { reports: number; conversations: number; external?: number; memories?: number; chunks: number; updated_at: string; }
 
 export interface StockHistoryItem { code: string; name: string; count: number; last_viewed: string; }
 
@@ -246,7 +280,7 @@ export interface LearnedProfile {
 
 export interface AppSettings {
   research_write_mode: "stream" | "parallel";
-  default_template: "equity_deep" | "industry" | "earnings" | "risk";
+  default_template: "equity_deep" | "industry" | "earnings" | "risk" | "market_recap";
   context_window_k: number;
   compact_threshold_pct: number;
   knowledge_enabled: boolean;
@@ -306,6 +340,8 @@ export interface Quote {
 /** 行情数据 + 来源/失败原因/耗时元信息（/intraday、/kline 返回此形状）。 */
 export interface MarketDataResult<T> {
   data: T;
+  adjust?: string;
+  trading_days?: number;
   trading_date?: string;
   elapsed_ms?: number;
   provenance?: {
@@ -468,10 +504,221 @@ export interface ReportDoc {
   llm_fallback_reason?: string;
 }
 
+
+export interface ToolInvocation {
+  call_id?: string;
+  name: string;
+  label: string;
+  status: "start" | "ok" | "error" | "aborted";
+  args_summary?: string;
+  elapsed_ms?: number;
+  provenance?: { source?: string; fetched_at?: string; error?: string | null } | null;
+  parent_run_id?: string;
+  agent_run_id?: string;
+  child_run_id?: string;
+}
+
+export interface ToolArtifact {
+  call_id: string;
+  name: string;
+  label: string;
+  artifact: Record<string, unknown>;
+  child_run_id?: string;
+}
+
+export interface HumanApproval {
+  checkpoint_id: string;
+  label: string;
+  kind: "symbol" | "batch_research";
+  status?: "pending" | "approved" | "rejected";
+  candidates: { code: string; name: string }[];
+}
+
+export interface MarketOverview {
+  indices: { code: string; name: string; price: number | null; changePct: number | null; as_of?: string }[];
+  breadth: {
+    up?: number; down?: number; flat?: number; count?: number; limit_up?: number | null; limit_down?: number | null;
+    turnover_yuan?: number | null; previous_turnover_yuan?: number | null; turnover_change_yuan?: number | null;
+    trading_date?: string; comparison_date?: string; turnover_partial?: boolean;
+    provenance?: { source?: string; fetched_at?: string; error?: string | null };
+  };
+  industries: { code: string; name: string; changePct: number | null; net_flow_yuan: number | null; flow_provenance?: { source?: string } }[];
+  industry_error?: string | null;
+}
+
+export interface WatchlistItem {
+  id: string; group_id: string; symbol: string; name: string; market: string;
+  added_price: number | null; note: string; sort_order: number; created_at: string;
+}
+export interface WatchlistGroup { id: string; name: string; sort_order: number; items: WatchlistItem[]; }
+interface WatchlistChange {
+  kind?: "group" | "item" | "order"; id?: string; group_id?: string; name?: string;
+  symbol?: string; symbols?: string[]; ids?: string[]; note?: string; sort_order?: number;
+}
+export interface WatchlistPreview {
+  verified: { code: string; name: string; input: string }[];
+  ambiguous: { input: string; candidates: { code: string; name: string }[] }[];
+  unmatched: string[];
+}
+type EvidenceSource = { source?: string; endpoint?: string; fetched_at?: string; error?: string };
+export interface RadarRow {
+  symbol: string; name: string; quote: Partial<Quote>; groups: string[];
+  valuation: { pe_ttm?: number; pb?: number; pe_ttm_percentile?: number; pb_percentile?: number; as_of?: string; provenance?: EvidenceSource };
+  earnings: { period?: string; revenue_yoy?: number; profit_yoy?: number; roe?: number; operating_cashflow?: number; provenance?: EvidenceSource; cashflow_provenance?: EvidenceSource };
+  price_volume: { close?: number; ma20?: number; rsi?: number; volume_ratio?: number; as_of?: string; provenance?: EvidenceSource };
+  risk: { volatility_20d?: number; max_drawdown?: number; beta?: number; as_of?: string; provenance?: { asset?: EvidenceSource; benchmark?: EvidenceSource } };
+  events: { count?: number; items: { title?: string; time?: string; url?: string }[]; provenance?: EvidenceSource };
+}
+interface BatchOutcome {
+  status: "awaiting_hitl" | "queued" | "rejected";
+  approval?: HumanApproval;
+  conversation_id?: string;
+  task_ids?: string[];
+}
+export interface FactSnapshot {
+  report_price?: number | null; report_pe_ttm?: number | null; report_pb?: number | null;
+  price_as_of?: string; valuation_as_of?: string; snapshot_ts?: string; hs300_as_of?: string; hs300_close?: number | null;
+  fin_period?: string; revenue_yoy?: number | null; profit_yoy?: number | null;
+  provenance?: Record<string, EvidenceSource | null>;
+}
+export interface ReportLedger {
+  snapshot: FactSnapshot; current: FactSnapshot; legacy: boolean; message?: string;
+  comparison: { price_change_pct?: number; excess_pp?: number; max_drawdown_pct?: number; pe_change_pct?: number; pb_change_pct?: number;
+    new_financial_period?: boolean; return_start?: string; return_end?: string; drawdown_as_of?: string };
+}
+export interface KnowledgeDocument { id: string; title: string; ticker: string; created_at: string; chunks: number; }
+export type PushChannel = "wework" | "feishu" | "dingtalk" | "smtp";
+export interface PushConfig {
+  enabled?: boolean; webhook?: string; secret?: string; host?: string; port?: number;
+  tls?: "ssl" | "starttls"; username?: string; password?: string; sender?: string; recipient?: string;
+}
+export interface SchedulerConfig {
+  enabled: boolean; run_time: string; group_id: string; attach_pdf: boolean; channels: Partial<Record<PushChannel, PushConfig>>;
+  runs?: { id: string; date: string; status: string; report_id?: string; channels?: Record<string, { ok: boolean }>; error?: string }[];
+}
+export interface McpServer { id: string; command: string[]; env: Record<string, string>; allowed_tools: string[]; enabled: boolean; }
+export type ReportFormat = "docx" | "pdf" | "txt" | "md" | "html";
+
+interface ChatHandlers {
+  onStage?: (stage: string, label: string, heartbeat?: boolean) => void;
+  onToolCall?: (event: ToolInvocation) => void;
+  onArtifact?: (event: ToolArtifact) => void;
+  onApproval?: (event: HumanApproval) => void;
+  onReasoning?: (text: string) => void;
+  onToken?: (text: string) => void;
+  onCompacted?: (info: { generation: number; used_tokens: number; window: number }) => void;
+  onDone?: (payload: ChatPayload) => void;
+  onError?: (message: string) => void;
+  signal?: AbortSignal;
+}
+
+async function readChatResponse(r: Response, handlers: ChatHandlers) {
+  if (!r.ok || !r.body) {
+    let detail = "";
+    try {
+      const value = await r.json();
+      detail = typeof value.detail === "string" ? value.detail : value.detail?.message || "";
+      notifyAuthIfNeeded(r.status, value);
+    } catch {
+      notifyAuthIfNeeded(r.status);
+    }
+    throw new Error(detail || "会话请求失败（HTTP " + r.status + "）");
+  }
+  if (!r.headers.get("Content-Type")?.includes("text/event-stream")) return;
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let terminal = false;
+  const process = (frame: string) => {
+    const line = frame.split("\n").find((part) => part.startsWith("data: "));
+    if (!line) return;
+    let event;
+    try { event = JSON.parse(line.slice(6)); } catch { return; }
+    switch (event.type) {
+      case "stage": handlers.onStage?.(event.stage, event.label, event.heartbeat === true); break;
+      case "tool_call": handlers.onToolCall?.(event); break;
+      case "tool_artifact": handlers.onArtifact?.(event); break;
+      case "human_approval_required": handlers.onApproval?.(event); break;
+      case "reasoning": handlers.onReasoning?.(event.text); break;
+      case "token": handlers.onToken?.(event.text); break;
+      case "context_compacted": handlers.onCompacted?.(event); break;
+      case "done": terminal = true; handlers.onDone?.(event); break;
+      case "error": terminal = true; handlers.onError?.(event.message); break;
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const frames = buffer.replace(/\r\n/g, "\n").split("\n\n");
+      buffer = done ? "" : frames.pop() || "";
+      for (const frame of frames) process(frame);
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (!terminal && !handlers.signal?.aborted) handlers.onError?.("对话流连接意外中断，请重试。");
+}
+
+async function chatRequest(path: string, payload: unknown, handlers: ChatHandlers) {
+  const response = await fetch(API_BASE + path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload), signal: handlers.signal, cache: "no-store", credentials: "include",
+  });
+  await readChatResponse(response, handlers);
+}
+
 export const api = {
   base: API_BASE,
 
   health: () => getJson<{ status: string; db: string; llm: string }>("/api/health"),
+  watchlist: () => getJson<{ groups: WatchlistGroup[] }>("/api/watchlist"),
+  addWatchlist: (body: WatchlistChange) => postJson<{ id?: string; items?: WatchlistItem[]; duplicates?: number }>("/api/watchlist", body, undefined, 90_000),
+  updateWatchlist: (body: WatchlistChange) => putJson<{ ok: boolean }>("/api/watchlist", body, 30_000, "PATCH"),
+  removeWatchlist: (id: string, kind: "item" | "group" = "item") =>
+    deleteJson<{ ok: boolean }>("/api/watchlist?id=" + encodeURIComponent(id) + "&kind=" + kind),
+  watchlistQuotes: (id: string, signal?: AbortSignal) =>
+    getJson<{ quotes: Record<string, Partial<Quote>> }>("/api/watchlist/quotes?group_id=" + encodeURIComponent(id), signal, 70_000),
+  watchlistPreview: (body: { mode: "text" | "table" | "image"; payload: string; filename?: string; llm?: LlmConfig }) =>
+    postJson<WatchlistPreview>("/api/watchlist/import-preview", body, undefined, 48_000),
+  watchlistRadar: (group_id: string, signal?: AbortSignal) =>
+    postJson<{ rows: RadarRow[] }>("/api/watchlist/radar", { group_id }, signal, 320_000),
+  batchResearch: (symbols: string[], llm?: LlmConfig) =>
+    postJson<BatchOutcome>("/api/research/batch", { symbols, llm }).then((res) => {
+      if (res.task_ids?.length) {
+        try { window.dispatchEvent(new CustomEvent("finresearch:research-created", { detail: res })); } catch {}
+      }
+      return res;
+    }),
+  approveBatch: (conversationId: string, checkpoint_id: string, action: "approve" | "edit" | "reject", value = "") =>
+    postJson<BatchOutcome>("/api/chat/" + encodeURIComponent(conversationId) + "/hitl-resume", { checkpoint_id, action, value }).then((res) => {
+      if (res.task_ids?.length) {
+        try { window.dispatchEvent(new CustomEvent("finresearch:research-created", { detail: res })); } catch {}
+      }
+      return res;
+    }),
+  ledger: (id: string, signal?: AbortSignal) => getJson<ReportLedger>("/api/reports/" + encodeURIComponent(id) + "/ledger", signal, 35_000),
+  knowledgeDocuments: () => getJson<{ items: KnowledgeDocument[] }>("/api/knowledge/documents"),
+  knowledgeDeleteDocument: (id: string) => deleteJson<{ ok: boolean }>("/api/knowledge/documents/" + encodeURIComponent(id)),
+  knowledgeUpload: async (file: File) => {
+    const body = new FormData();
+    body.set("file", file);
+    const response = await fetch(API_BASE + "/api/knowledge/upload", {
+      method: "POST", body, credentials: "include", signal: AbortSignal.timeout(40_000),
+    });
+    const data = await parseJsonSafe<{ detail?: string; ok?: boolean; code?: string }>(response, "/api/knowledge/upload");
+    if (!response.ok) {
+      notifyAuthIfNeeded(response.status, data);
+      throw new Error(data.detail || "上传失败。");
+    }
+    return data;
+  },
+  schedulerConfig: () => getJson<SchedulerConfig>("/api/scheduler/config"),
+  saveScheduler: (body: SchedulerConfig) => putJson<SchedulerConfig>("/api/scheduler/config", body),
+  testPush: (channel: PushChannel) => postJson<{ ok: boolean; error?: string }>("/api/scheduler/test-push", { channel }),
+  mcpServers: () => getJson<{ servers: McpServer[]; editable?: boolean }>("/api/mcp/servers"),
+  saveMcpServers: (servers: McpServer[]) => putJson<{ ok: boolean }>("/api/mcp/servers", { servers }),
 
   resolve: (q: string, limit = 8, signal?: AbortSignal) =>
     getJson<ResolveHit[]>(
@@ -479,20 +726,27 @@ export const api = {
       signal
     ),
 
+  marketOverview: (signal?: AbortSignal, refresh = false) =>
+    getJson<MarketOverview>("/api/market/overview?refresh=" + Number(refresh), signal),
+
+  webAuthStatus: () => getJson<{ required: boolean; authenticated: boolean }>("/api/auth/status"),
+  webAuthLogin: (token: string) => postJson<{ authenticated: boolean }>("/api/auth/login", { token }),
+  webAuthLogout: () => postJson<{ authenticated: boolean }>("/api/auth/logout", {}),
+
   quote: (code: string, signal?: AbortSignal) =>
     getJson<Quote>(`/api/quote/${encodeURIComponent(code)}`, signal),
 
   /** 分时：返回 {data, provenance, trading_date, elapsed_ms}（含来源/失败原因）。 */
-  intraday: (code: string, signal?: AbortSignal) =>
+  intraday: (code: string, signal?: AbortSignal, days = 1) =>
     getJson<MarketDataResult<IntradayPoint[]>>(
-      `/api/quote/${encodeURIComponent(code)}/intraday`,
+      `/api/quote/${encodeURIComponent(code)}/intraday?days=${days}`,
       signal
     ),
 
   /** 日K：返回 {data, provenance, trading_date, elapsed_ms}（含来源/失败原因）。 */
-  kline: (code: string, n = 60, adjust = "qfq", signal?: AbortSignal) =>
+  kline: (code: string, n = 60, adjust = "qfq", signal?: AbortSignal, period = "daily") =>
     getJson<MarketDataResult<Candle[]>>(
-      `/api/quote/${encodeURIComponent(code)}/kline?n=${n}&adjust=${adjust}`,
+      `/api/quote/${encodeURIComponent(code)}/kline?n=${n}&adjust=${encodeURIComponent(adjust)}&period=${period}`,
       signal
     ),
 
@@ -542,85 +796,18 @@ export const api = {
 
   /** 流式发送对话消息（POST → text/event-stream）。用 fetch + ReadableStream 解析（EventSource 仅 GET）。
    *  事件：stage(思考阶段) → 多个 token(回复流) → done(最终 conversation/messages/reply) | error。 */
-  sendChatMessageStream: async (
-    id: string,
-    message: string,
-    llm: LlmConfig | null,
-    images: string[] | undefined,
-    handlers: {
-      onStage?: (stage: string, label: string, heartbeat?: boolean) => void;
-      onToolCall?: (ev: { name: string; label: string; status: "start" | "ok" | "error" }) => void;
-      /** v1.7.0：思维链增量（reasoning_content 透出）；纯瞬态展示，不计入对话内容 */
-      onReasoning?: (text: string) => void;
-      onToken?: (text: string) => void;
-      /** v1.8.0：上下文自动压缩完成（较早对话已写成交接摘要） */
-      onCompacted?: (info: { generation: number; used_tokens: number; window: number }) => void;
-      onDone?: (payload: ChatPayload) => void;
-      onError?: (message: string) => void;
-      signal?: AbortSignal;
-    }
-  ) => {
-    let r: Response;
-    try {
-      r = await fetch(
-        `${API_BASE}/api/chat/conversations/${encodeURIComponent(id)}/messages`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message, llm: llm ?? undefined, images: images?.length ? images : undefined }),
-          signal: handlers.signal,
-          cache: "no-store",
-        }
-      );
-    } catch (e) {
-      if ((e as DOMException)?.name === "AbortError") throw e;
-      throw new Error("后端连接失败，请稍后重试");
-    }
-    if (!r.ok || !r.body) {
-      let detail = "";
-      try { const b = await r.json(); detail = b?.detail || b?.message || ""; } catch {}
-      throw new Error(detail ? `chat stream → ${r.status}: ${detail}` : `chat stream → ${r.status}`);
-    }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
-    let sawTerminal = false;
-    const processFrame = (frame: string) => {
-      const line = frame.split("\n").find((l) => l.startsWith("data: "));
-      if (!line) return;
-      let ev: any;
-      try { ev = JSON.parse(line.slice(6)); } catch { return; }
-      if (ev.type === "stage") handlers.onStage?.(ev.stage, ev.label, ev.heartbeat === true);
-      else if (ev.type === "tool_call") handlers.onToolCall?.(ev);
-      else if (ev.type === "reasoning") handlers.onReasoning?.(ev.text);
-      else if (ev.type === "token") handlers.onToken?.(ev.text);
-      else if (ev.type === "context_compacted") handlers.onCompacted?.(ev);
-      else if (ev.type === "done") {
-        sawTerminal = true;
-        handlers.onDone?.(ev as ChatPayload);
-      } else if (ev.type === "error") {
-        sawTerminal = true;
-        handlers.onError?.(ev.message);
-      }
-    };
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        buf = (buf + decoder.decode()).replace(/\r\n|\r/g, "\n");
-        for (const frame of buf.split("\n\n")) {
-          if (frame.trim()) processFrame(frame);
-        }
-        break;
-      }
-      buf = (buf + decoder.decode(value, { stream: true })).replace(/\r\n|\r/g, "\n");
-      const frames = buf.split("\n\n");
-      buf = frames.pop() || "";
-      for (const frame of frames) processFrame(frame);
-    }
-    if (!sawTerminal && !handlers.signal?.aborted) {
-      handlers.onError?.("对话流连接意外中断，请重试。");
-    }
-  },
+  sendChatMessageStream: (
+    id: string, message: string, llm: LlmConfig | null, images: string[] | undefined,
+    handlers: ChatHandlers, activeSymbol?: string,
+  ) => chatRequest("/api/chat/conversations/" + encodeURIComponent(id) + "/messages", {
+    message, llm: llm ?? undefined, images: images?.length ? images : undefined, active_symbol: activeSymbol,
+  }, handlers),
+
+  resumeChat: (
+    id: string, checkpointId: string, action: "approve" | "edit" | "reject", value: string, handlers: ChatHandlers,
+  ) => chatRequest("/api/chat/" + encodeURIComponent(id) + "/hitl-resume", {
+    checkpoint_id: checkpointId, action, value,
+  }, handlers),
 
   archiveChatConversation: (id: string, archived = true) =>
     putJson<{ conversation: ChatConversation; channel: "deltachannel" }>(
@@ -659,9 +846,9 @@ export const api = {
   /** SSE 流式研究的完整 URL（前端用 EventSource 连，带 code 兜底）。
    *  模型配置不在 URL（密钥不入 URL/日志）；后端按 task_id 从 POST 时落库/内存取出。 */
   researchStreamUrl: (taskId: string, code: string, template = "equity_deep") =>
-    `${API_BASE}/api/research/${taskId}/stream?code=${encodeURIComponent(
+    `${API_BASE}/api/research/${encodeURIComponent(taskId)}/stream?code=${encodeURIComponent(
       code
-    )}&template=${template}`,
+    )}&template=${encodeURIComponent(template)}`,
 
   /** 研究任务列表（恢复历史与运行中状态）。 */
   researchTasks: () => getJson<{ tasks: ResearchTaskSummary[] }>("/api/research/tasks"),
@@ -688,12 +875,17 @@ export const api = {
   reportsList: () => getJson<{ reports: ReportListItem[] }>("/api/reports"),
 
   /** 报告真实文件下载 URL（docx/pdf/txt/md）。 */
-  reportDownloadUrl: (id: string, format: "docx" | "pdf" | "txt" | "md") =>
+  reportDownloadUrl: (id: string, format: ReportFormat) =>
     `${API_BASE}/api/reports/${encodeURIComponent(id)}/download?format=${format}`,
 
   /** 报告真删除：物理删除报告行 + 来源任务 + 检查点（不可恢复）。 */
   deleteReport: (id: string) =>
-    deleteJson<{ ok: boolean; deleted: string }>(`/api/reports/${encodeURIComponent(id)}`),
+    deleteJson<{ ok: boolean; deleted: string; task_id?: string | null }>(`/api/reports/${encodeURIComponent(id)}`).then((res) => {
+      try {
+        window.dispatchEvent(new CustomEvent("finresearch:report-deleted", { detail: { id, taskId: res.task_id ?? undefined } }));
+      } catch {}
+      return res;
+    }),
 
   /** 本地用户画像（默认稳健研究型）。 */
   userProfile: () => getJson<{ payload: UserProfile | null }>(`/api/local-settings/user-profile`),
@@ -746,7 +938,7 @@ export const api = {
 /** 桌面/浏览器通用报告下载（fetch + Blob + 延迟释放 ObjectURL，兼容 Electron will-navigate 拦截）。 */
 export async function downloadReportFile(
   id: string,
-  format: "docx" | "pdf" | "txt" | "md",
+  format: ReportFormat,
 ): Promise<void> {
   const guard = withTimeoutSignal(90_000);
   let r: Response;
@@ -754,6 +946,7 @@ export async function downloadReportFile(
     r = await fetch(api.reportDownloadUrl(id, format), {
       signal: guard.signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch {
     guard.cleanup();
@@ -766,7 +959,10 @@ export async function downloadReportFile(
       try {
         const b = await r.json();
         detail = b?.detail || b?.message || "";
-      } catch {}
+        notifyAuthIfNeeded(r.status, b);
+      } catch {
+        notifyAuthIfNeeded(r.status);
+      }
       throw new Error(detail ? `导出失败（${r.status}）：${detail}` : `导出失败（HTTP ${r.status}）`);
     }
     const cd = r.headers.get("content-disposition") || "";

@@ -80,6 +80,7 @@ export function loadPickerOptions(): PickerOption[] {
           base_url: baseUrl,
           api_key: (s.apiKey || "").trim(),
           model,
+          ...(Array.isArray(s.fallbackModels) ? { fallback_models: s.fallbackModels.filter((value: unknown) => typeof value === "string" && value !== model).slice(0, 4) } : {}),
           // v1.6.5：思考深度档位（用户显式选择时才携带；后端 build_llm 透传 reasoning_effort）
           ...((s.reasoningEffort || "").trim() ? { reasoning_effort: (s.reasoningEffort || "").trim() } : {}),
         },

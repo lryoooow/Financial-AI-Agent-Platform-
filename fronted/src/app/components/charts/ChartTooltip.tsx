@@ -3,33 +3,35 @@ import { fmt } from "../../lib/format";
 /**
  * 主题化图表 Tooltip（替代原 recharts 写死的 #14161c 深色弹窗）。
  * 用 bg-popover / border-border 等 token，浅色深色都正确。
- * `ai` 字段为"走势线 AI 速读"预留位（下一步接入 /api/chart/analyze）。
  *
  * recharts 会把 { active, payload, label } 作为 props 注入（克隆本元素时合并）。
  */
 interface OwnProps {
   kind: "intraday" | "kline";
-  up?: boolean;          // intraday：相对昨收的涨跌
-  prevClose?: number;    // intraday：昨收，用于算偏离
-  ai?: string;           // 走势线 AI 速读（可选）
+  up?: boolean;          // intraday：相对基准的涨跌
+  prevClose?: number;    // intraday：昨收（5日分时为首笔基准），用于算偏离
+  isFiveDay?: boolean;   // 5日分时标签区分
 }
 
 const KLINE_LABEL: Record<string, string> = {
-  open: "开", close: "收", high: "高", low: "低", ma5: "MA5", ma10: "MA10", ma20: "MA20",
+  open: "开", close: "收", high: "高", low: "低", ma5: "MA5", ma10: "MA10", ma20: "MA20", ma60: "MA60",
 };
 
 export function ChartTooltip(ownProps: OwnProps) {
   const { active, payload, label } = ownProps as any;
   if (!active || !payload || !payload.length) return null;
 
-  const { kind, prevClose, ai } = ownProps;
+  const { kind, prevClose, isFiveDay } = ownProps;
   const rawRow = payload[0]?.payload as Record<string, any> | undefined;
+  const effectivePrevClose = kind === "kline" && typeof rawRow?.prevClose === "number"
+    ? rawRow.prevClose
+    : prevClose;
   const priceVal = kind === "kline"
     ? rawRow?.close
     : payload.find((p: any) => p.dataKey === "price" || p.dataKey === "close")?.value;
   const dec = typeof priceVal === "number" && priceVal > 0 && priceVal < 5 ? 3 : 2;
-  const pct = prevClose != null && prevClose > 0 && typeof priceVal === "number"
-    ? ((priceVal - prevClose) / prevClose) * 100
+  const pct = effectivePrevClose != null && effectivePrevClose > 0 && typeof priceVal === "number"
+    ? ((priceVal - effectivePrevClose) / effectivePrevClose) * 100
     : null;
   const pointUp = pct != null ? pct >= 0 : (ownProps.up ?? true);
 
@@ -42,6 +44,7 @@ export function ChartTooltip(ownProps: OwnProps) {
         ["MA5", rawRow.ma5],
         ["MA10", rawRow.ma10],
         ["MA20", rawRow.ma20],
+        ["MA60", rawRow.ma60],
       ]
     : [];
 
@@ -76,16 +79,11 @@ export function ChartTooltip(ownProps: OwnProps) {
           className="mt-1 pt-1 border-t border-border tabular text-[10px]"
           style={{ color: pointUp ? "var(--up)" : "var(--down)" }}
         >
-          {kind === "intraday" ? "较昨收 " : "涨跌幅 "}
+          {kind === "intraday" ? (isFiveDay ? "区间涨跌 " : "较昨收 ") : "涨跌幅 "}
           {pct >= 0 ? "+" : ""}{fmt(pct, 2)}%
         </div>
       )}
 
-      {ai && (
-        <div className="mt-1.5 pt-1.5 border-t border-border text-[10.5px] leading-snug text-foreground/80">
-          <span className="text-gold font-medium">AI 速读 · </span>{ai}
-        </div>
-      )}
     </div>
   );
 }

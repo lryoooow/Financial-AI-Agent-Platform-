@@ -18,6 +18,7 @@ from ..config import app_data_dir
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _DATA_URL = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.+)$", re.DOTALL)
 _EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+_MEDIA_NAME = re.compile(r"^[0-9a-f]{20}\.(?:jpg|png|webp|gif)$")
 
 
 def _safe(value: str, label: str) -> str:
@@ -48,7 +49,7 @@ def _is_active_markup(raw: bytes) -> bool:
     return head.startswith((b"<svg", b"<!doctype", b"<html", b"<script", b"<?xml")) or b"<script" in head
 
 
-def validate_images_input(images: Optional[list[str]]) -> list[str]:
+def validate_images_input(images: Optional[list[str]], conversation_id: str = "") -> list[str]:
     """校验多模态输入图片数量、单张体积与魔数（供路由前置拦截，违规抛 ValueError）。"""
     if not images:
         return []
@@ -59,6 +60,9 @@ def validate_images_input(images: Optional[list[str]]) -> list[str]:
         if not isinstance(image, str) or not image.strip():
             continue
         if image.startswith("/api/context/media/"):
+            prefix = f"/api/context/media/{conversation_id}/"
+            if not conversation_id or not image.startswith(prefix) or not media_path(conversation_id, image[len(prefix):]).is_file():
+                raise ValueError("图片引用不属于当前会话或文件不存在。")
             cleaned.append(image)
             continue
         match = _DATA_URL.match(image)
@@ -83,8 +87,10 @@ def validate_images_input(images: Optional[list[str]]) -> list[str]:
 
 
 def conversation_dir(conversation_id: str, root: Optional[Path] = None, *, create: bool = True) -> Path:
-    base = Path(root) if root is not None else Path(app_data_dir()) / "context"
+    base = (Path(root) if root is not None else Path(app_data_dir()) / "context").resolve()
     path = base / "conversations" / _safe(conversation_id, "conversation_id")
+    if path.resolve() != path:
+        raise ValueError("invalid conversation path")
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path
@@ -97,6 +103,8 @@ def offload_message_media(message: dict, conversation_id: str, root: Optional[Pa
     if not images:
         return stored
     media_dir = conversation_dir(conversation_id, root, create=True) / "media"
+    if media_dir.resolve() != media_dir:
+        raise ValueError("invalid media directory")
     media_dir.mkdir(parents=True, exist_ok=True)
     refs: list[str] = []
     for image in images[:MAX_IMAGE_COUNT]:
@@ -130,11 +138,12 @@ def offload_message_media(message: dict, conversation_id: str, root: Optional[Pa
 
 
 def media_path(conversation_id: str, filename: str, root: Optional[Path] = None) -> Path:
-    _safe(filename.replace(".", "_"), "filename")
+    if not _MEDIA_NAME.fullmatch(filename or ""):
+        raise ValueError("invalid media filename")
     conv_root = conversation_dir(conversation_id, root, create=False)
     media_root = (conv_root / "media").resolve()
     target = (conv_root / "media" / filename).resolve()
-    if media_root not in target.parents:
+    if media_root.parent != conv_root or target.parent != media_root:
         raise ValueError("invalid media path")
     return target
 

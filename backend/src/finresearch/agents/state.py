@@ -21,6 +21,7 @@ from typing_extensions import TypedDict
 
 
 class ResearchState(TypedDict, total=False):
+    blocked_tools: dict[str, str]
     # 输入
     code: str            # 前端格式 600519.SH
     template: str        # equity_deep / industry / earnings / risk

@@ -29,7 +29,7 @@ DEFAULTS: dict[str, Any] = {
 
 _CHOICES = {
     "research_write_mode": {"stream", "parallel"},
-    "default_template": {"equity_deep", "industry", "earnings", "risk"},
+    "default_template": {"equity_deep", "industry", "earnings", "risk", "market_recap"},
 }
 _RANGES = {
     "context_window_k": (0, 2000),

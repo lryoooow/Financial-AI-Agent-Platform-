@@ -28,7 +28,8 @@ import {
 } from "../../api/client";
 import { TEMPLATES, type TemplateId } from "../../data/report";
 import { ModelPicker, loadActiveLlm } from "../ModelPicker";
-import { ResearchCard, SECTION_ORDER } from "../research/ResearchCard";
+import { ResearchCard } from "../research/ResearchCard";
+import { isImeKeyEvent } from "../../lib/ime";
 import { isIndexCodeInput, resolveResearchTarget } from "../../lib/ticker";
 
 export interface PendingResearch {
@@ -55,28 +56,27 @@ const TEMPLATE_META: Record<
   TemplateId,
   {
     icon: typeof TrendingUp;
-    tagline: string;
-    detail: string;
+      detail: string;
   }
 > = {
   equity_deep: {
     icon: TrendingUp,
-    tagline: "全景四维研报",
     detail: "自动拉取实时行情、60 日 K 线技术指标、多年财务报表与近期快讯，一次流式生成完整深度研报。",
   },
   industry: {
     icon: Building2,
-    tagline: "赛道景气与格局",
     detail: "围绕申万行业分类梳理景气周期、核心驱动、竞争格局、估值水位与潜在风险。",
   },
   earnings: {
     icon: FileBarChart2,
-    tagline: "核心财报拆解",
     detail: "聚焦最新财报期营收、归母净利、ROE、毛利率与现金流变化，快速定位经营拐点。",
+  },
+  market_recap: {
+    icon: FileBarChart2,
+    detail: "汇总有时间戳的宽基指数、涨跌广度和申万一级行业表现。",
   },
   risk: {
     icon: ShieldAlert,
-    tagline: "下行压力与排雷",
     detail: "从估值溢价、技术超买、波动率、流动性及基本面脆弱点排查潜在回撤情景与监测信号。",
   },
 };
@@ -118,9 +118,10 @@ const FOCUS_PRESETS: Record<TemplateId, string[]> = {
     "分析经营性现金流与净利润的匹配质量",
     "判断单季毛利率与费用率是否出现拐点",
   ],
+  market_recap: [],
   risk: [
     "排查高估值回撤、业绩不及预期与流动性风险",
-    "给出关键支撑位与基本面恶化的预警观测指标",
+    "核验历史价格区间与基本面变化的观测指标",
     "评估极端市场环境下的抗跌韧性",
   ],
 };
@@ -173,6 +174,7 @@ export function ResearchHub({
   const [llm, setLlm] = useState<LlmConfig | null>(() => loadActiveLlm());
 
   const [candidates, setCandidates] = useState<CandidateStock[]>([]);
+  const [candidateIndex, setCandidateIndex] = useState(-1);
   const [searchingStock, setSearchingStock] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [recentStocks, setRecentStocks] = useState<StockHistoryItem[]>([]);
@@ -191,6 +193,7 @@ export function ResearchHub({
     Map<string, { status: "done" | "error"; report_id?: string | null; name?: string; at: number }>
   >(new Map());
   const prevRunningIdsRef = useRef<Set<string>>(new Set());
+  const notifiedReportIdsRef = useRef<Set<string>>(new Set());
   const onReportGeneratedRef = useRef(onReportGenerated);
   onReportGeneratedRef.current = onReportGenerated;
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
@@ -259,10 +262,11 @@ export function ResearchHub({
         return t;
       });
 
-      // 检测后台完成（非当前打开卡片）的任务，通知报告库刷新
+      // 检测后台完成（非当前打开卡片）的任务，通知报告库刷新（去重防止与卡片 onDone 重复触发）
       const prevRunning = prevRunningIdsRef.current;
       for (const t of list) {
-        if (prevRunning.has(t.id) && t.status === "done" && t.report_id) {
+        if (prevRunning.has(t.id) && t.status === "done" && t.report_id && !notifiedReportIdsRef.current.has(t.report_id)) {
+          notifiedReportIdsRef.current.add(t.report_id);
           onReportGeneratedRef.current?.({
             id: t.report_id,
             name: t.name || t.code,
@@ -400,6 +404,7 @@ export function ResearchHub({
           exchange: item.exchange,
         }));
         setCandidates(list);
+        setCandidateIndex(-1);
         setDropdownOpen(list.length > 0);
       } catch {
         if (seq === searchSeqRef.current) setCandidates([]);
@@ -419,14 +424,8 @@ export function ResearchHub({
     }) => {
       if (submittingRef.current) return;
       const effectiveLlm = llm ?? loadActiveLlm();
-      if (!effectiveLlm || !effectiveLlm.api_key?.trim() || !effectiveLlm.base_url?.trim()) {
-        setSelectedTaskId(null);
-        setError("尚未配置可用大模型：请先前往「设置 → 模型配置」填入 API Key 并选择模型。");
-        return;
-      }
-
       const raw = opts.rawTarget.trim();
-      if (!raw && !opts.known) {
+      if (!raw && !opts.known && opts.tpl !== "market_recap") {
         setError(opts.tpl === "industry" ? "请输入要研究的行业或赛道名称，如「半导体」「光伏设备」。" : "请输入要研究的 A 股代码、名称或拼音首字母，如「600519」或「贵州茅台」。");
         return;
       }
@@ -436,7 +435,7 @@ export function ResearchHub({
       setError("");
       setDropdownOpen(false);
       try {
-        let target = opts.known ?? null;
+        let target = opts.tpl === "market_recap" ? { code: "market", name: "A 股收盘复盘" } : opts.known ?? null;
         if (!target) {
           if (opts.tpl !== "industry" && isIndexCodeInput(raw)) {
             setError("当前个股模板仅支持 A 股个股 / ETF 研究（暂不支持 000001.SH / 399001 等宽基指数），请输入个股或切换为「行业研究」。");
@@ -454,7 +453,7 @@ export function ResearchHub({
           target.code,
           opts.tpl,
           cleanQuery,
-          effectiveLlm,
+          effectiveLlm ?? undefined,
           { name: target.name },
         );
 
@@ -581,8 +580,8 @@ export function ResearchHub({
             }}
             className={`w-full flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-all ${
               selectedTaskId === null
-                ? "bg-gold text-[#17140a] shadow-sm"
-                : "bg-gold/90 text-[#17140a] hover:bg-gold hover:brightness-105"
+                ? "bg-action text-gold-foreground shadow-sm"
+                : "bg-gold/90 text-gold-foreground hover:bg-gold hover:brightness-105"
             }`}
           >
             <Plus className="size-3.5" strokeWidth={2.5} /> 新建深度研究任务
@@ -737,7 +736,7 @@ export function ResearchHub({
         </header>
 
         {/* 主体内容区 */}
-        <div className="flex-1 overflow-y-auto p-5">
+        <div className="flex-1 overflow-y-auto px-3 py-2.5">
           {activeTask ? (
             /* ── 视图 B：单任务实时流式/成品阅读视图 ── */
             <div className="mx-auto max-w-4xl space-y-3.5">
@@ -805,6 +804,9 @@ export function ResearchHub({
                   if (p === "done" || p === "error") {
                     settleTaskLocally(activeTask.id, { status: p });
                     void refreshTasks();
+                  } else if (p === "running") {
+                    locallySettledRef.current.delete(activeTask.id);
+                    void refreshTasks();
                   }
                 }}
                 onDone={(r) => {
@@ -814,13 +816,16 @@ export function ResearchHub({
                     name: r.name,
                   });
                   void refreshTasks();
-                  onReportGenerated?.(r);
+                  if (!notifiedReportIdsRef.current.has(r.id)) {
+                    notifiedReportIdsRef.current.add(r.id);
+                    onReportGenerated?.(r);
+                  }
                 }}
               />
             </div>
           ) : (
             /* ── 视图 A：深度研究发起台（Launchpad） ── */
-            <div className="mx-auto max-w-3xl py-2 space-y-5">
+            <div className="mx-auto max-w-4xl space-y-3">
               {/* 错误或引导横幅 */}
               {error && (
                 <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-xs text-destructive flex items-center justify-between gap-3">
@@ -832,7 +837,7 @@ export function ResearchHub({
                     <button
                       type="button"
                       onClick={onGoSettings}
-                      className="shrink-0 rounded-lg bg-gold px-3 py-1.5 text-xs font-medium text-[#17140a] hover:brightness-110 transition-all"
+                      className="shrink-0 rounded-lg bg-gold px-3 py-1.5 text-xs font-medium text-gold-foreground hover:brightness-110 transition-all"
                     >
                       去配置 API Key →
                     </button>
@@ -843,19 +848,16 @@ export function ResearchHub({
               {/* 第一步：研究范式选择 */}
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <label className="text-xs font-medium text-foreground/90 flex items-center gap-2">
-                    <span className="inline-grid place-items-center size-4.5 rounded-full bg-gold/20 text-gold text-[10px] font-mono">1</span>
+                  <h2 className="text-sm font-medium">
                     选择深度研究模板
-                  </label>
-                  <span className="text-[11px] text-muted-foreground">不同模板自动匹配对应的数据抓取管线与报告结构</span>
+                  </h2>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div className="grid grid-cols-2 gap-1.5 lg:grid-cols-5">
                   {TEMPLATES.map((t) => {
                     const chosen = template === t.id;
                     const meta = TEMPLATE_META[t.id];
                     const Icon = meta.icon;
-                    const chapters = SECTION_ORDER[t.id] || [];
                     return (
                       <button
                         key={t.id}
@@ -868,50 +870,28 @@ export function ResearchHub({
                             setTargetInput("");
                           }
                         }}
-                        className={`text-left rounded-xl border p-3.5 transition-all ${
+                        aria-pressed={chosen}
+                        className={`text-left rounded-md border px-2 py-2 transition-colors ${
                           chosen
                             ? "border-gold bg-accent/60 shadow-sm"
                             : "border-border bg-card hover:border-gold/35 hover:bg-secondary/30"
                         }`}
                       >
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex items-center gap-2">
-                            <div className={`grid place-items-center size-7 rounded-lg ${chosen ? "bg-gold text-[#17140a]" : "bg-secondary text-muted-foreground"}`}>
-                              <Icon className="size-4" />
-                            </div>
-                            <div>
-                              <div className="flex items-center gap-1.5">
-                                <span className={`text-sm font-medium ${chosen ? "text-gold" : "text-foreground"}`}>{t.label}</span>
-                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-secondary/80 text-muted-foreground">{meta.tagline}</span>
-                              </div>
-                            </div>
-                          </div>
-                          <div className={`size-4 rounded-full border grid place-items-center ${chosen ? "border-gold bg-gold/20" : "border-border"}`}>
-                            {chosen && <div className="size-2 rounded-full bg-gold" />}
-                          </div>
-                        </div>
-                        <p className="mt-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                          {meta.detail}
-                        </p>
-                        <div className="mt-2.5 flex flex-wrap gap-1">
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-background/70 border border-border/60 text-muted-foreground">核心摘要</span>
-                          {chapters.map((ch) => (
-                            <span key={ch} className="text-[10px] px-1.5 py-0.5 rounded bg-background/70 border border-border/60 text-muted-foreground">
-                              {ch}
-                            </span>
-                          ))}
+                        <div className="flex items-center gap-1.5">
+                          <Icon className={"size-4 shrink-0 " + (chosen ? "text-gold" : "text-muted-foreground")} />
+                          <span className={chosen ? "text-gold" : "text-foreground"}>{t.label}</span>
                         </div>
                       </button>
                     );
                   })}
                 </div>
+                <p className="text-xs text-muted-foreground">{TEMPLATE_META[template].detail}</p>
               </div>
 
               {/* 第二步：研究标的输入 + 智能联想 */}
-              <div className="rounded-xl border border-border bg-card p-4 space-y-4">
-                <div className="space-y-2" ref={searchBoxRef}>
+              <div className="rounded-lg border border-border bg-card p-3 space-y-2.5">
+                <div className="space-y-2" ref={searchBoxRef} hidden={template === "market_recap"}>
                   <label className="text-xs font-medium text-foreground/90 flex items-center gap-2">
-                    <span className="inline-grid place-items-center size-4.5 rounded-full bg-gold/20 text-gold text-[10px] font-mono">2</span>
                     {template === "industry" ? "输入目标行业或赛道" : "输入目标股票 / ETF（支持代码、简称、拼音首字母）"}
                   </label>
 
@@ -930,12 +910,23 @@ export function ResearchHub({
                           if (candidates.length > 0 && template !== "industry") setDropdownOpen(true);
                         }}
                         onKeyDown={(e) => {
+                          if (isImeKeyEvent(e.nativeEvent)) return;
                           if (e.key === "Escape") {
                             setDropdownOpen(false);
                             return;
                           }
-                          if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                          if (candidates.length && dropdownOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                             e.preventDefault();
+                            const step = e.key === "ArrowDown" ? 1 : -1;
+                            setCandidateIndex((index) => index < 0 ? (step === 1 ? 0 : candidates.length - 1) : (index + step + candidates.length) % candidates.length);
+                            return;
+                          }
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            if (dropdownOpen && candidates[candidateIndex]) {
+                              selectStockCandidate(candidates[candidateIndex]);
+                              return;
+                            }
                             void launchResearch({
                               rawTarget: pickedTarget ? pickedTarget.code : targetInput,
                               tpl: template,
@@ -963,12 +954,12 @@ export function ResearchHub({
                     {/* 联想候选下拉框 */}
                     {dropdownOpen && candidates.length > 0 && template !== "industry" && (
                       <div className="absolute z-20 left-0 right-0 mt-1 rounded-xl border border-border bg-popover shadow-lg overflow-hidden">
-                        {candidates.map((c) => (
+                        {candidates.map((c, index) => (
                           <button
                             key={c.code}
                             type="button"
                             onClick={() => selectStockCandidate(c)}
-                            className="w-full flex items-center justify-between px-3.5 py-2 text-xs hover:bg-accent transition-colors text-left"
+                            className={"w-full flex items-center justify-between px-3.5 py-2 text-xs hover:bg-accent transition-colors text-left " + (index === candidateIndex ? "bg-accent" : "")}
                           >
                             <div className="flex items-center gap-2">
                               <span className="font-medium text-foreground">{c.name}</span>
@@ -1039,7 +1030,7 @@ export function ResearchHub({
                     value={focusQuery}
                     onChange={(e) => setFocusQuery(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                      if (e.key === "Enter" && !isImeKeyEvent(e.nativeEvent)) {
                         e.preventDefault();
                         void launchResearch({
                           rawTarget: pickedTarget ? pickedTarget.code : targetInput,
@@ -1081,7 +1072,7 @@ export function ResearchHub({
                   <motion.button
                     whileTap={{ scale: 0.985 }}
                     type="button"
-                    disabled={submitting || (!targetInput.trim() && !pickedTarget)}
+                    disabled={submitting || (template !== "market_recap" && !targetInput.trim() && !pickedTarget)}
                     onClick={() =>
                       void launchResearch({
                         rawTarget: pickedTarget ? pickedTarget.code : targetInput,
@@ -1090,7 +1081,7 @@ export function ResearchHub({
                         known: pickedTarget,
                       })
                     }
-                    className="flex items-center gap-2 rounded-lg bg-gold px-5 py-2.5 text-sm font-medium text-[#17140a] hover:brightness-110 disabled:opacity-45 disabled:cursor-not-allowed transition-all shadow-sm"
+                    className="flex items-center gap-2 rounded-lg bg-gold px-5 py-2.5 text-sm font-medium text-gold-foreground hover:brightness-110 disabled:opacity-45 disabled:cursor-not-allowed transition-all shadow-sm"
                   >
                     {submitting ? (
                       <>

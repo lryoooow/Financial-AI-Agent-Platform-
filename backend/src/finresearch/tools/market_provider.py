@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import logging
 import re
+import time
 from threading import Lock
 from typing import Any, List, Optional
 from urllib.parse import urlencode
@@ -25,6 +26,8 @@ from .entity import BJ_PREFIXES, SH_PREFIXES, _classify_exchange, normalize_tick
 
 logger = logging.getLogger(__name__)
 _NET_LOCK = Lock()
+_EM_HIS_FAIL_AT = 0.0
+_EM_HIS_BREAKER_S = 180.0
 
 # 行情域名白名单：默认对这些主机绕过代理（requests/urllib 读 NO_PROXY）。
 # 东方财富（akshare 主源）、Sina（备用源）、腾讯（预留）、乐咕乐股（申万估值）。
@@ -38,6 +41,7 @@ MARKET_HOSTS = [
     "datacenter.eastmoney.com",
     "quote.eastmoney.com",
     "search-api-web.eastmoney.com",
+    "np-anotice-stock.eastmoney.com",
     "so.eastmoney.com",
     # Sina（备用源）
     "hq.sinajs.cn",
@@ -163,6 +167,16 @@ def _sina_symbol(raw: str) -> str:
     return f"sz{raw}"
 
 
+def _index_symbol(code: str) -> str:
+    from .entity import detect_index_code
+
+    index = detect_index_code(code)
+    if index is None:
+        raise ValueError("需要带市场后缀的宽基指数代码。")
+    number, exchange = index[0].split(".")
+    return f"{exchange.lower()}{number}"
+
+
 def _eastmoney_secid(raw: str) -> str:
     """Eastmoney secid: 1.SH, 0.SZ/BJ."""
     return f"1.{raw}" if raw.startswith(SH_PREFIXES) else f"0.{raw}"
@@ -178,27 +192,36 @@ def _http_get(url: str, headers: Optional[dict] = None, timeout: float = 3.0) ->
     return raw.decode("utf-8", errors="replace")
 
 
-def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
+def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq", *, period: str = "daily") -> dict:
     """东方财富直连日 K，绕过 AkShare 封装层，国内免费源。"""
+    global _EM_HIS_FAIL_AT
+    if time.time() - _EM_HIS_FAIL_AT < _EM_HIS_BREAKER_S:
+        raise ConnectionError("Eastmoney push2his 近 3 分钟内连接断开，熔断跳过")
     raw = normalize_ticker(code)
     fqt = {"": "0", "qfq": "1", "hfq": "2"}.get(adjust, "1")
     now = now_cst()
-    fetch_n = max(1, int(n)) + 25
+    fetch_n = max(1, int(n)) + 59
     end = now.strftime("%Y%m%d")
-    start = (now - dt.timedelta(days=fetch_n * 3 + 90)).strftime("%Y%m%d")
+    scale = {"daily": (101, 3), "weekly": (102, 7), "monthly": (103, 32)}
+    interval, calendar_factor = scale[period]
+    start = (now - dt.timedelta(days=fetch_n * calendar_factor + 90)).strftime("%Y%m%d")
     qs = urlencode(
         {
             "secid": _eastmoney_secid(raw),
             "fields1": "f1,f2,f3,f4,f5,f6",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "klt": "101",
+            "klt": str(interval),
             "fqt": fqt,
             "beg": start,
             "end": end,
         }
     )
     url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?{qs}"
-    body = _http_get(url, headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}, timeout=3)
+    try:
+        body = _http_get(url, headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}, timeout=3)
+    except Exception:
+        _EM_HIS_FAIL_AT = time.time()
+        raise
     payload = json.loads(body)
     rows = ((payload.get("data") or {}).get("klines") or [])[-fetch_n:]
     if not rows:
@@ -218,6 +241,7 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
     df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
@@ -232,6 +256,7 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "ma5": _opt_n(r["ma5"]),
                 "ma10": _opt_n(r["ma10"]),
                 "ma20": _opt_n(r["ma20"]),
+                "ma60": _opt_n(r["ma60"]),
             }
         )
     return {
@@ -241,27 +266,34 @@ def eastmoney_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
             "source": "eastmoney-direct",
             "endpoint": "push2his.eastmoney.com/api/qt/stock/kline/get",
             "fetched_at": now_iso(),
-            "raw_value": {"secid": _eastmoney_secid(raw), "n": n, "adjust": adjust},
+            "raw_value": {"secid": _eastmoney_secid(raw), "n": n, "adjust": adjust, "period": period},
             "error": None,
         },
     }
 
 
-def eastmoney_intraday(code: str) -> dict:
+def eastmoney_intraday(code: str, days: int = 1) -> dict:
     """东方财富直连 1 分钟分时，国内免费源。"""
+    global _EM_HIS_FAIL_AT
+    if time.time() - _EM_HIS_FAIL_AT < _EM_HIS_BREAKER_S:
+        raise ConnectionError("Eastmoney push2his 近 3 分钟内连接断开，熔断跳过")
     raw = normalize_ticker(code)
     qs = urlencode(
         {
             "secid": _eastmoney_secid(raw),
             "fields1": "f1,f2,f3,f4,f5,f6",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-            "ndays": "1",
+            "ndays": str(days),
             "iscr": "0",
             "iscca": "0",
         }
     )
     url = f"http://push2his.eastmoney.com/api/qt/stock/trends2/get?{qs}"
-    body = _http_get(url, headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}, timeout=3)
+    try:
+        body = _http_get(url, headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}, timeout=3)
+    except Exception:
+        _EM_HIS_FAIL_AT = time.time()
+        raise
     payload = json.loads(body)
     rows = (payload.get("data") or {}).get("trends") or []
     if not rows:
@@ -283,10 +315,8 @@ def eastmoney_intraday(code: str) -> dict:
     if df.empty:
         raise ValueError("Eastmoney 分时无有效时间字段")
     latest = df["dt"].iloc[-1].date()
-    df = df[df["dt"].dt.date == latest]
-    now = now_cst()
-    if latest == now.date():
-        df = df[df["dt"] <= now]
+    trade_dates = df["dt"].dt.date.drop_duplicates().tail(days)
+    df = df[df["dt"].dt.date.isin(trade_dates) & (df["dt"] <= now_cst())]
     hhmm = df["dt"].dt.strftime("%H:%M")
     df = df[(hhmm >= "09:30") & (hhmm <= "15:00")]
     if df.empty:
@@ -295,9 +325,9 @@ def eastmoney_intraday(code: str) -> dict:
     df = df.set_index("dt")
     bucket = df.resample("5min", label="left", closed="left")
     agg = bucket.agg(price=("price", "last"), volume=("volume", "sum")).dropna(subset=["price"])
-    agg["time"] = agg.index.strftime("%H:%M")
-    cum_p5 = (agg["price"] * agg["volume"]).cumsum()
-    cum_v5 = agg["volume"].cumsum()
+    agg["time"] = agg.index.strftime("%m-%d %H:%M" if days > 1 else "%H:%M")
+    cum_p5 = (agg["price"] * agg["volume"]).groupby(agg.index.date).cumsum()
+    cum_v5 = agg["volume"].groupby(agg.index.date).cumsum()
     agg["avg"] = [
         round(float(cp / cv), 2) if cv > 0 else round(float(pr), 2)
         for cp, cv, pr in zip(cum_p5, cum_v5, agg["price"])
@@ -311,6 +341,7 @@ def eastmoney_intraday(code: str) -> dict:
     return {
         "data": out,
         "trading_date": str(latest),
+        "trading_days": len(set(agg.index.date)),
         "provenance": {
             "source": "eastmoney-direct",
             "endpoint": "push2his.eastmoney.com/api/qt/stock/trends2/get",
@@ -327,7 +358,7 @@ def eastmoney_intraday(code: str) -> dict:
 _HQ_RE = re.compile(r'="([^"]*)"')
 
 
-def sina_realtime(code: str) -> dict:
+def sina_realtime(code: str, *, index: bool = False) -> dict:
     """Sina 实时快照（前端 Stock 形状，source='sina'）。
 
     hq.sinajs.cn 返回 GBK 文本：var hq_str_sh600519="名称,今开,昨收,最新,最高,最低,...,成交量(股),成交额(元),...,日期,时间,...";
@@ -336,7 +367,7 @@ def sina_realtime(code: str) -> dict:
     需要 Referer + User-Agent，否则 403/空。只取映射确定的字段，绝不臆造。
     """
     raw = normalize_ticker(code)
-    sym = _sina_symbol(raw)
+    sym = _index_symbol(code) if index else _sina_symbol(raw)
     import urllib.request as _u
 
     url = f"http://hq.sinajs.cn/list={sym}"
@@ -379,11 +410,13 @@ def sina_realtime(code: str) -> dict:
     change_pct = (change / prev_close * 100.0) if prev_close else 0.0
     vol_shares = _f(parts[8])
     amount = _f(parts[9])
+    if open_p <= 0 and high <= 0 and low <= 0 and vol_shares <= 0 and amount <= 0:
+        raise ValueError(f"Sina 盘前清空态（{sym}），尚无有效成交数据")
     trading_date = parts[30].strip()
     trading_time = parts[31].strip()
 
     return {
-        "code": to_market_ticker(raw),
+        "code": to_market_ticker(code if index else raw),
         "name": name,
         "exchange": _classify_exchange(raw),
         "price": round(price, 3),
@@ -395,6 +428,7 @@ def sina_realtime(code: str) -> dict:
         "prevClose": prev_close,
         "volume": _fmt_volume(vol_shares / 100.0),  # 股 → 手
         "turnover": _fmt_amount(amount),
+        "amount": amount,
         "marketCap": "—",  # Sina hq 无市值字段，诚实留空
         "pe": 0.0,
         "pb": 0.0,
@@ -412,10 +446,10 @@ def sina_realtime(code: str) -> dict:
     }
 
 
-def tencent_realtime(code: str) -> dict:
+def tencent_realtime(code: str, *, index: bool = False) -> dict:
     """Tencent qt.gtimg.cn 实时快照，国内免费兜底源。"""
     raw = normalize_ticker(code)
-    sym = _sina_symbol(raw)
+    sym = _index_symbol(code) if index else _sina_symbol(raw)
     import urllib.request as _u
 
     req = _u.Request(
@@ -438,9 +472,12 @@ def tencent_realtime(code: str) -> dict:
     trading_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}" if len(ts) >= 8 else ""
     trading_time = f"{ts[8:10]}:{ts[10:12]}:{ts[12:14]}" if len(ts) >= 14 else ""
     amount_yuan = _n(parts[37]) * 10000.0
+    raw_vol = _n(parts[36])
+    # 科创板（688xxx）腾讯 qt.gtimg.cn parts[36] 返回股数而非手数，需折算为手（/100）
+    vol_hand = (raw_vol / 100.0) if (not index and raw.startswith("688")) else raw_vol
 
     return {
-        "code": to_market_ticker(raw),
+        "code": to_market_ticker(code if index else raw),
         "name": parts[1].strip(),
         "exchange": _classify_exchange(raw),
         "price": price,
@@ -450,8 +487,9 @@ def tencent_realtime(code: str) -> dict:
         "high": _n(parts[33]),
         "low": _n(parts[34]),
         "prevClose": prev_close,
-        "volume": _fmt_volume(_n(parts[36])),
+        "volume": _fmt_volume(vol_hand),
         "turnover": _fmt_amount(amount_yuan),
+        "amount": amount_yuan,
         "marketCap": _fmt_amount(_n(parts[45]) * 1e8) if (len(parts) > 45 and _n(parts[45]) > 0) else "—",
         "pe": _n(parts[39]) if len(parts) > 39 else 0.0,
         "pb": _n(parts[46]) if len(parts) > 46 else 0.0,
@@ -469,12 +507,12 @@ def tencent_realtime(code: str) -> dict:
     }
 
 
-def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
+def tencent_kline(code: str, n: int = 60, adjust: str = "qfq", *, index: bool = False) -> dict:
     """Tencent qfq/hfq/day K line, domestic free fallback."""
     raw = normalize_ticker(code)
-    sym = _sina_symbol(raw)
+    sym = _index_symbol(code) if index else _sina_symbol(raw)
     key, fq = {"qfq": ("qfqday", "qfq"), "hfq": ("hfqday", "hfq"), "": ("day", "")}.get(adjust, ("qfqday", "qfq"))
-    fetch_n = max(1, int(n)) + 25
+    fetch_n = max(1, int(n)) + 59
     url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{fetch_n},{fq}"
     body = _http_get(
         url,
@@ -485,16 +523,19 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     if payload.get("code") != 0:
         raise ValueError(f"Tencent K线响应异常：{payload.get('msg')}")
     rows = (((payload.get("data") or {}).get(sym) or {}).get(key) or [])[-fetch_n:]
-    # v1.6.3（B3）：北交所符号腾讯只回 'day' 键（不复权），即便请求了 qfq/hfq。
+    # 1) 上市以来从未分红送转的标的（如部分科创板 688xxx）腾讯 fqkline 仅返回 'day' 键（此时前/后复权与不复权完全等价）；
+    # 2) 北交所符号腾讯也只回 'day' 键（不复权），需标注 bj_unadjusted。
     bj_unadjusted = False
-    if not rows and key != "day" and raw.startswith(BJ_PREFIXES):
+    if not rows and key != "day":
         rows = (((payload.get("data") or {}).get(sym) or {}).get("day") or [])[-fetch_n:]
-        bj_unadjusted = True
+        if rows and raw.startswith(BJ_PREFIXES):
+            bj_unadjusted = True
     if not rows:
         raise ValueError("Tencent 日K 空数据")
 
     import pandas as pd
 
+    vol_scale = 0.01 if (not index and raw.startswith("688")) else 1.0
     parsed = []
     for r in rows:
         if len(r) < 6:
@@ -506,7 +547,7 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "close": _n(r[2]),
                 "high": _n(r[3]),
                 "low": _n(r[4]),
-                "volume": int(_n(r[5])),
+                "volume": int(round(_n(r[5]) * vol_scale)),
             }
         )
     if not parsed:
@@ -515,6 +556,7 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
     df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
@@ -529,6 +571,7 @@ def tencent_kline(code: str, n: int = 60, adjust: str = "qfq") -> dict:
                 "ma5": _opt_n(r["ma5"]),
                 "ma10": _opt_n(r["ma10"]),
                 "ma20": _opt_n(r["ma20"]),
+                "ma60": _opt_n(r["ma60"]),
             }
         )
     return {
@@ -554,7 +597,7 @@ def sina_kline(code: str, n: int = 60) -> dict:
     """Sina 日 K（不复权）。返回与 akshare kline 同构的 {data:[...], provenance}。"""
     raw = normalize_ticker(code)
     sym = _sina_symbol(raw)
-    fetch_n = max(1, int(n)) + 25
+    fetch_n = max(1, int(n)) + 59
     qs = urlencode({"symbol": sym, "scale": 240, "ma": "no", "datalen": fetch_n})
     url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?{qs}"
     headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0 JingYuan/1.0"}
@@ -572,6 +615,7 @@ def sina_kline(code: str, n: int = 60) -> dict:
     df["ma5"] = df["close"].rolling(5).mean()
     df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
     df = df.tail(int(n)).reset_index(drop=True)
     out = []
     for _, r in df.iterrows():
@@ -586,6 +630,7 @@ def sina_kline(code: str, n: int = 60) -> dict:
                 "ma5": _opt_n(r.get("ma5")),
                 "ma10": _opt_n(r.get("ma10")),
                 "ma20": _opt_n(r.get("ma20")),
+                "ma60": _opt_n(r.get("ma60")),
             }
         )
     return {

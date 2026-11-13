@@ -161,12 +161,26 @@ async def t_create_research_reuse_window():
         s.add(ResearchTask(id="fresh-pending", code="000999.SZ", template="risk", status="pending"))
         await s.commit()
         # 模拟刚写入：SQLite 侧 updated_at 由 server_default 生成（naive-UTC，几秒前）——正是生产形态
-    r = await create_research(ResearchRequest(code="000999.SZ", template="risk"))
-    check(r.get("reused") is True and r["task_id"] == "fresh-pending",
-          f"30s 内重复提交复用 pending 任务（实际 {r}）")
-    async with session_scope() as s:
-        row = await s.get(ResearchTask, "fresh-pending")
-        check(row.status == "pending", "复用时任务未被改判 error")
+    async def blocked_fixture(**_):
+        await asyncio.Event().wait()
+        if False:
+            yield ""
+
+    original = routes.run_research_direct
+    routes.run_research_direct = blocked_fixture
+    try:
+        r = await create_research(ResearchRequest(code="000999.SZ", template="risk"))
+        check(r.get("reused") is True and r["task_id"] == "fresh-pending",
+              f"30s 内重复提交复用 pending 任务（实际 {r}）")
+        async with session_scope() as s:
+            row = await s.get(ResearchTask, "fresh-pending")
+            check(row.status in ("pending", "running"), "复用时任务未被改判 error")
+        runtime = routes._RESEARCH_RUNS["fresh-pending"]
+        check(runtime.task is not None, "提交时已建立后台任务，无需打开 SSE")
+        runtime.task.cancel()
+        await asyncio.gather(runtime.task, return_exceptions=True)
+    finally:
+        routes.run_research_direct = original
 
 
 async def t_chat_compliance_gate_and_guard():

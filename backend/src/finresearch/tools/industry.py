@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -30,29 +32,126 @@ _LEVELS = (
     ("申万二级", "sw_index_second_info"),
     ("申万三级", "sw_index_third_info"),
 )
+_LEGU_DIV_MAP = {
+    "sw_index_first_info": ("申万一级", "level1Items"),
+    "sw_index_second_info": ("申万二级", "level2Items"),
+    "sw_index_third_info": ("申万三级", "level3Items"),
+}
+_LEGU_LOCK = threading.Lock()
+_LEGU_URL = "https://legulegu.com/stockdata/sw-industry-overview"
+
+
+def _parse_legu_div(soup, div_id: str, level_name: str) -> list[dict]:
+    container = soup.find(name="div", attrs={"id": div_id})
+    if container is None:
+        return []
+    code_raw = container.find_all(name="div", attrs={"class": "lg-industries-item-chinese-title"})
+    name_raw = container.find_all(name="div", attrs={"class": "lg-industries-item-number"})
+    value_raw = container.find_all(name="div", attrs={"class": "lg-sw-industries-item-value"})
+    n = min(len(code_raw), len(name_raw), len(value_raw))
+    out: list[dict] = []
+    for idx in range(n):
+        c_item = code_raw[idx]
+        n_item = name_raw[idx]
+        v_item = value_raw[idx]
+        code = _s(c_item.get_text())
+        n_text = _s(n_item.get_text())
+        name = n_text.split("(", 1)[0].strip() if "(" in n_text else n_text
+        num_str = n_text.split("(", 1)[1].split(")", 1)[0] if "(" in n_text and ")" in n_text else "0"
+        parent = ""
+        span = n_item.find("span")
+        if span is not None:
+            sp_txt = _s(span.get_text()).strip("[]（）() ")
+            parent = sp_txt.split("(", 1)[0].split("（", 1)[0].strip("[]（）() ")
+        vals = [s.get_text().strip() for s in v_item.find_all("span", attrs={"class": "value"})]
+        out.append({
+            "level": level_name,
+            "code": code,
+            "name": name,
+            "parent": parent,
+            "constituents": _i(num_str),
+            "pe_static": _f(vals[0] if len(vals) > 0 else None),
+            "pe_ttm": _f(vals[1] if len(vals) > 1 else None),
+            "pb": _f(vals[2] if len(vals) > 2 else None),
+            "dividend_yield": _f(vals[3] if len(vals) > 3 else None),
+        })
+    return out
+
+
+def _populate_all_levels_from_legu(retries: int = 2) -> bool:
+    """单次请求拉取乐咕乐股申万一级/二级/三级全表并同时写入缓存。
+
+    根因修复：ak.sw_index_first_info / second_info / third_info 底层全部抓取同一个 1.16MB HTML 页面
+    (https://legulegu.com/stockdata/sw-industry-overview)，分别解析 #level1Items / #level2Items /
+    #level3Items。旧实现用 3 线程同时打同一 URL 3 次，极易触发对端限流/截断返回，导致后半页的
+    申万二级/三级报 `'NoneType' object has no attribute 'find_all'`。
+    改为加锁使用 requests（自动启用 gzip 压缩传输，~0.9s）单次拉取同页解析三层，彻底消除并发自撞与截断。
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    from .market_provider import configure_market_network
+
+    with _LEGU_LOCK:
+        if all(slow_cache.get(f"sw_industry:{fn}") is not None for _, fn in _LEVELS):
+            return True
+        configure_market_network()
+        html_text = ""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+            ),
+        }
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.get(_LEGU_URL, headers=headers, timeout=8)
+                resp.raise_for_status()
+                html_text = resp.text
+                if "level1Items" in html_text and "level2Items" in html_text and "level3Items" in html_text:
+                    break
+            except Exception as e:  # noqa: BLE001
+                logger.debug("申万行业全表直连尝试 %d 失败：%s", attempt + 1, e)
+                if attempt < retries:
+                    _time.sleep(0.5)
+        if not html_text:
+            return False
+        soup = BeautifulSoup(html_text, features="lxml")
+        ok_count = 0
+        for fn_name, (lv_name, div_id) in _LEGU_DIV_MAP.items():
+            parsed = _parse_legu_div(soup, div_id, lv_name)
+            if parsed:
+                slow_cache.set(f"sw_industry:{fn_name}", parsed, ttl=1800)
+                ok_count += 1
+        return ok_count == len(_LEVELS)
 
 
 def _rows(level_name: str, fn_name: str, retries: int = 2) -> list:
-    """取单个层级的全部行业行。整表按层级缓存——同一次研究里多次搜索共享。
-
-    带重试：新浪的申万接口不稳，单次失败率不低（实测三层里常有一两层 RemoteDisconnected）。
-    数据日频更新，一次拉稳、缓存 30 分钟远比每次赌运气值——不重试的话行业命中数会飘忽
-    （同一查询时而 5 个时而 1 个），甚至误报"无匹配行业"。
-    """
+    """取单个层级的全部行业行。整表按层级缓存——同一次研究里多次搜索共享。"""
     cache_key = f"sw_industry:{fn_name}"
     cached = slow_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    import time as _time
-
     import akshare as ak
+
+    if getattr(ak, "__file__", None):
+        try:
+            _populate_all_levels_from_legu(retries=retries)
+            cached = slow_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        except Exception as e:  # noqa: BLE001
+            logger.debug("申万单页三层同解失败，回退 AkShare：%s", e)
 
     last_err: Optional[Exception] = None
     df = None
     for attempt in range(retries + 1):
         try:
-            df = getattr(ak, fn_name)()
+            with _LEGU_LOCK:
+                cached = slow_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+                df = getattr(ak, fn_name)()
             if df is not None and not df.empty:
                 break
         except Exception as e:  # noqa: BLE001
@@ -74,7 +173,6 @@ def _rows(level_name: str, fn_name: str, retries: int = 2) -> list:
             "pb": _f(r.get("市净率")),
             "dividend_yield": _f(r.get("静态股息率")),
         })
-    # 行业估值日频更新，缓存久一点（slow_cache 的 TTL 由调用方给）
     slow_cache.set(cache_key, out, ttl=1800)
     return out
 

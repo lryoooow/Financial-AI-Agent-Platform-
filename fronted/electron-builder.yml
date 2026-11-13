@@ -4,18 +4,15 @@ productName: JingYuan
 asar: false
 directories:
   output: release
-  buildResources: build
+  buildResources: electron/icons
 files:
   # Electron 外壳：主进程 + 预加载 + package.json（渲染进程由后端伺服，不进 Electron 包）
   - electron/**
   - package.json
   - "!**/node_modules/**"
-# Python 后端（PyInstaller onedir）随包发布到 resources/backend
-extraResources:
-  - from: ../backend/dist/FinResearch
-    to: backend
+# scripts/package_desktop.cjs sets the path to the freshly built sidecar.
 win:
-  icon: build/icon.ico
+  icon: electron/icon.ico
   target:
     - target: nsis
       arch: [x64]
@@ -23,14 +20,28 @@ win:
       arch: [x64]
 nsis:
   oneClick: false
-  perMachine: true
+  perMachine: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: 景渊 JingYuan
-  installerIcon: build/icon.ico
-  uninstallerIcon: build/icon.ico
+  installerIcon: electron/icon.ico
+  uninstallerIcon: electron/icon.ico
   # 产物名与 README 下载表一致（默认是 "JingYuan Setup x.y.z.exe" 带空格）
   artifactName: JingYuan-Setup-${version}.${ext}
 portable:
   artifactName: JingYuan-Portable-${version}.${ext}
+mac:
+  icon: electron/icons/icon.icns
+  category: public.app-category.finance
+  darkModeSupport: true
+  hardenedRuntime: false
+  identity: "-"
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  artifactName: JingYuan-${version}-mac-${arch}-portable.${ext}
+dmg:
+  artifactName: JingYuan-${version}-mac-${arch}.${ext}

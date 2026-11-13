@@ -3,9 +3,6 @@ import {
   Archive,
   ArchiveRestore,
   Bot,
-  Brain,
-  Check,
-  ChevronDown,
   Image as ImageIcon,
   Loader2,
   MessageSquare,
@@ -19,9 +16,15 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import { api, isReasoningModelLike, type ChatConversation, type ChatMessage, type LlmConfig } from "../../api/client";
+import { api, isReasoningModelLike, type ChatConversation, type ChatMessage, type LlmConfig, type ToolInvocation, type ToolArtifact, type HumanApproval } from "../../api/client";
 import { ModelPicker } from "../ModelPicker";
-import { StructuredText } from "../../lib/markdown";
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { useConfirm } from "../ui/confirm";
+import { isImeKeyEvent } from "../../lib/ime";
+import { ChatReasoning } from "../chat/ChatReasoning";
+import { ChatToolCalls } from "../chat/ChatToolCalls";
+import { ArtifactDrawer } from "../chat/ArtifactDrawer";
+import { StructuredText, toolCitations } from "../../lib/markdown";
 import { ResearchCard } from "../research/ResearchCard";
 
 /** 图片压缩：canvas 限宽 maxWidth=1280、限高 maxHeight=4096（长财报/长表格截图不压扁宽度导致字迹模糊）。 */
@@ -76,33 +79,6 @@ function Typewriter({ text, className }: { text: string; className?: string }) {
   );
 }
 
-/** v1.7.0：思维链折叠面板（仅流式期间的瞬态展示——不进 messages、不落库）。
- *  端点不流式思维链（o 系风格）时无 reasoning 文本，此面板不出现，退回打字机动效。 */
-function ThinkingPanel({ text, secs, live }: { text: string; secs: number; live: boolean }) {
-  const [open, setOpen] = useState(false);
-  const preview = text.length > 80 ? "…" + text.slice(-80) : text;
-  return (
-    <div className="mb-2 rounded-lg border border-border/60 bg-secondary/30">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground"
-        title={open ? "收起思考过程" : "展开思考过程"}
-      >
-        <Brain className={`size-3 shrink-0 ${live ? "text-gold animate-pulse" : ""}`} />
-        <span className="shrink-0">{live ? "思考中" : "已思考"} {secs}s</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-muted-foreground/60">{preview}</span>
-        <ChevronDown className={`size-3 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
-      </button>
-      {open && (
-        <div className="max-h-48 overflow-y-auto whitespace-pre-wrap border-t border-border/40 px-2.5 pb-2 pt-1.5 text-[11px] leading-relaxed text-muted-foreground/80">
-          {text}
-        </div>
-      )}
-    </div>
-  );
-}
-
 interface ActiveModel { provider: string; model: string; accent: string; }
 
 export function ChatDesk({
@@ -118,6 +94,12 @@ export function ChatDesk({
   draftPrompt?: { text: string; nonce: number } | null;
   onReportGenerated?: (r: { id: string; name: string; code: string; template: string; date: string; summary: string }) => void;
 }) {
+  const confirm = useConfirm();
+  const [artifact, setArtifact] = useState<ToolArtifact | null>(null);
+  const [chatArtifacts, setChatArtifacts] = useState<ToolArtifact[]>([]);
+  const [handledApprovals, setHandledApprovals] = useState<Set<string>>(() => new Set());
+  const [editedSymbol, setEditedSymbol] = useState("");
+  const [editingApproval, setEditingApproval] = useState("");
   const [notice, setNotice] = useState("");
   const [conversations, setConversations] = useState<ChatConversation[]>([]);
   const [current, setCurrent] = useState<ChatConversation | null>(null);
@@ -129,7 +111,7 @@ export function ChatDesk({
   const [showArchived, setShowArchived] = useState(false);
   const [stage, setStage] = useState("");
   const [streamingId, setStreamingId] = useState<string | null>(null);
-  const [chatTools, setChatTools] = useState<{ name: string; label: string; status: "start" | "ok" | "error" }[]>([]);
+  const [chatTools, setChatTools] = useState<ToolInvocation[]>([]);
   // v1.7.0：思维链瞬态展示（reasoning SSE）——不进 messages、不落库，流结束即清。
   const [reasoning, setReasoning] = useState("");          // CoT 文本（尾部 6000 字截断，防长 CoT 撑爆渲染）
   const [thinkSecs, setThinkSecs] = useState(0);           // 已等待秒数
@@ -144,7 +126,8 @@ export function ChatDesk({
 
   useEffect(() => {
     activeConvIdRef.current = current?.id ?? null;
-  }, [current]);
+    setArtifact(null);
+  }, [current?.id]);
 
   const handledDraftNonceRef = useRef(0);
   useEffect(() => {
@@ -168,7 +151,7 @@ export function ChatDesk({
 
   useEffect(() => {
     if (!lightbox) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setLightbox(null); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !isImeKeyEvent(e)) setLightbox(null); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [lightbox]);
@@ -253,7 +236,7 @@ export function ChatDesk({
   }
 
   async function deleteConversation(c: ChatConversation) {
-    if (!window.confirm(`确定删除「${c.title || "新对话"}」及其全部本地历史吗？`)) return;
+    if (!await confirm("删除对话", "将删除「" + (c.title || "新对话") + "」及其本地历史。")) return;
     setError("");
     // v1.6.0（审计 C1）：删除正在流式的对话先停流，避免 done 回调把已删会话写回状态
     if (current?.id === c.id) stopRef.current?.abort();
@@ -282,6 +265,7 @@ export function ChatDesk({
     setLoading(true);
     setStage("正在理解问题");
     setChatTools([]);
+    setChatArtifacts([]);
     const optimistic: ChatMessage = {
       id: `local-${Date.now()}`,
       role: "user",
@@ -324,8 +308,17 @@ export function ChatDesk({
     }, 5_000);
     const onVisible = () => { if (!document.hidden) lastAct = Date.now(); };
     document.addEventListener("visibilitychange", onVisible);
-    // v1.7.0：已等待秒数计时（与看门狗同生命周期，finally 统一清理）
-    const thinkTimer = window.setInterval(() => setThinkSecs((s) => s + 1), 1_000);
+    // v1.7.0：已等待秒数计时（一旦正文开始流出且不在新一轮 CoT 中则暂停累加，与后端 TurnTranscript 口径一致）
+    let thinkingPaused = false;
+    let latestTools: ToolInvocation[] = [];
+    let latestArtifacts: ToolArtifact[] = [];
+    let latestReasoning = "";
+    let latestThinkSecs = 0;
+    const thinkTimer = window.setInterval(() => {
+      if (thinkingPaused) return;
+      latestThinkSecs += 1;
+      setThinkSecs(latestThinkSecs);
+    }, 1_000);
     let streamOpened = false;
     try {
       let conv = current;
@@ -349,27 +342,38 @@ export function ChatDesk({
           streamOpened = true;
           if (isStale()) return;
           lastAct = Date.now();
-          setChatTools((prev) => {
-            if (ev.status === "start") {
-              return [...prev, { name: ev.name, label: ev.label || ev.name, status: "start" }];
-            }
-            const next = [...prev];
-            for (let i = next.length - 1; i >= 0; i--) {
-              if (next[i].name === ev.name && next[i].status === "start") {
-                next[i] = { ...next[i], status: ev.status };
-                return next;
-              }
-            }
+          thinkingPaused = false;
+          setChatTools((previous) => {
+            const match = previous.findIndex((call) =>
+              ev.call_id ? call.call_id === ev.call_id : call.name === ev.name && call.status === "start"
+            );
+            const next = match < 0 ? [...previous, ev] : previous.map((call, index) => index === match ? { ...call, ...ev } : call);
+            latestTools = next;
             return next;
           });
+        },
+        onArtifact: (event) => {
+          streamOpened = true;
+          if (!isStale()) {
+            setChatArtifacts((current) => {
+              const next = [...current, event];
+              latestArtifacts = next;
+              return next;
+            });
+          }
         },
         onReasoning: (piece) => {
           streamOpened = true;
           if (isStale()) return;
           // 思维链活跃 = 真实的看门狗续命信号（比 stage 心跳更强的证据），且面板置 live
           lastAct = Date.now();
+          thinkingPaused = false;
           setReasoningLive(true);
-          setReasoning((r) => (r + piece).slice(-6000));
+          setReasoning((r) => {
+            const next = (r + piece).slice(-6000);
+            latestReasoning = next;
+            return next;
+          });
         },
         onCompacted: (info) => {
           streamOpened = true;
@@ -381,6 +385,7 @@ export function ChatDesk({
           streamOpened = true;
           if (isStale()) return;
           lastAct = Date.now();
+          thinkingPaused = true;
           setReasoningLive(false); // 正文开始流：折叠思考面板（下一轮工具调用的 CoT 会再点亮）
           setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
         },
@@ -396,7 +401,7 @@ export function ChatDesk({
           streamOpened = true;
           if (isStale()) return;
           setError(msg);
-          setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
+          setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content && !latestTools.length)));
           setStreamingId(null);
         },
       });
@@ -405,7 +410,7 @@ export function ChatDesk({
       const stale = isStale();
       const isAbort = (e as DOMException)?.name === "AbortError" || (e as Error)?.message === "模型长时间无输出";
       if (isAbort) {
-        // 用户停止/看门狗：已生成部分保留（后端会把部分回复落库并标注「生成中断」）
+        // 用户停止/看门狗：已生成部分及已执行的工具轨迹保留在当前气泡上
         if (!stale) setError("已停止生成");
       } else if (!stale) {
         setError(e instanceof Error ? e.message : String(e));
@@ -418,8 +423,22 @@ export function ChatDesk({
           if (imgs.length) setPendingImages((cur) => (cur.length ? cur : imgs));
         }
       } else {
-        // 后端在流开始时已持久化用户消息：只移除空的助手占位
-        setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content)));
+        // 后端在流开始时已持久化用户消息：若有部分正文或工具轨迹则挂回气泡，否则移除空占位
+        setMessages((m) =>
+          m
+            .map((x) =>
+              x.id === assistantId && (x.content || latestTools.length)
+                ? {
+                    ...x,
+                    tool_invocations: latestTools.length ? latestTools.map((t) => (t.status === "start" ? { ...t, status: "aborted" as const } : t)) : x.tool_invocations,
+                    artifacts: latestArtifacts.length ? latestArtifacts : x.artifacts,
+                    reasoning_summary: latestReasoning || x.reasoning_summary,
+                    thinking_elapsed_ms: latestThinkSecs * 1000 || x.thinking_elapsed_ms,
+                  }
+                : x,
+            )
+            .filter((x) => !(x.id === assistantId && !x.content && !latestTools.length)),
+        );
       }
       setStreamingId(null);
     } finally {
@@ -431,7 +450,196 @@ export function ChatDesk({
       setLoading(false);
       setStage("");
       setChatTools([]);
+      setChatArtifacts([]);
       // 思维链面板随流结束清空（done/error/中止/看门狗统一走这里）
+      setReasoning("");
+      setThinkSecs(0);
+      setReasoningLive(false);
+    }
+  }
+
+  async function resume(approval: HumanApproval, action: "approve" | "edit" | "reject", symbol: string) {
+    if (!current || sendingRef.current) return;
+    const conversationId = current.id;
+    const isStale = () => activeConvIdRef.current !== conversationId;
+    const controller = new AbortController();
+    stopRef.current = controller;
+    sendingRef.current = true;
+    stickToBottomRef.current = true;
+    setLoading(true);
+    setError("");
+    setChatTools([]);
+    setChatArtifacts([]);
+    setReasoning("");
+    setThinkSecs(0);
+    setReasoningLive(false);
+
+    const markApprovalStatus = (status: "approved" | "rejected") => {
+      setHandledApprovals((prior) => new Set(prior).add(approval.checkpoint_id));
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.approval?.checkpoint_id === approval.checkpoint_id
+            ? { ...m, approval: { ...m.approval, status } }
+            : m,
+        ),
+      );
+    };
+
+    if (approval.kind === "batch_research") {
+      try {
+        const result = await api.approveBatch(conversationId, approval.checkpoint_id, action, symbol);
+        markApprovalStatus(action === "reject" ? "rejected" : "approved");
+        setNotice(action === "reject" ? "已取消批量研究。" : "已排入 " + (result.task_ids?.length || 0) + " 项深度研究。");
+        setEditingApproval("");
+        setEditedSymbol("");
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        if (stopRef.current === controller) stopRef.current = null;
+        sendingRef.current = false;
+        setLoading(false);
+      }
+      return;
+    }
+
+    const assistantId = action === "reject" ? "" : `resume-${Date.now()}`;
+    if (assistantId) {
+      setStage("正在核验标的并继续分析");
+      setMessages((m) => [
+        ...m.map((item) =>
+          item.approval?.checkpoint_id === approval.checkpoint_id
+            ? { ...item, approval: { ...item.approval, status: "approved" as const } }
+            : item,
+        ),
+        { id: assistantId, role: "assistant", content: "", created_at: new Date().toISOString() },
+      ]);
+      setStreamingId(assistantId);
+    }
+
+    let thinkingPaused = false;
+    let latestTools: ToolInvocation[] = [];
+    let latestArtifacts: ToolArtifact[] = [];
+    let latestReasoning = "";
+    let latestThinkSecs = 0;
+    const thinkTimer = assistantId
+      ? window.setInterval(() => {
+          if (thinkingPaused) return;
+          latestThinkSecs += 1;
+          setThinkSecs(latestThinkSecs);
+        }, 1_000)
+      : null;
+
+    try {
+      await api.resumeChat(conversationId, approval.checkpoint_id, action, symbol, {
+        signal: controller.signal,
+        onStage: (_stage, label) => {
+          if (!isStale()) setStage(label);
+        },
+        onToolCall: (ev) => {
+          if (isStale()) return;
+          thinkingPaused = false;
+          setChatTools((previous) => {
+            const match = previous.findIndex((call) =>
+              ev.call_id ? call.call_id === ev.call_id : call.name === ev.name && call.status === "start"
+            );
+            const next = match < 0 ? [...previous, ev] : previous.map((call, index) => index === match ? { ...call, ...ev } : call);
+            latestTools = next;
+            return next;
+          });
+        },
+        onArtifact: (event) => {
+          if (!isStale()) {
+            setChatArtifacts((cur) => {
+              const next = [...cur, event];
+              latestArtifacts = next;
+              return next;
+            });
+          }
+        },
+        onReasoning: (piece) => {
+          if (isStale()) return;
+          thinkingPaused = false;
+          setReasoningLive(true);
+          setReasoning((r) => {
+            const next = (r + piece).slice(-6000);
+            latestReasoning = next;
+            return next;
+          });
+        },
+        onCompacted: (info) => {
+          if (!isStale()) {
+            setNotice(`较早的对话已自动压缩为要点摘要（第 ${info.generation} 次），后续回答基于摘要与最近几轮继续。`);
+          }
+        },
+        onToken: (piece) => {
+          if (isStale() || !assistantId) return;
+          thinkingPaused = true;
+          setReasoningLive(false);
+          setMessages((m) => m.map((x) => (x.id === assistantId ? { ...x, content: x.content + piece } : x)));
+        },
+        onDone: (payload) => {
+          refreshList(false).catch(() => {});
+          if (isStale()) return;
+          if (payload.conversation) setCurrent(payload.conversation);
+          if (payload.messages?.length) setMessages(payload.messages);
+          else if (action === "reject") markApprovalStatus("rejected");
+          setStreamingId(null);
+        },
+        onError: (msg) => {
+          if (isStale()) return;
+          setError(msg);
+          if (assistantId) {
+            setMessages((m) => m.filter((x) => !(x.id === assistantId && !x.content && !latestTools.length)));
+          }
+          setStreamingId(null);
+        },
+      });
+      markApprovalStatus(action === "reject" ? "rejected" : "approved");
+      if (action === "reject" && !isStale()) {
+        api.chatConversation(conversationId)
+          .then((r) => {
+            if (!isStale()) {
+              setCurrent(r.conversation);
+              setMessages(r.messages);
+            }
+          })
+          .catch(() => {});
+      }
+      setEditingApproval("");
+      setEditedSymbol("");
+    } catch (cause) {
+      const isAbort = controller.signal.aborted || (cause as DOMException)?.name === "AbortError";
+      if (!isAbort && !isStale()) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } else if (isAbort && !isStale()) {
+        setError("已停止生成");
+      }
+      if (assistantId) {
+        setMessages((m) =>
+          m
+            .map((x) =>
+              x.id === assistantId && (x.content || latestTools.length)
+                ? {
+                    ...x,
+                    tool_invocations: latestTools.length ? latestTools.map((t) => (t.status === "start" ? { ...t, status: "aborted" as const } : t)) : x.tool_invocations,
+                    artifacts: latestArtifacts.length ? latestArtifacts : x.artifacts,
+                    reasoning_summary: latestReasoning || x.reasoning_summary,
+                    thinking_elapsed_ms: latestThinkSecs * 1000 || x.thinking_elapsed_ms,
+                  }
+                : x,
+            )
+            .filter((x) => !(x.id === assistantId && !x.content && !latestTools.length)),
+        );
+      }
+      setStreamingId(null);
+    } finally {
+      if (thinkTimer !== null) window.clearInterval(thinkTimer);
+      if (stopRef.current === controller) stopRef.current = null;
+      sendingRef.current = false;
+      setLoading(false);
+      setStage("");
+      setChatTools([]);
+      setChatArtifacts([]);
       setReasoning("");
       setThinkSecs(0);
       setReasoningLive(false);
@@ -447,8 +655,8 @@ export function ChatDesk({
   const canSend = (!!input.trim() || pendingImages.length > 0) && !loading && !readOnly;
 
   return (
-    <div className="h-full min-h-0 grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4 p-5 overflow-hidden">
-      <aside className="rounded-xl border border-border bg-card max-h-44 lg:max-h-none min-h-0 flex flex-col">
+    <div className="h-full min-h-0 grid grid-cols-[minmax(150px,215px)_minmax(0,1fr)] overflow-hidden">
+      <aside className="border-r bg-card min-h-0 flex flex-col">
         <div className="p-3 border-b border-border space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-sm">
@@ -520,7 +728,9 @@ export function ChatDesk({
         </div>
       </aside>
 
-      <section className="rounded-xl border border-border bg-card min-h-0 flex flex-col overflow-hidden">
+      <PanelGroup direction="horizontal" className="min-w-0 min-h-0">
+      <Panel minSize={45}>
+      <section className="h-full min-h-0 flex flex-col overflow-hidden bg-background">
         <div className="p-3 border-b border-border flex items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="truncate text-sm">{current?.title || (showArchived ? "归档对话" : "投研问答")}</div>
@@ -597,7 +807,13 @@ export function ChatDesk({
                     <FlaskConical className="size-4" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <ResearchCard research={m.research} onDone={onReportGenerated} />
+                    <ResearchCard
+                      research={m.research}
+                      initialStatus={m.research.status}
+                      initialReportId={m.research.report_id}
+                      initialError={m.research.error}
+                      onDone={onReportGenerated}
+                    />
                   </div>
                 </div>
               );
@@ -612,33 +828,39 @@ export function ChatDesk({
                   </div>
                 )}
                 <div className={`max-w-[78%] rounded-xl px-4 py-3 text-sm leading-relaxed ${
-                  m.role === "user" ? "bg-gold text-[#17140a]" : "bg-secondary/50 text-foreground/90"
+                  m.role === "user" ? "bg-action text-gold-foreground" : "bg-secondary/50 text-foreground/90"
                 }`}>
                   {m.role === "assistant" ? (
                     <>
-                      {/* v1.7.0：思维链面板——正文未出或新一轮 CoT 进行中时显示（带已等待秒数） */}
-                      {isStreaming && reasoning && (showThinking || reasoningLive) && (
-                        <ThinkingPanel text={reasoning} secs={thinkSecs} live={reasoningLive} />
-                      )}
-                      {isStreaming && chatTools.length > 0 && (
-                        <div className="mb-2 flex flex-wrap gap-1.5">
-                          {chatTools.map((tc, ti) => (
-                            <span
-                              key={`${tc.name}-${ti}`}
-                              className="inline-flex items-center gap-1 rounded-md border border-border/60 bg-background/60 px-2 py-0.5 text-[11px] text-muted-foreground"
-                            >
-                              {tc.status === "start" ? (
-                                <Loader2 className="size-3 animate-spin text-gold" />
-                              ) : tc.status === "ok" ? (
-                                <Check className="size-3 text-down" />
-                              ) : (
-                                <X className="size-3 text-up" />
-                              )}
-                              <span>{tc.label}</span>
-                            </span>
-                          ))}
-                        </div>
-                      )}
+                      {(isStreaming ? reasoning : m.reasoning_summary) && <ChatReasoning
+                        text={(isStreaming ? reasoning : m.reasoning_summary) || ""}
+                        elapsedMs={isStreaming ? thinkSecs * 1000 : m.thinking_elapsed_ms || 0}
+                        live={isStreaming && reasoningLive}
+                      />}
+                      {!!(isStreaming ? chatTools : m.tool_invocations)?.length && <ChatToolCalls
+                        calls={(isStreaming ? chatTools : m.tool_invocations) || []}
+                        artifacts={(isStreaming ? chatArtifacts : m.artifacts) || []}
+                        onOpen={setArtifact}
+                      />}
+                      {m.approval && (!m.approval.status || m.approval.status === "pending") && !handledApprovals.has(m.approval.checkpoint_id) && !readOnly && <div className="my-2 flex flex-wrap gap-2">
+                        {m.approval.kind === "batch_research" ? <>
+                          <p className="w-full text-xs text-muted-foreground">{m.approval.candidates.map((candidate) => candidate.name).join("、")}</p>
+                          <button type="button" disabled={loading} className="rounded bg-action px-2 py-1 text-gold-foreground"
+                            onClick={() => void resume(m.approval!, "approve", "")}>提交全部</button>
+                        </> : m.approval.candidates.map((candidate) => <button key={candidate.code} type="button" disabled={loading}
+                          className="rounded border px-2 py-1 hover:bg-accent" onClick={() => void resume(m.approval!, "approve", candidate.code)}>
+                          {candidate.name} <span className="font-mono text-xs">{candidate.code}</span>
+                        </button>)}
+                        {editingApproval === m.approval.checkpoint_id ? <>
+                          <input aria-label="标的代码" value={editedSymbol} onChange={(e) => setEditedSymbol(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter" && !isImeKeyEvent(e.nativeEvent) && editedSymbol.trim()) void resume(m.approval!, "edit", editedSymbol); }}
+                            className="w-48 rounded border bg-input px-2" placeholder={m.approval.kind === "batch_research" ? "以逗号分隔原批次代码" : "标的代码"} />
+                          <button type="button" disabled={loading || !editedSymbol.trim()} className="rounded border px-2 py-1"
+                            onClick={() => void resume(m.approval!, "edit", editedSymbol)}>确认代码</button>
+                        </> : <button type="button" disabled={loading} className="rounded border px-2 py-1"
+                          onClick={() => { setEditingApproval(m.approval!.checkpoint_id); setEditedSymbol(""); }}>修改</button>}
+                        <button type="button" disabled={loading} className="rounded border px-2 py-1" onClick={() => void resume(m.approval!, "reject", "")}>取消</button>
+                      </div>}
                       {showThinking ? (
                       <div className="flex items-center gap-2 text-xs text-muted-foreground py-1">
                         <Sparkles className="size-3.5 text-gold animate-pulse" />
@@ -651,7 +873,7 @@ export function ChatDesk({
                       </div>
                     ) : (
                       <>
-                        <StructuredText content={m.content} />
+                        <StructuredText content={m.content} streaming={isStreaming} citations={toolCitations(isStreaming ? chatArtifacts : m.artifacts)} />
                         {isStreaming && (
                           <span className="inline-block w-1.5 h-4 -mb-0.5 ml-0.5 bg-gold animate-pulse rounded-sm align-middle" />
                         )}
@@ -777,7 +999,7 @@ export function ChatDesk({
                 }}
                 onDragOver={(e) => e.preventDefault()}
                 onKeyDown={(e) => {
-                  if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+                  if (e.key !== "Enter" || e.shiftKey || isImeKeyEvent(e.nativeEvent)) return;
                   e.preventDefault();
                   void send();
                 }}
@@ -799,7 +1021,7 @@ export function ChatDesk({
               <button
                 onClick={send}
                 disabled={!canSend}
-                className="grid place-items-center size-10 rounded-lg bg-gold text-[#17140a] hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                className="grid place-items-center size-10 rounded-lg bg-action text-gold-foreground hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
                 title="发送"
               >
                 {loading ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
@@ -808,6 +1030,14 @@ export function ChatDesk({
           </div>
         </div>
       </section>
+      </Panel>
+      {artifact && <>
+        <PanelResizeHandle className="w-1 bg-border hover:bg-action" />
+        <Panel defaultSize={34} minSize={23} maxSize={55}>
+          <ArtifactDrawer entry={artifact} onClose={() => setArtifact(null)} />
+        </Panel>
+      </>}
+      </PanelGroup>
 
       {/* 图片全屏预览 */}
       {lightbox && (

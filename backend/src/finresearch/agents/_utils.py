@@ -20,17 +20,21 @@ import logging
 import re
 import time
 
+from ..core.guardrails.errors import public_failure
+
 logger = logging.getLogger(__name__)
 
 # 外部行情/财报 IO 独立有界线程池（A-15）：避免慢请求超时后悬挂线程占满 asyncio 默认
 # ThreadPoolExecutor，拖慢共用 to_thread 的 SQLite / 知识库读写。
-_DATA_IO_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="fin-data-io")
+_DATA_IO_EXECUTOR = ThreadPoolExecutor(max_workers=24, thread_name_prefix="fin-data-io")
 _WIN_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"'<>|]+")
 _UNIX_PATH_RE = re.compile(r"(?:/(?:Users|home|var|tmp|etc|opt|usr)/[^\s\"'<>|]+)")
 
 
 def sanitize_err_text(msg: object) -> str:
     """脱敏外部异常文本：剥离本地文件路径与换行堆栈，避免流入 SSE / API / 工具输出。"""
+    if isinstance(msg, BaseException):
+        return public_failure(msg)
     s = str(msg or "").strip()
     if not s:
         return "unknown_error"
@@ -55,5 +59,6 @@ async def _timed_call(fn, *args, timeout: float = 8.0, label: str = "", fallback
         logger.warning("%s 超时（%ss）", label or getattr(fn, "__name__", "fn"), timeout)
         return fallback, int((time.perf_counter() - t) * 1000), "timeout"
     except Exception as e:  # noqa: BLE001
-        logger.warning("%s 失败：%s", label or getattr(fn, "__name__", "fn"), e)
-        return fallback, int((time.perf_counter() - t) * 1000), sanitize_err_text(e)
+        failure = public_failure(e)
+        logger.warning("%s 失败：%s", label or getattr(fn, "__name__", "fn"), failure)
+        return fallback, int((time.perf_counter() - t) * 1000), failure

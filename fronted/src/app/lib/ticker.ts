@@ -51,6 +51,9 @@ export async function resolveResearchTarget(
     } catch { /* ignore */ }
     return { code: codeLike, name: codeLike };
   }
-  const hits = await api.resolve(text, 1);
-  return hits.length ? { code: hits[0].code, name: hits[0].name } : null;
+  const hits = await api.resolve(text, 8);
+  const exact = hits.filter((hit) => hit.name.replace(/\s/g, "").toLowerCase() === text.replace(/\s/g, "").toLowerCase());
+  const candidates = exact.length ? exact : hits;
+  if (candidates.length > 1) throw new Error("请从下拉列表中确认具体标的。");
+  return candidates.length ? { code: candidates[0].code, name: candidates[0].name } : null;
 }

@@ -83,7 +83,7 @@ def _ensure() -> None:
                     cur.close()
 
         _maker = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
-        logger.info("DB 引擎已就绪：%s", url)
+        logger.info("DB 引擎已就绪：%s", "SQLite" if is_sqlite else "PostgreSQL")
     except Exception as e:  # noqa: BLE001
         logger.warning("DB 引擎创建失败，DB 功能降级为内存：%s", e)
         _engine = None
@@ -141,8 +141,16 @@ async def init_db() -> None:
             await _add_column_if_missing(conn, "research_task", "progress_events", "JSON")
             await _add_column_if_missing(conn, "research_task", "timings", "JSON")
             await _add_column_if_missing(conn, "research_task", "report_id", "VARCHAR(64)")
+            await _add_column_if_missing(conn, "report", "snapshot_json", "JSON")
             # v1.8.0：对话自动压缩代际
             await _add_column_if_missing(conn, "chat_context_summary", "generation", "INTEGER DEFAULT 0")
+            for column, ddl in (
+                ("clean_content", "TEXT"), ("reasoning_summary", "TEXT"),
+                ("thinking_elapsed_ms", "INTEGER"), ("agent_trace_json", "JSON"),
+                ("tool_invocations_json", "JSON"), ("artifacts_json", "JSON"),
+                ("turn_status", "VARCHAR(24) DEFAULT 'completed'"),
+            ):
+                await _add_column_if_missing(conn, "chat_delta", column, ddl)
         logger.info("DB 表已就绪（create_all + 迁移）。")
     except Exception as e:  # noqa: BLE001
         logger.warning("init_db 失败（PG 可能未起）：%s", e)

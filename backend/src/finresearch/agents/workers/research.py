@@ -9,10 +9,22 @@ import time
 from .._utils import _timed_call
 from ...tools.fundamentals import get_company_profile, get_financial_indicators
 from ...tools.news import search_news
-from ...tools.search import web_search, is_configured as serper_configured
+from ...tools.search import domestic_web_search, web_search, is_configured as serper_configured
+from ...tools.citation_verify import verify_citation
+from ...core.guardrails.untrusted import looks_like_instruction
 from ..state import ResearchState
 
 logger = logging.getLogger(__name__)
+_default_research_web_search = web_search
+
+
+def _web_search_with_domestic_fallback(query: str, limit: int = 8) -> dict:
+    res = web_search(query, limit=limit)
+    if web_search is _default_research_web_search and not (isinstance(res, dict) and res.get("items")):
+        dom = domestic_web_search(query, limit=limit)
+        if isinstance(dom, dict) and dom.get("items"):
+            return dom
+    return res
 
 
 async def research_node(state: ResearchState) -> dict:
@@ -40,6 +52,11 @@ async def research_node(state: ResearchState) -> dict:
         "items": [],
         "provenance": {"source": "serper", "endpoint": "search", "error": "timeout_or_failed"},
     }
+    blocked = state.get("blocked_tools", {})
+
+    async def omitted(result: dict) -> tuple:
+        return {**result, "provenance": {**result["provenance"], "error": "user_scope"}}, 0, "user_scope"
+
     profile_res, fins_res, news_res, web_res = await asyncio.gather(
         _timed_call(get_company_profile, code, timeout=6, label="company_profile", fallback=profile_fallback),
         # 15s 不是拍的：实测冷启动稳定 10.6s（akshare 串行抓 7 页 × 1.24s，见 stock_financial_
@@ -47,9 +64,15 @@ async def research_node(state: ResearchState) -> dict:
         # slow_cache 是纯内存 TTL，进程一重启就空，等于每次开软件后的第一份报告都没有
         # PE/PB/ROE/营收同比，摘要里一排"（未获取）"。这不是超时保护，是自己掐自己。
         # 其余三源实测 3.3s / 2.1s / 0.3s，余量充足，不动。
-        _timed_call(get_financial_indicators, code, timeout=15, label="financial_indicators", fallback=fins_fallback),
-        _timed_call(search_news, code, timeout=6, label="news", fallback=news_fallback, limit=12),
-        _timed_call(web_search, ws_query, timeout=5, label="web_search", fallback=web_fallback, limit=8),
+        omitted(fins_fallback) if "get_financial_indicators" in blocked else _timed_call(
+            get_financial_indicators, code, timeout=15, label="financial_indicators", fallback=fins_fallback,
+        ),
+        omitted(news_fallback) if "search_news" in blocked else _timed_call(
+            search_news, code, timeout=6, label="news", fallback=news_fallback, limit=12,
+        ),
+        omitted(web_fallback) if "web_search" in blocked else _timed_call(
+            _web_search_with_domestic_fallback, ws_query, timeout=5, label="web_search", fallback=web_fallback, limit=8,
+        ),
     )
     profile, profile_ms, profile_err = profile_res
     fins, fins_ms, fins_err = fins_res
@@ -82,7 +105,7 @@ async def research_node(state: ResearchState) -> dict:
             "key": "web_search",
             "title": "联网搜索",
             "items": web.get("items", []),
-            "configured": serper_configured(),
+            "configured": serper_configured() or bool(web.get("items")),
             "provenance": web.get("provenance"),
         },
     ]
@@ -90,31 +113,40 @@ async def research_node(state: ResearchState) -> dict:
     # 来源 citations（新闻证据 + 公开信息证据 + 财务接口）
     citations = []
     for n in news.get("items", [])[:6]:
+        title = n.get("title") or ""
+        anchor = verify_citation(title, n.get("source_text") or title)
+        if not anchor["verified"] or looks_like_instruction(title):
+            continue
         citations.append(
             {
                 "title": "[新闻证据] " + n.get("title", ""),
                 "url": n.get("url", ""),
                 "date": n.get("time", ""),
                 "kind": "news",
+                "anchor": anchor,
             }
         )
     for w in web.get("items", [])[:6]:
+        w_title = w.get("title") or ""
+        if not w_title.strip() or looks_like_instruction(w_title):
+            continue
         citations.append(
             {
-                "title": "[公开信息] " + w.get("title", ""),
+                "title": "[公开信息] " + w_title,
                 "url": w.get("url", ""),
                 "date": w.get("time", ""),
                 "kind": "web",
             }
         )
-    citations.append(
-        {
-            "title": f"[行情事实/财务] {name or code} 财务分析指标 · akshare",
-            "url": "stock_financial_analysis_indicator",
-            "date": state.get("data_as_of", ""),
-            "kind": "fundamentals",
-        }
-    )
+    if fins_err is None and (fins.get("financials") or {}).get("rows"):
+        citations.append(
+            {
+                "title": f"[行情事实/财务] {name or code} 财务分析指标 · akshare",
+                "url": "stock_financial_analysis_indicator",
+                "date": state.get("data_as_of", ""),
+                "kind": "fundamentals",
+            }
+        )
 
     return {
         "findings": findings,

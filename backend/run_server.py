@@ -15,10 +15,14 @@ v1.6.0 变更（审计修复）：
 """
 
 # 这些必须在导入 uvicorn / finresearch 之前设置（和 main.py 一致）
+import multiprocessing
 import os
 import socket
 import sys
 import warnings
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 # tqdm>=4.66 尊重该变量；必须在 akshare 首次 import tqdm 前设置
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -109,14 +113,17 @@ def _redirect_stdio() -> None:
             pass
 
 
-def _free_port() -> int:
-    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+def _bound_socket() -> _socket.socket:
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
         try:
-            s.bind((HOST, PREFERRED))
-            return PREFERRED
+            listener.bind((HOST, PREFERRED))
         except OSError:
-            s.bind((HOST, 0))
-            return s.getsockname()[1]
+            listener.bind((HOST, 0))
+        return listener
+    except OSError:
+        listener.close()
+        raise
 
 
 def _write_port_file(port_file: str, port: int) -> None:
@@ -244,19 +251,19 @@ def main() -> None:
     _ensure_ascii_cacert()
     from finresearch.main import app as asgi_app
 
-    port = _free_port()
-    _write_port_file(os.path.join(app_data_dir(), "port.txt"), port)
-    _write_shutdown_token()
-    try:
-        print(f"FIN_PORT={port}", flush=True)  # port.txt is the primary channel.
-    except Exception:
-        pass
-
-    # 显式 Server 实例（而非 uvicorn.run）：挂到 app.state 供 POST /api/shutdown 优雅停机
-    server = uvicorn.Server(uvicorn.Config(asgi_app, host=HOST, port=port, log_level="warning"))
-    asgi_app.state.uvicorn_server = server
-    _start_parent_watchdog(server)
-    server.run()
+    with _bound_socket() as listener:
+        port = listener.getsockname()[1]
+        _write_port_file(os.path.join(app_data_dir(), "port.txt"), port)
+        _write_shutdown_token()
+        print(f"FIN_PORT={port}", flush=True)
+        # Pending renderer requests must release the server before Electron's
+        # process deadline so the lifespan can flush the SQLite checkpoints.
+        server = uvicorn.Server(uvicorn.Config(
+            asgi_app, host=HOST, port=port, log_level="warning", timeout_graceful_shutdown=3,
+        ))
+        asgi_app.state.uvicorn_server = server
+        _start_parent_watchdog(server)
+        server.run(sockets=[listener])
 
 
 if __name__ == "__main__":

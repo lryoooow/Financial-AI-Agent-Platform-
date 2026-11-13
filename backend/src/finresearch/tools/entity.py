@@ -205,6 +205,19 @@ def to_market_ticker(code: str) -> str:
     return f"{c}.SZ"
 
 
+def stock_ticker(code: str) -> str:
+    """Validate an equity/ETF identifier before passing it to a stock adapter."""
+    raw = normalize_ticker(code)
+    if len(raw) != 6 or not raw.isascii() or not raw.isdigit():
+        raise ValueError("请输入有效的 A 股或 ETF 代码。")
+    if detect_non_ashare_code(code) or detect_index_code(code):
+        raise ValueError("此行情接口支持 A 股和 ETF，请通过指数接口查询宽基指数。")
+    expected = to_market_ticker(raw)
+    if extract_exchange_hint(code) and to_market_ticker(code) != expected:
+        raise ValueError("股票代码与交易所后缀不匹配。")
+    return expected
+
+
 def _compact_text(value: str) -> str:
     norm = unicodedata.normalize("NFKC", str(value or "")).upper()
     return "".join(norm.split())

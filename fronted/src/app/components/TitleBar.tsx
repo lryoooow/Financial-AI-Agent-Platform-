@@ -1,162 +1,78 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { motion } from "motion/react";
-import { Wifi, WifiOff, Minus, Square, Copy, X } from "lucide-react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { Wifi, WifiOff, Minus, Square, Copy, X, Search, LogOut } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
 import { api } from "../api/client";
 import logoMark from "../assets/logo-mark.svg";
 
-/**
- * Windows 11 风格应用内标题栏（Electron frameless 窗口的唯一标题栏）。
- * 左：品牌 Logo；中：连接/交易状态 + 时钟；右：主题切换 + 最小化/最大化/关闭。
- *
- * 根因 2 修复：
- * - 整条标题栏 `-webkit-app-region: drag` 可拖拽移动窗口；
- * - 右侧控制按钮区 `-webkit-app-region: no-drag`，点击触发 IPC 真控窗口；
- * - 浏览器运行态（非 Electron）下 window.finresearch 不存在，按钮降级为可视不触发。
- */
-const CST_FMT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  hour12: false,
-  weekday: "short",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
+const noDrag = { WebkitAppRegion: "no-drag" } as CSSProperties;
 
-function getCstClock(d: Date): { timeText: string; trading: boolean } {
-  const parts = CST_FMT.formatToParts(d);
-  const map: Record<string, string> = {};
-  for (const p of parts) map[p.type] = p.value;
-  const hh = Number(map.hour ?? 0) % 24;
-  const mm = Number(map.minute ?? 0);
-  const ss = map.second ?? "00";
-  const wk = map.weekday ?? "";
-  const isWorkday = wk === "Mon" || wk === "Tue" || wk === "Wed" || wk === "Thu" || wk === "Fri";
-  const mins = hh * 60 + mm;
-  const trading = isWorkday && ((mins >= 570 && mins <= 690) || (mins >= 780 && mins <= 900));
-  const pad2 = (n: number) => String(n).padStart(2, "0");
-  return { timeText: `${pad2(hh)}:${pad2(mm)}:${ss}`, trading };
-}
-
-export function TitleBar() {
-  const [now, setNow] = useState(new Date());
+export function TitleBar({ onSearch, modelSelector }: { onSearch: () => void; modelSelector?: ReactNode }) {
   const [maximized, setMaximized] = useState(false);
-  const [healthOk, setHealthOk] = useState<boolean | null>(null);
-  const win = typeof window !== "undefined" ? window.finresearch?.window : undefined;
-
+  const [health, setHealth] = useState<boolean | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const win = window.finresearch?.window;
+  const nativeMac = window.finresearch?.platform === "darwin";
+  const isMacKey = nativeMac || (typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.platform));
   useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const checkHealth = () => {
-      if (typeof document !== "undefined" && document.hidden) return;
-      api.health()
-        .then((r) => { if (!cancelled) setHealthOk(r.status === "ok"); })
-        .catch(() => { if (!cancelled) setHealthOk(false); });
+    let alive = true;
+    const check = () => {
+      if (document.hidden) return;
+      api.health().then((value) => { if (alive) setHealth(value.status === "ok"); })
+        .catch(() => { if (alive) setHealth(false); });
     };
-    checkHealth();
-    const t = setInterval(checkHealth, 15_000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, []);
-
-  // 初始最大化状态 + 订阅变化（Electron 主进程 push）
+    check();
+    if (!win) {
+      api.webAuthStatus().then((r) => { if (alive) setAuthRequired(!!r.required); }).catch(() => {});
+    }
+    const timer = setInterval(check, 20_000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [win]);
   useEffect(() => {
     if (!win) return;
-    let unsub: (() => void) | undefined;
     win.isMaximized().then(setMaximized).catch(() => {});
-    unsub = win.onMaximizeChange(setMaximized);
-    return () => unsub?.();
+    return win.onMaximizeChange(setMaximized);
   }, [win]);
 
-  // 交易时段判断（北京时间 09:30–11:30, 13:00–15:00 工作日）
-  const { timeText, trading } = useMemo(() => getCstClock(now), [now]);
-
-  const onDouble = () => win?.maximizeToggle();  // 双击标题栏切换最大化（Windows 习惯）
-
+  const iconButton = "grid h-9 w-10 place-items-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
   return (
-    <div
-      className="h-10 shrink-0 flex items-center justify-between pl-3 border-b border-border bg-sidebar/80 backdrop-blur-xl select-none"
-      style={{ WebkitAppRegion: "drag" } as CSSProperties}
-      onDoubleClick={onDouble}
-    >
-      {/* 左：品牌 */}
-      <div className="flex items-center gap-2 min-w-0">
-        <img src={logoMark} alt="景渊" className="size-5 rounded-[5px] shrink-0" />
-        <span className="text-sm text-foreground/90 leading-none whitespace-nowrap">
-          <span className="font-display" style={{ fontWeight: 600 }}>景渊</span>
-          <span className="text-muted-foreground ml-1.5 text-xs">金融研究助手</span>
-        </span>
+    <header className="relative flex h-9 shrink-0 items-center justify-between gap-2 border-b bg-sidebar px-2"
+      style={{ WebkitAppRegion: win ? "drag" : undefined } as CSSProperties}
+      onDoubleClick={() => win?.maximizeToggle()}>
+      <div className={"flex shrink-0 items-center gap-2 px-1 font-semibold " + (nativeMac ? "pl-20" : "")}>
+        <img src={logoMark} alt="" className="size-5 rounded" /> 景渊
       </div>
-
-      {/* 中：状态 */}
-      <div className="hidden md:flex items-center gap-4 text-xs text-muted-foreground">
-        <div className="flex items-center gap-1.5">
-          {healthOk === false ? (
-            <>
-              <WifiOff className="size-3.5 text-up" />
-              <span className="text-up">本地服务 · 未连接</span>
-            </>
-          ) : (
-            <>
-              <Wifi className={`size-3.5 ${healthOk ? "text-down" : "text-muted-foreground"}`} />
-              <span>{healthOk ? "本地服务 · 已连接" : "本地服务 · 连接中"}</span>
-            </>
-          )}
-        </div>
-        <div className="flex items-center gap-1.5">
-          <motion.span
-            className="size-1.5 rounded-full"
-            style={{ background: trading ? "var(--down)" : "var(--muted-foreground)" }}
-            animate={trading ? { opacity: [1, 0.3, 1] } : {}}
-            transition={{ repeat: Infinity, duration: 1.6 }}
-          />
-          <span>{trading ? "交易中" : "已休市"}</span>
-        </div>
-        <span className="tabular text-foreground/70" title="北京时间 (UTC+8)">
-          {timeText}
+      <button type="button" onClick={onSearch} onDoubleClick={(event) => event.stopPropagation()} style={noDrag}
+        className="flex h-7 w-[min(44vw,440px)] items-center gap-2 rounded-md border bg-background px-2 text-left text-xs text-muted-foreground hover:border-[var(--border-emphasized)]">
+        <Search className="size-3.5" /> <span className="flex-1 truncate">搜索股票与指令</span>
+        <kbd className="rounded border px-1 text-[11px]">{isMacKey ? "⌘ K" : "Ctrl K"}</kbd>
+      </button>
+      <div className="flex min-w-0 items-center gap-1" style={noDrag} onDoubleClick={(event) => event.stopPropagation()}>
+        <div className="hidden min-w-0 px-1 sm:block">{modelSelector}</div>
+        <span title={health === false ? "服务未连接" : health ? "服务已连接" : "正在连接服务"} className="px-1" aria-live="polite">
+          {health === false ? <WifiOff className="size-4 text-up" /> : <Wifi className={"size-4 " + (health ? "text-down" : "text-muted-foreground")} />}
         </span>
-      </div>
-
-      {/* 右：主题切换 + Windows 窗口控制（no-drag，真实 IPC 控窗） */}
-      <div
-        className="flex items-center"
-        style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
-      >
         <ThemeToggle />
-        <button
-          type="button"
-          aria-label="最小化"
-          title="最小化"
-          onClick={() => win?.minimize()}
-          className="grid place-items-center h-10 w-11 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground transition-colors"
-        >
-          <Minus className="size-4" />
-        </button>
-        <button
-          type="button"
-          aria-label={maximized ? "还原" : "最大化"}
-          title={maximized ? "向下还原" : "最大化"}
-          onClick={() => win?.maximizeToggle()}
-          className="grid place-items-center h-10 w-11 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground transition-colors"
-        >
-          {maximized ? <Copy className="size-3" /> : <Square className="size-3" />}
-        </button>
-        <button
-          type="button"
-          aria-label="关闭"
-          title="关闭（驻留托盘，研究在后台继续）"
-          onClick={() => win?.close()}
-          className="grid place-items-center h-10 w-12 text-muted-foreground hover:bg-[#c42b1c] hover:text-white transition-colors"
-        >
-          <X className="size-4" />
-        </button>
+        {!win && authRequired && (
+          <button
+            type="button"
+            title="退出当前访问会话"
+            aria-label="退出登录"
+            onClick={() => {
+              api.webAuthLogout().catch(() => {}).finally(() => {
+                window.dispatchEvent(new Event("jingyuan:auth-required"));
+              });
+            }}
+            className="grid size-7 place-items-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <LogOut className="size-3.5" />
+          </button>
+        )}
+        {win && !nativeMac && <>
+          <button type="button" aria-label="最小化" onClick={() => win.minimize()} className={iconButton}><Minus className="size-4" /></button>
+          <button type="button" aria-label={maximized ? "还原" : "最大化"} onClick={() => win.maximizeToggle()} className={iconButton}>{maximized ? <Copy className="size-3" /> : <Square className="size-3" />}</button>
+          <button type="button" aria-label="关闭" onClick={() => win.close()} className={iconButton + " hover:bg-destructive hover:text-destructive-foreground"}><X className="size-4" /></button>
+        </>}
       </div>
-    </div>
+    </header>
   );
 }

@@ -5,15 +5,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from ..app_settings import load_app_settings
 from ..knowledge import profile as profile_store
 from ..knowledge import service
+from ..knowledge import store
+from ..core.guardrails.isolated_worker import MAX_BYTES
+from ..core.rag.ingest import ingest_document
 
 router = APIRouter(prefix="/api")
 
@@ -26,8 +30,8 @@ async def knowledge_search(q: str, limit: int = 8, ticker: str = "", kind: str =
     query = (q or "").strip()
     if not query:
         return {"items": []}
-    if kind and kind not in {"report", "conversation"}:
-        raise HTTPException(400, "kind 仅支持 report / conversation")
+    if kind and kind not in {"report", "conversation", "external"}:
+        raise HTTPException(400, "kind 仅支持 report / conversation / external")
     return {"items": await service.search(query[:200], limit=limit, ticker=ticker, kind=kind)}
 
 
@@ -40,6 +44,31 @@ async def knowledge_stats() -> dict:
 async def knowledge_reindex() -> dict:
     n = await service.rebuild_reports()
     return {"ok": True, "indexed": n, **(await service.stats())}
+
+
+@router.get("/knowledge/documents")
+async def knowledge_documents() -> dict:
+    return {"items": await asyncio.to_thread(store.list_external_documents)}
+
+
+@router.post("/knowledge/upload")
+async def knowledge_upload(file: UploadFile = File(...)) -> dict:
+    try:
+        data = await file.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise HTTPException(413, "文档超过 12 MiB。")
+        return await ingest_document(file.filename or "", data)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        await file.close()
+
+
+@router.delete("/knowledge/documents/{doc_id}")
+async def knowledge_delete_document(doc_id: str) -> dict:
+    if not await asyncio.to_thread(store.delete_external_document, doc_id):
+        raise HTTPException(404, "文档不存在。")
+    return {"ok": True}
 
 
 # ── 行情搜索记录 ─────────────────────────────────────────
@@ -91,6 +120,11 @@ async def learned_profile_clear() -> dict:
 
     events = await asyncio.to_thread(profile_store.clear_events, None)
     notes = await asyncio.to_thread(profile_store.clear_notes)
+    def clear_memories():
+        with store.connect() as conn:
+            conn.execute("DELETE FROM kb_memories")
+
+    await asyncio.to_thread(clear_memories)
     return {"ok": True, "events": events, "notes": notes}
 
 

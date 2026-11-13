@@ -78,39 +78,90 @@ def _company_profile_direct(raw: str) -> dict:
     }
 
 
+def _company_profile_f10(raw: str) -> dict:
+    """东方财富 F10 机构基本资料（datacenter-web.eastmoney.com HTTPS CDN 直连）。
+
+    当 push2.eastmoney.com 在本机网络被重置（RemoteDisconnected）时，datacenter-web 仍可 150ms
+    稳定返回简称、所属东财行业（如「医药生物-化学制药-化学制剂」）、上市日期与主营业务。
+    """
+    from .market_provider import configure_market_network
+
+    configure_market_network()
+    secucode = to_market_ticker(raw)
+    resp = _direct_session().get(
+        "https://datacenter-web.eastmoney.com/api/data/v1/get",
+        params={
+            "reportName": "RPT_F10_BASIC_ORGINFO",
+            "columns": "ALL",
+            "filter": f'(SECUCODE="{secucode}")',
+            "pageNumber": "1",
+            "pageSize": "1",
+            "source": "HSF10",
+            "client": "PC",
+        },
+        timeout=5,
+    )
+    resp.raise_for_status()
+    rows = ((resp.json() or {}).get("result") or {}).get("data") or []
+    if not rows or not isinstance(rows[0], dict):
+        raise ValueError("RPT_F10_BASIC_ORGINFO 返回空")
+    item = rows[0]
+    em_ind = str(item.get("EM2016") or "").strip()
+    ind_parts = [p.strip() for p in em_ind.split("-") if p.strip()]
+    # 优先取二级行业（如「化学制药」），与申万二级口径对齐；若只有一级则取一级
+    industry = ind_parts[1] if len(ind_parts) >= 2 else (ind_parts[0] if ind_parts else "")
+    list_date = str(item.get("LISTING_DATE") or "")[:10]
+    out = {
+        "股票代码": raw,
+        "股票简称": str(item.get("SECURITY_NAME_ABBR") or "").strip(),
+        "公司名称": str(item.get("ORG_NAME") or "").strip(),
+        "行业": industry,
+        "行业全称": em_ind,
+        "上市时间": list_date,
+        "主营业务": str(item.get("MAIN_BUSINESS") or "").strip(),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 def get_company_profile(code: str) -> dict:
     """公司概况。"""
     raw = normalize_ticker(code)
+    cache_key = f"company_profile:{raw}"
     try:
         import akshare as ak
+        if getattr(ak, "__file__", None):
+            cached = slow_cache.get(cache_key)
+            if isinstance(cached, dict) and cached.get("name"):
+                return cached
         source = "akshare"
         endpoint = "stock_individual_info_em"
         try:
+            if getattr(ak, "__file__", None) and (time.time() - _DIRECT_FAIL_AT < _DIRECT_BREAKER_S):
+                raise ConnectionError("push2.eastmoney.com 处于 5 分钟熔断窗口，直接切换 F10 资料源")
             df = ak.stock_individual_info_em(symbol=raw)
             rec = {}
             if df is not None and not df.empty:
                 for _, r in df.iterrows():
                     rec[str(r.iloc[0])] = r.iloc[1] if len(r) > 1 else ""
-        except Exception as ak_error:  # AkShare 可能因上游新增字段触发 Length mismatch
+            if not str(rec.get("股票简称") or "").strip():
+                raise ValueError("stock_individual_info_em 返回空简称")
+        except Exception as ak_error:  # AkShare 可能因上游新增字段或 push2 断连失败
             logger.info("公司资料 AkShare 解析失败，改用直连接口：%s", ak_error)
-            rec = _company_profile_direct(raw)
-            source = "eastmoney-direct"
-            endpoint = "stock_profile_direct"
-            # 这里原本还有第三级兜底 ak.stock_profile_cninfo（巨潮资讯），已移除——它会把整个
-            # 进程打死。
-            #
-            # 根因：stock_profile_cninfo 需要跑 JS 解混淆，走 py_mini_racer(V8)，而 V8 在
-            # Python 3.14 + Windows 下会抛原生致命断言
-            #   [FATAL:partition_address_space.cc] Check failed: !IsConfigurablePoolInitialized()
-            # 这不是 Python 异常，下面的 except 接不住，进程直接死。实测主线程、worker 线程、
-            # 加锁串行化、主线程预热全都救不回来。
-            #
-            # 平时不响是因为前两级（东财 em / 东财直连）通着，走不到这一级；一旦东财抽风，
-            # 这条路就是必死。研究管线与对话链路都会命中。
-            #
-            # 移除的代价极小：巨潮只给 简称/行业/上市日期，总市值还是空的；而下面第 94 行的
-            # 行情兜底给的是 简称/行业/**真实总市值**，比它还全，只少一个上市时间。
-            # 用一个上市时间换"进程不会被打死"，非常划算。
+            try:
+                rec = _company_profile_direct(raw)
+                if not str(rec.get("股票简称") or "").strip():
+                    raise ValueError("stock_profile_direct 返回空简称") from ak_error
+                source = "eastmoney-direct"
+                endpoint = "stock_profile_direct"
+            except Exception as direct_err:
+                if not getattr(ak, "__file__", None):
+                    raise direct_err
+                rec = _company_profile_f10(raw)
+                if not str(rec.get("股票简称") or "").strip():
+                    raise ValueError("RPT_F10_BASIC_ORGINFO 返回空简称") from direct_err
+                source = "eastmoney-f10"
+                endpoint = "RPT_F10_BASIC_ORGINFO"
+
         def _clean_str(val) -> str:
             v = clean_for_json(val)
             if v is None:
@@ -140,7 +191,18 @@ def get_company_profile(code: str) -> dict:
         name = _clean_str(clean_rec.get("股票简称", ""))
         industry = _clean_str(clean_rec.get("行业", ""))
         market_cap = _fmt_cap(clean_rec.get("总市值", ""))
-        return {
+        if not market_cap:
+            try:
+                from .market import get_realtime_quote
+
+                q = get_realtime_quote(code)
+                q_cap = _clean_str(q.get("marketCap", ""))
+                if q_cap and q_cap != "—":
+                    market_cap = q_cap
+                    clean_rec["总市值"] = q_cap
+            except Exception:  # noqa: BLE001
+                pass
+        result = {
             "code": to_market_ticker(raw),
             "name": name,
             "industry": industry,
@@ -151,6 +213,9 @@ def get_company_profile(code: str) -> dict:
                 source=source, endpoint=endpoint, raw_value=raw
             ),
         }
+        if getattr(ak, "__file__", None) and name:
+            slow_cache.set(cache_key, result, ttl=1800)
+        return result
     except Exception as e:  # noqa: BLE001
         logger.warning("公司资料主源失败，尝试行情名称兜底：%s", e)
         try:
@@ -275,6 +340,34 @@ def _last_n_years_indicator(raw: str, n: int = 6) -> Optional[list]:
         except Exception as fb_err:  # noqa: BLE001
             logger.info("东财 F10 财务兜底也未取到数据：%s", fb_err)
             df = None
+    elif "总资产周转率(次)" in df.columns and "归母净利润" not in df.columns:
+        # 新浪财务分析指标接口不含营业总收入与归母净利润（且扭亏期净利润增长率常为 NaN），
+        # 按报告期对齐补充东财 F10 同口径真值，保留原表字段优先。
+        try:
+            em_df = _eastmoney_main_finance_df(raw)
+            if em_df is not None and not em_df.empty:
+                em_by_period = {}
+                for em_rec in em_df.to_dict("records"):
+                    p_key = _norm_period(em_rec.get("日期"))
+                    if p_key and p_key not in em_by_period:
+                        em_by_period[p_key] = em_rec
+                date_c = next((c for c in df.columns if str(c).strip() in ("日期", "报告期", "报告日")), df.columns[0])
+                supplemented = []
+                for row_rec in df.to_dict("records"):
+                    p_key = _norm_period(row_rec.get(date_c))
+                    em_rec = em_by_period.get(p_key) or {}
+                    for col_k, col_v in em_rec.items():
+                        if col_k == "日期" or col_v is None:
+                            continue
+                        cur_v = row_rec.get(col_k)
+                        if cur_v is None or (isinstance(cur_v, float) and not math.isfinite(cur_v)) or str(cur_v).strip() in ("", "nan", "NaN", "None"):
+                            row_rec[col_k] = col_v
+                    supplemented.append(row_rec)
+                import pandas as pd
+
+                df = pd.DataFrame(supplemented)
+        except Exception as sup_err:  # noqa: BLE001
+            logger.info("东财 F10 指标补充跳过：%s", sup_err)
     if df is None or df.empty:
         return None
     # 第一列通常是日期（"日期"）；按名字优先，避免上游列序变化
@@ -516,6 +609,7 @@ def get_financial_indicators(code: str) -> dict:
         if isinstance(prior, dict):
             yoy_base = {
                 "period": _norm_period(prior.get("_date")),
+                "净利润": fmt_num(pick(prior, *net_keys)),
                 "ROE": fmt_pct(pick(prior, "净资产收益率(%)", "加权净资产收益率(%)", "净资产收益率", "ROE")),
                 "毛利率": fmt_pct(pick(prior, "销售毛利率(%)", "销售毛利率", "毛利率")),
                 "资产负债率": fmt_pct(pick(prior, "资产负债率(%)", "资产负债率")),

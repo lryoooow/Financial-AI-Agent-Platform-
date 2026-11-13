@@ -43,6 +43,10 @@ from ...llm import (
 from ...tools import facts, report as report_tool
 from ...tools.context import build_report_section_context, finalize_diag
 from ...tools.entity import to_market_ticker
+from ...core.guardrails.number_evidence import NumberEvidence, metric_values
+from ...core.guardrails.compliance import check_generated
+from ...core.guardrails.sanitizer import AnswerStreamSanitizer
+from ...core.guardrails.untrusted import looks_like_instruction
 from .._utils import sanitize_err_text
 from ..prompts import (
     FORBIDDEN_VERBS,
@@ -64,6 +68,8 @@ _SRC_LABELS = {
     "sina": "新浪（Sina 直连）",
     "tencent": "腾讯（Tencent 直连）",
     "eastmoney-direct": "东方财富（直连）",
+    "eastmoney_search": "东方财富搜索（国内直连）",
+    "serper": "Serper（Google 搜索）",
     "akshare": "AkShare（东方财富）",
 }
 
@@ -143,21 +149,10 @@ def _stream_push(msg) -> None:
             pass
         return
     try:
-        from langgraph.config import get_stream_writer
-        get_stream_writer()(payload)
+        from ...engine.framework import push_custom_event
+        push_custom_event(payload)
     except Exception:
         pass
-
-
-_QUOTED_SPAN_RE = re.compile(r"「[^」\n]{0,180}」|“[^”\n]{0,180}”")
-_UNCLOSED_QUOTE_TAIL_RE = re.compile(r"(?:「[^」\n]{0,140}|“[^”\n]{0,140})$")
-_NEUTRAL_FIN_TERMS_RE = re.compile(
-    r"(?:"
-    r"净买入|净卖出|融资买入|融券卖出|买入额|卖出额|大宗交易买入|大宗交易卖出"
-    r"|买入评级|卖出评级|(?:维持|给予|上调至|下调至|获)买入"
-    r"|不构成(?:任何)?[^\n。；！？]{0,20}"
-    r")"
-)
 
 
 def _clean_query(state: dict) -> str:
@@ -168,19 +163,25 @@ def _clean_query(state: dict) -> str:
     return cleaned[:200]
 
 
-def check_generated(text: str, *, streaming: bool = False) -> List[str]:
-    """检测 LLM 产出是否命中禁用指令词，返回命中列表（不改写文本）。
+def _fv_fields(fv: Optional[dict]) -> Optional[dict[str, list]]:
+    if not isinstance(fv, dict) or not fv:
+        return None
+    safe_fv = dict(fv)
+    if not facts.quote_usable(safe_fv.get("quote")):
+        safe_fv.pop("quote", None)
+    fields = metric_values(safe_fv)
+    return fields or None
 
-    先剥离客观引文（「新闻标题」/“引文”）、中性市场数据术语（净买入/融资买入/买入评级）
-    与合规免责声明（不构成任何买入或卖出建议），避免引用真实快讯标题时误抹除已流式章节。
-    """
-    if not text:
-        return []
-    cleaned = _QUOTED_SPAN_RE.sub(" ", text)
-    if streaming:
-        cleaned = _UNCLOSED_QUOTE_TAIL_RE.sub(" ", cleaned)
-    cleaned = _NEUTRAL_FIN_TERMS_RE.sub(" ", cleaned)
-    return [w for w in FORBIDDEN_VERBS if w in cleaned]
+
+def _section_guard(fact_text: str, fv: Optional[dict] = None) -> AnswerStreamSanitizer:
+    evidence = NumberEvidence(fact_text, _fv_fields(fv))
+    return AnswerStreamSanitizer(
+        check_generated,
+        numeric_locator=lambda t, *, streaming=False: evidence.locate(
+            t, streaming=streaming, financial_only=True
+        ),
+        max_redactions=3,
+    )
 
 
 # ────────────────────────────────────────────────────────────
@@ -213,9 +214,10 @@ def _trend(vals: list) -> str:
     first, last = facts.to_float(vals[0]), facts.to_float(vals[-1])
     if first is None or last is None:
         return "（部分年度数据缺失）"
-    if last > first * 1.02:
+    tolerance = abs(first) * 0.02
+    if last > first + tolerance:
         return "上行"
-    if last < first * 0.98:
+    if last < first - tolerance:
         return "下行"
     return "基本平稳"
 
@@ -410,13 +412,23 @@ def _section_fundamentals(fv: dict) -> str:
     rev_yoy = _yoy_or_series("营业收入", ["营收同比", "营业收入同比"])
     net_yoy = _yoy_or_series(["净利润", "扣非净利润"], ["净利润同比", "归母净利润同比"])
     rev_l, net_l = facts.val_str(rev), facts.val_str(net)
-    if rev_yoy is not None or net_yoy is not None:
+    turn_tag = facts.latest_profit_turnaround(fins)
+    if rev_yoy is not None or net_yoy is not None or turn_tag:
+        net_note = f"同比 {facts.pct(net_yoy, 1)}"
+        if turn_tag:
+            net_note = f"{net_note}，{turn_tag}" if net_yoy is not None else turn_tag
         line = (
             f"【成长性】最新一期（{years[-1] if years else '—'}）实现营业收入 {rev_l}"
             f"（同比 {facts.pct(rev_yoy, 1)}）、"
-            f"净利润 {net_l}（同比 {facts.pct(net_yoy, 1)}）。"
+            f"净利润 {net_l}（{net_note}）。"
         )
-        if rev_yoy is not None and net_yoy is not None:
+        if turn_tag == "扭亏为盈":
+            line += "盈利端实现同比扭亏为盈，经营拐点显现，需持续跟踪核心品种放量与盈利持续性。"
+        elif turn_tag == "由盈转亏":
+            line += "盈利端同比由盈转亏，需重点关注收入承压、毛利变动或期间费用率抬升的影响。"
+        elif turn_tag in ("同比减亏", "亏损扩大"):
+            line += f"当前仍处亏损阶段但呈{turn_tag}态势，需结合研发投入节奏与商业化兑现评估。"
+        elif rev_yoy is not None and net_yoy is not None:
             if net_yoy > rev_yoy + 5:
                 line += "利润增速高于营收增速，关注毛利率扩张或费用率优化的贡献。"
             elif net_yoy < rev_yoy - 5:
@@ -516,17 +528,24 @@ def _section_industry_company(fv: dict) -> str:
         "基于公开行情与财务指标，本报告对其行业地位仅做框架性描述。"
     )
     if news:
-        items = news[:3]
+        items = [
+            n for n in news[:3]
+            if isinstance(n, dict) and not looks_like_instruction(str(n.get("title") or ""))
+        ]
         headlines = "；".join(
             f"「{n.get('title', '').strip() or '相关动态'}」（{n.get('source', '') or n.get('time', '公开来源')}）"
-            for n in items if isinstance(n, dict)
+            for n in items
         )
-        parts.append(f"【新闻证据·个股资讯】东方财富公开资讯显示：{headlines}。")
+        if headlines:
+            parts.append(f"【新闻证据·个股资讯】东方财富公开资讯显示：{headlines}。")
     if web:
-        items = web[:3]
+        items = [
+            w for w in web[:3]
+            if isinstance(w, dict) and w.get("title") and not looks_like_instruction(str(w.get("title") or ""))
+        ]
         headlines = "；".join(
             f"「{w.get('title', '').strip() or '相关网页'}」（{w.get('source', '') or '网页'}）"
-            for w in items if isinstance(w, dict) and w.get("title")
+            for w in items
         )
         if headlines:
             parts.append(f"【公开信息·联网搜索】网络检索显示：{headlines}。")
@@ -540,7 +559,9 @@ def _section_industry_company(fv: dict) -> str:
 # ────────────────────────────────────────────────────────────
 # 证据分层与数据来源（规则生成——描述数据来源事实，不让模型写）
 # ────────────────────────────────────────────────────────────
-def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
+def _section_evidence_traceback(
+    findings: list, fv: dict, gen: dict, redacted_sections: Optional[dict] = None
+) -> str:
     """证据分层。gen = {段标题: 'llm'|'template'|'insufficient'}，据此如实声明生成来源。
 
     此前这一栏写死"投资摘要与各分析段由大语言模型生成"——LLM 未配置或 429 降级时，
@@ -548,6 +569,8 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
     """
     quote_prov = (fv.get("quote", {}).get("provenance") or {}) if isinstance(fv.get("quote"), dict) else {}
     kline_prov = _find(findings, "kline").get("provenance") or {}
+    news_prov = _find(findings, "news").get("provenance") or {}
+    web_prov = _find(findings, "web_search").get("provenance") or {}
     news_items = fv.get("news", [])
     web_items = fv.get("web", [])
     web_configured = fv.get("web_configured", False)
@@ -556,8 +579,9 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
     quote_err = quote_prov.get("error")
 
     if facts.quote_usable(fv.get("quote")):
+        kline_label = _SRC_LABELS.get(kline_prov.get("source"), kline_prov.get("source") or "未获取")
         market_line = (
-            f"【行情事实】实时快照与日K数据来自 {src_label}，"
+            f"【行情事实】实时快照来自 {src_label}，日 K 来自 {kline_label}。"
             "所有价位、成交量、技术指标均由本地工具库计算，未经人工调整。"
         )
     else:
@@ -566,14 +590,16 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
             + (f"，原因：{quote_err}" if quote_err else "")
             + "）：本报告未使用任何实时价位或估值倍数。"
         )
+    news_src = _SRC_LABELS.get(news_prov.get("source"), news_prov.get("source") or "AkShare（东方财富）")
     parts = [
         market_line,
-        f"【新闻证据】个股资讯来自 akshare·stock_news_em（东方财富），共引用 {len(news_items)} 条，"
+        f"【新闻证据】公开资讯来自 {news_src}，共检索 {len(news_items)} 条，"
         "仅作背景参考，不代表本报告立场。",
     ]
     if web_configured:
+        web_src = _SRC_LABELS.get(web_prov.get("source"), web_prov.get("source") or "Serper")
         parts.append(
-            f"【公开信息】联网搜索增强已启用（Serper），共检索 {len(web_items)} 条公开网页结果，"
+            f"【公开信息】联网搜索增强已启用（{web_src}），共检索 {len(web_items)} 条公开网页结果，"
             "标题/摘要/链接见下方来源清单，需读者自行核验时效与权威性。"
         )
     else:
@@ -597,6 +623,11 @@ def _section_evidence_traceback(findings: list, fv: dict, gen: dict) -> str:
         lines.append(f"数据不足未展开：{'、'.join(thin)}")
     if by_err:
         lines.append(f"生成失败（占位文案）：{'、'.join(by_err)}")
+    if redacted_sections:
+        total_redacted = sum(int(v) for v in redacted_sections.values() if v)
+        if total_redacted > 0:
+            sec_names = "、".join(k for k, v in redacted_sections.items() if v)
+            lines.append(f"数值核验：其中 {sec_names} 共 {total_redacted} 处未能与事实块逐项核对的数值已标注「〔数值待核〕」隐去")
     parts.append("【生成来源】" + ("；".join(lines) if lines else "全部由规则模板生成。") + "。本报告不构成投资建议。")
     return "\n".join(parts)
 
@@ -700,7 +731,10 @@ def _render_industry_valuation_facts(iv: dict) -> str:
 
 
 def _facts_earnings(fv: dict) -> str:
-    return facts.compose_facts(facts.render_financial_facts(fv.get("fins", {})))
+    return facts.compose_facts(
+        facts.render_financial_facts(fv.get("fins", {})),
+        facts.render_news_facts(fv.get("news", []), fv.get("web", [])),
+    )
 
 
 def _facts_scenario(fv: dict) -> str:
@@ -741,7 +775,9 @@ def _section_landscape(fv: dict) -> str:
     cites = []
     for item in list(fv.get("news", []))[:3] + list(fv.get("web", []))[:3]:
         if isinstance(item, dict) and (item.get("title") or "").strip():
-            cites.append(f"「{item['title'].strip()}」（{item.get('source') or '公开来源'}）")
+            title_s = item["title"].strip()
+            if not looks_like_instruction(title_s):
+                cites.append(f"「{title_s}」（{item.get('source') or '公开来源'}）")
     if cites:
         parts.append("【已获取的公开资讯】" + "；".join(cites) + "。")
     parts.append("【说明】模型不可用，本栏仅罗列已取得的估值与资讯证据，未作景气度解读；行业规模、集中度与市占率需第三方数据支撑，本报告不展开。")
@@ -814,6 +850,7 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
         return f"（{spec.title}所需数据不足，本报告不展开该部分。）", "insufficient"
 
     facts_block = spec.build_facts(fv)
+    guard = _section_guard(facts_block, fv)
     q = _clean_query(state)
     if q:
         facts_block += f"\n\n【用户重点关注】{q}（仅在事实块已有数据范围内回应，无对应数据则如实说明未获取，禁止编造。）"
@@ -864,10 +901,10 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
     # 节流后以 section_thinking 快照推给前端（替换语义、只带尾部预览），思考型模型
     # 几十秒的 CoT 期间该段显示「思考中」而不是一动不动；<think> 内容绝不计入正文。
     cap = min(spec.max_chars, max(120, int(getattr(settings, "report_section_max_chars", 420))))
-    parts: list[str] = []
     acc = ""
     forbidden = False
     splitter = ThinkTagSplitter()
+    saw_reasoning = False
     thinking = ""
     last_think_push = 0.0
 
@@ -888,15 +925,14 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
             return True
         if not acc and not tok.strip():
             return True  # 跳过前导纯空白 token，避免空段先闪一段空白再被模板覆盖
-        # 实时禁用词闸：并入这段 token 会命中禁用词，就不外发它、停止流式，
-        # 转下方回退模板（最终 report_section 事件会以模板 body 覆盖已流出的片段）。
-        if check_generated(acc + tok, streaming=True):
+        delta = guard.feed(tok)
+        if delta.compliance_triggered:
             forbidden = True
             return False
         acc += tok
-        parts.append(tok)
-        _stream_push({"type": "section_token", "title": spec.title, "text": tok})
-        return len(acc) < cap  # 到确定性字符上限即停，省 token
+        if delta.visible_text:
+            _stream_push({"type": "section_token", "title": spec.title, "text": delta.visible_text})
+        return not ((not thinks or saw_reasoning) and len(guard.visible_text) >= cap)
 
     try:
         # v1.7.0：闸在 timeout 外——并行下排队等闸的时间不得消耗该段撰写预算
@@ -911,16 +947,21 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
                 async for chunk in llm.astream(lc):
                     rc = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
                     if isinstance(rc, str) and rc:
+                        saw_reasoning = True
                         thinking += rc
                         _push_thinking()
                     content, inline_rc = splitter.feed(_extract_token(chunk))
+                    if splitter._saw_think_boundary:
+                        saw_reasoning = True
                     if splitter.orphan_think_closed:
                         splitter.orphan_think_closed = False
                         thinking += acc
                         acc = ""
-                        parts.clear()
+                        guard = _section_guard(spec.build_facts(fv), fv)
+                        _stream_push({"type": "section_reset", "title": spec.title})
                         _push_thinking(force=True)
                     if inline_rc:
+                        saw_reasoning = True
                         thinking += inline_rc
                         _push_thinking()
                     if not _accept(content):
@@ -929,10 +970,15 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
                     tail, inline_rc = splitter.flush()
                     thinking += inline_rc
                     _accept(tail)
-        if forbidden or check_generated("".join(parts)):
-            finalize_diag(diag, _elapsed(), error="forbidden_verbs")
-            return spec.fallback(fv) + "（模型输出含禁用表述，已使用事实模板。）", "template"
-        text = "".join(parts)
+        final = guard.flush()
+        final_forbidden = forbidden or final.compliance_triggered
+        if final.visible_text and not final_forbidden:
+            _stream_push({"type": "section_token", "title": spec.title, "text": final.visible_text})
+        if final_forbidden:
+            err_tag = "unsupported_number" if guard.numeric_violated else "forbidden_verbs"
+            finalize_diag(diag, _elapsed(), error=err_tag)
+            return spec.fallback(fv) + "（模型输出未通过事实或用语核验，已使用事实模板。）", "template"
+        text = guard.visible_text
         # 空/纯空白兜底：模型在并发限流、内容审查、max_tokens 被 reasoning 吃满等情况下偶发返回空。
         # 空返回当撰写失败、回退规则模板（body 必非空），如实标注来源 template；否则渲染成空白章节。
         if not text.strip():
@@ -943,16 +989,23 @@ async def _llm_section(state: ResearchState, spec: SectionSpec, fv: dict) -> tup
             finalize_diag(diag, _elapsed(), error="empty_llm_output")
             return spec.fallback(fv), "template"
         text, truncated = _bound_generated_text(text, cap)
-        finalize_diag(diag, _elapsed(), note="output_truncated" if truncated else "")
+        if guard.redactions > 0:
+            state.setdefault("_redacted_sections", {})[spec.title] = guard.redactions
+        note_parts = []
+        if truncated:
+            note_parts.append("output_truncated")
+        if guard.redactions > 0:
+            note_parts.append(f"redacted:{guard.redactions}")
+        finalize_diag(diag, _elapsed(), note=",".join(note_parts))
         return text, "llm"
     except Exception as e:  # noqa: BLE001
-        logger.warning("%s LLM 流式撰写失败，回退模板：%s", spec.key, e)
+        logger.warning("%s LLM 流式撰写失败，回退模板：%s", spec.key, sanitize_err_text(e))
         finalize_diag(diag, _elapsed(), error=str(e))
         return spec.fallback(fv), "template"
 
 
 def _bound_generated_text(text: str, max_chars: int) -> tuple[str, bool]:
-    """对模型正文做确定性字符上限，优先在中文句号/分号边界截断。"""
+    """对模型正文做确定性字符上限，优先在中文句号/分号边界截断，且绝不截断「〔数值待核〕」标记。"""
     value = (text or "").strip()
     if len(value) <= max_chars:
         return value, False
@@ -963,6 +1016,9 @@ def _bound_generated_text(text: str, max_chars: int) -> tuple[str, bool]:
     bounded = window[: cut + 1].rstrip()
     if len(bounded) >= max_chars:
         bounded = bounded[: max_chars - 1].rstrip()
+    open_idx = bounded.rfind("〔")
+    if open_idx != -1 and "〕" not in bounded[open_idx:]:
+        bounded = bounded[:open_idx].rstrip()
     return bounded + "…", True
 
 
@@ -1103,7 +1159,8 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
     if llm is None:
         return _compose_summary_block(state, fv) + "（LLM 未配置，以上为模板化摘要，数字均来自本地工具库。）"
 
-    user = SUMMARY_USER_TEMPLATE.format(**s_facts)
+    evidence_text = SUMMARY_USER_TEMPLATE.format(**s_facts)
+    user = evidence_text
     q = _clean_query(state)
     if q:
         user += f"\n\n【用户重点关注】{q}（仅在事实块已有数据范围内回应，无对应数据则如实说明未获取，禁止编造。）"
@@ -1129,14 +1186,24 @@ async def _llm_summary(state: ResearchState, fv: dict) -> str:
             logger.warning("LLM 摘要返回空内容，回退模板")
             finalize_diag(diag, _elapsed(), error="empty_llm_output")
             return _compose_summary_block(state, fv)
-        hits = check_generated(text)
-        if not hits:
+        comp_hits = check_generated(text)
+        if comp_hits:
+            finalize_diag(diag, _elapsed(), error=f"forbidden_verbs:{','.join(comp_hits)}")
+            return _compose_summary_block(state, fv) + "（模型输出未通过事实或用语核验，已使用事实摘要。）"
+        issues = NumberEvidence(evidence_text, _fv_fields(fv)).locate(text, financial_only=True)
+        if not issues:
             finalize_diag(diag, _elapsed())
             return text.strip()
-        finalize_diag(diag, _elapsed(), error=f"forbidden_verbs:{','.join(hits)}")
-        return _compose_summary_block(state, fv) + "（模型输出含禁用表述，已使用事实摘要。）"
+        if len(issues) <= 3:
+            redacted = text
+            for iss in reversed(issues):
+                redacted = redacted[:iss.start] + AnswerStreamSanitizer.REDACTION + redacted[iss.end:]
+            finalize_diag(diag, _elapsed(), note=f"redacted:{len(issues)}")
+            return redacted.strip()
+        finalize_diag(diag, _elapsed(), error=f"unsupported_number:{issues[0].reason}")
+        return _compose_summary_block(state, fv) + "（模型输出未通过事实或用语核验，已使用事实摘要。）"
     except Exception as e:  # noqa: BLE001
-        logger.warning("LLM 摘要失败，回退模板：%s", e)
+        logger.warning("LLM 摘要失败，回退模板：%s", sanitize_err_text(e))
         finalize_diag(diag, _elapsed(), error=str(e))
         return _compose_summary_block(state, fv) + "（LLM 调用失败，回退模板摘要，数字仍来自本地计算。）"
 
@@ -1156,9 +1223,12 @@ def _compose_catalyst(fv: dict, template: str = "equity_deep") -> str:
         return f"{ind}行业需求、政策与竞争格局的新增公开证据，是后续更新行业判断的主要触发条件。"
     parts = [f"{ind}行业景气边际变化与公司经营节奏是核心催化，需结合财务指标持续跟踪。"]
     if news:
-        n0 = news[0]
-        if isinstance(n0, dict) and n0.get("title"):
-            parts.append(f"近期公开信息（「{n0['title'].strip()}」）可作为短期催化剂观察点。")
+        for n0 in news:
+            if isinstance(n0, dict) and (n0.get("title") or "").strip():
+                t0_s = n0["title"].strip()
+                if not looks_like_instruction(t0_s):
+                    parts.append(f"近期公开信息（「{t0_s}」）可作为短期催化剂观察点。")
+                    break
     parts.append(
         "潜在催化剂（需后续验证）：①行业政策或下游需求边际改善；"
         "②公司新产品/新产能投放或客户结构优化；③技术面关键压力位有效突破。"
@@ -1231,9 +1301,9 @@ def _summary_facts_block(state: ResearchState, fv: dict) -> str:
 class _Part:
     """单次流中一个部分（摘要或某一段）的累积状态。"""
 
-    __slots__ = ("title", "cap", "acc", "forbidden", "capped", "started", "closed")
+    __slots__ = ("title", "cap", "acc", "forbidden", "capped", "started", "closed", "guard")
 
-    def __init__(self, title: str, cap: int) -> None:
+    def __init__(self, title: str, cap: int, evidence: str, fv: Optional[dict] = None) -> None:
         self.title = title
         self.cap = cap
         self.acc = ""
@@ -1241,13 +1311,14 @@ class _Part:
         self.capped = False
         self.started = False
         self.closed = False
+        self.guard = _section_guard(evidence, fv)
 
 
 def _safe_fallback(sp: "SectionSpec", fv: dict, note: str = "") -> tuple[str, str]:
     try:
         return sp.fallback(fv) + note, "template"
     except Exception as fb_err:  # noqa: BLE001  fallback 本身崩溃也只影响本段
-        logger.warning("%s 段 fallback 失败：%s", sp.key, fb_err)
+        logger.warning("%s 段 fallback 失败：%s", sp.key, sanitize_err_text(fb_err))
         return f"（{sp.title}生成失败，数据可能异常，本段暂不展开。）", "error"
 
 
@@ -1266,11 +1337,13 @@ async def _llm_report_stream(
     task_id = state.get("task_id") or state.get("normalized_ticker", "")
     summary_fallback = _compose_summary_block(state, fv)
     order = [sp.key for sp in specs]
-    results: dict[str, tuple[str, str]] = {}
+    insufficient_map: dict[str, tuple[str, str]] = {
+        sp.key: (f"（{sp.title}所需数据不足，本报告不展开该部分。）", "insufficient")
+        for sp in specs if not sp.has_data(fv)
+    }
+    results: dict[str, tuple[str, str]] = dict(insufficient_map)
     writable = [sp for sp in specs if sp.has_data(fv)]
-    pending_insufficient = [sp for sp in specs if not sp.has_data(fv)]
-    for sp in pending_insufficient:
-        results[sp.key] = (f"（{sp.title}所需数据不足，本报告不展开该部分。）", "insufficient")
+    pending_insufficient = [sp for sp in specs if sp.key in insufficient_map]
 
     def _emit_insufficient(limit: int) -> None:
         """数据不足段在报告顺位上排在 limit 之前的，按顺位收口（保持自上而下的阅读顺序）。"""
@@ -1300,10 +1373,12 @@ async def _llm_report_stream(
     for sp in writable:
         block, _cut = _truncate_facts_by_segment(sp.build_facts(fv), budget)
         facts_parts.append(f"【{sp.title}·事实块】\n{block}")
+    evidence_block = "\n\n".join(facts_parts)
     q = _clean_query(state)
     if q:
         facts_parts.append(f"【用户重点关注】{q}（请在不超出上述各节事实块数字的前提下予以回应；无相关数据则如实说明未获取。）")
     facts_block = "\n\n".join(facts_parts)
+    evidence = [evidence_block] * (1 + len(writable))
     plan = [(SUMMARY_HEADING, SUMMARY_STREAM_TASK)] + [(sp.title, SECTION_TASK.get(sp.key, "")) for sp in writable]
     lc, diag = build_report_section_context(
         system_prompt=report_stream_system_prompt(template, plan), facts_block=facts_block,
@@ -1315,12 +1390,17 @@ async def _llm_report_stream(
     section_titles = [_SUMMARY_ALIASES] + [
         _SECTION_ALIASES.get(sp.key, (sp.title,)) for sp in writable
     ]
-    parts = [_Part(SUMMARY_HEADING, caps[0])] + [_Part(sp.title, c) for sp, c in zip(writable, caps[1:])]
+    parts = [_Part(title, cap, block, fv) for title, cap, block in zip(
+        [SUMMARY_HEADING, *(sp.title for sp in writable)], caps, evidence
+    )]
     parser = SectionStreamParser(section_titles)
     splitter = ThinkTagSplitter()
+    saw_reasoning = False
     thinking = ""
     last_think_push = 0.0
     cur = 0
+    error = ""
+    redacted_sections: dict[str, int] = {}
 
     def _push_thinking(force: bool = False) -> None:
         nonlocal last_think_push
@@ -1343,27 +1423,48 @@ async def _llm_report_stream(
         if part.closed:
             return
         part.closed = True
-        final_forbidden = part.forbidden or bool(check_generated(part.acc, streaming=False))
+        final = part.guard.flush()
+        final_forbidden = part.forbidden or final.compliance_triggered
+        if final.visible_text and not final_forbidden:
+            _push_token(i, final.visible_text)
+        sanitized = part.guard.visible_text
         if i == 0:
             if final_forbidden:
-                text, source = summary_fallback + "（模型输出含禁用表述，已使用事实摘要。）", "template"
-            elif not part.acc.strip():
+                text, source = summary_fallback + "（模型输出未通过事实或用语核验，已使用事实摘要。）", "template"
+            elif not sanitized.strip():
                 text, source = summary_fallback, "template"
             else:
-                text, source = _bound_generated_text(part.acc, part.cap)[0], "llm"
+                text, _ = _bound_generated_text(sanitized, part.cap)
+                if error and not text.endswith(("。", "！", "？", "…", "）", ")")):
+                    text = text.rstrip("，、；：,: ") + "…"
+                source = "llm"
+                if part.guard.redactions > 0:
+                    redacted_sections["投资摘要"] = part.guard.redactions
             results["__summary__"] = (text, source)
             _stream_push({"type": "research_summary_text", "text": text})
             return
         sp = writable[i - 1]
         if final_forbidden:
-            body, source = _safe_fallback(sp, fv, "（模型输出含禁用表述，已使用事实模板。）")
-        elif not part.acc.strip():
+            body, source = _safe_fallback(sp, fv, "（模型输出未通过事实或用语核验，已使用事实模板。）")
+        elif not sanitized.strip():
             body, source = _safe_fallback(sp, fv)
         else:
-            body, source = _bound_generated_text(part.acc, part.cap)[0], "llm"
+            body, _ = _bound_generated_text(sanitized, part.cap)
+            if error and not body.endswith(("。", "！", "？", "…", "）", ")")):
+                body = body.rstrip("，、；：,: ") + "…"
+            source = "llm"
+            if part.guard.redactions > 0:
+                redacted_sections[sp.title] = part.guard.redactions
         results[sp.key] = (body, source)
         _stream_push({"type": "report_section", "title": sp.title, "body": body, "source": source})
         _stream_push(f"✓ {sp.title} 完成")
+
+    def _push_token(i: int, token: str) -> None:
+        if token:
+            _stream_push(
+                {"type": "summary_token", "text": token} if i == 0
+                else {"type": "section_token", "title": parts[i].title, "text": token}
+            )
 
     def _route(events) -> bool:
         """把解析器事件落到各部分；返回 False 表示可以提前结束（末段已写满/已判废）。"""
@@ -1385,20 +1486,13 @@ async def _llm_report_stream(
             tok = text if part.acc else text.lstrip()
             if not tok:
                 continue
-            # 实时禁用词闸：并入会命中就不外发、该部分作废（收口时回退模板覆盖已流出片段）
-            if check_generated(part.acc + tok, streaming=True):
-                part.forbidden = True
-                continue
-            room = part.cap - len(part.acc)
-            if len(tok) >= room:
-                tok = tok[:room]
-                part.capped = True
             part.acc += tok
-            if tok:
-                _stream_push(
-                    {"type": "summary_token", "text": tok} if idx == 0
-                    else {"type": "section_token", "title": part.title, "text": tok}
-                )
+            delta = part.guard.feed(tok)
+            part.forbidden |= delta.compliance_triggered
+            if not part.forbidden:
+                _push_token(idx, delta.visible_text)
+            if (not thinks or saw_reasoning) and len(part.guard.visible_text) >= part.cap:
+                part.capped = True
         last = parts[-1]
         return not (cur == len(parts) - 1 and (last.capped or last.forbidden))
 
@@ -1406,7 +1500,6 @@ async def _llm_report_stream(
     # 总时长只是兜底上限（真正判死靠空闲超时）：慢中转 10 token/s 写完整份报告也要 4-5 分钟
     total = max(600.0, idle * (len(parts) + 1) * 2)
     _stream_push(f"开始撰写研究报告（单次流式：摘要 + {len(writable)} 段）…")
-    error = ""
     try:
         async with _LLM_GATE:
             async with asyncio.timeout(total):
@@ -1424,9 +1517,12 @@ async def _llm_report_stream(
                             break
                         rc = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
                         if isinstance(rc, str) and rc:
+                            saw_reasoning = True
                             thinking += rc
                             _push_thinking()
                         content, inline_rc = splitter.feed(_extract_token(chunk))
+                        if splitter._saw_think_boundary:
+                            saw_reasoning = True
                         if splitter.orphan_think_closed:
                             splitter.orphan_think_closed = False
                             # 网关预填 <think> 仅输出裸 </think> 时，若思考链内提前复述了 ## 小节标题，
@@ -1435,14 +1531,17 @@ async def _llm_report_stream(
                             leaked_cot = "\n".join(p.acc for p in parts if p.acc)
                             if leaked_cot:
                                 thinking += leaked_cot
-                            for p in parts:
+                            for p, block in zip(parts, evidence):
                                 p.acc = ""
                                 p.started = False
                                 p.closed = False
                                 p.capped = False
                                 p.forbidden = False
+                                p.guard = _section_guard(block, fv)
                             cur = 0
-                            results.clear()
+                            results = dict(insufficient_map)
+                            pending_insufficient[:] = [sp for sp in specs if sp.key in insufficient_map]
+                            redacted_sections.clear()
                             parser = SectionStreamParser(section_titles)
                             _stream_push({"type": "research_summary_text", "text": ""})
                             if had_sec:
@@ -1451,6 +1550,7 @@ async def _llm_report_stream(
                                     _stream_push({"type": "section_queued", "title": sp.title})
                             _push_thinking(force=True)
                         if inline_rc:
+                            saw_reasoning = True
                             thinking += inline_rc
                             _push_thinking()
                         if content and not _route(parser.feed(content)):
@@ -1461,7 +1561,7 @@ async def _llm_report_stream(
                         with contextlib.suppress(Exception):
                             await aclose()
     except Exception as e:  # noqa: BLE001  超时/网络/429：已写部分保留，其余回退模板
-        error = sanitize_err_text(type(e).__name__ + (f": {e}" if str(e) else ""))
+        error = sanitize_err_text(e)
         state["_llm_stream_error"] = error
         logger.warning("单次流式撰写中断，未完成部分回退模板：%s", error)
         _stream_push(f"⚠ 模型流式撰写中断（{error[:80]}），未完成章节已回退规则模板")
@@ -1473,7 +1573,10 @@ async def _llm_report_stream(
             _start(i)
             _close(i)
     _emit_insufficient(len(order))
-    finalize_diag(diag, int((time.perf_counter() - t0) * 1000), error=error)
+    if redacted_sections:
+        state.setdefault("_redacted_sections", {}).update(redacted_sections)
+    note = ",".join(f"{k}:{v}" for k, v in redacted_sections.items()) if redacted_sections else ""
+    finalize_diag(diag, int((time.perf_counter() - t0) * 1000), error=error, note=note)
 
     summary = results.pop("__summary__", (summary_fallback, "template"))
     return summary, [results[sp.key] for sp in specs]
@@ -1571,7 +1674,9 @@ async def _write_sections_parallel(state: ResearchState, specs: List[SectionSpec
         try:
             result = await _llm_section(state, spec, fv)
         except Exception as exc:  # noqa: BLE001  单段独立降级的第二道网（第一道在 _llm_section 内）
-            logger.warning("%s 段撰写异常：%s", spec.key, exc)
+            logger.warning("%s 段撰写异常：%s", spec.key, sanitize_err_text(exc))
+            fb_body, fb_source = _safe_fallback(spec, fv, "（撰写异常，已回退模板。）")
+            _stream_push({"type": "report_section", "title": spec.title, "body": fb_body, "source": fb_source})
             _stream_push(f"⚠ {spec.title} 撰写异常，回退模板")
             return exc
         body, source = result
@@ -1601,7 +1706,7 @@ def _assemble_report(
     gen: dict[str, str] = {}
     for spec, res in zip(specs, results):
         if isinstance(res, BaseException):
-            logger.warning("%s 段 gather 异常，回退模板：%s", spec.key, res)
+            logger.warning("%s 段 gather 异常，回退模板：%s", spec.key, sanitize_err_text(res))
             # fallback 本身也可能抛异常（如数据源返回畸形 kline，_ma_arrangement 崩）。
             # 这里是"单段独立降级"的最后一道兜底：fallback 再崩，也只让这一段显示占位，
             # 绝不让整个报告因一段挂掉（此前无保护，fallback 一崩 report_node 直接抛异常，
@@ -1609,7 +1714,7 @@ def _assemble_report(
             try:
                 body, source = spec.fallback(fv) + "（撰写异常，已回退模板。）", "template"
             except Exception as fb_err:  # noqa: BLE001
-                logger.warning("%s 段 fallback 也失败：%s", spec.key, fb_err)
+                logger.warning("%s 段 fallback 也失败：%s", spec.key, sanitize_err_text(fb_err))
                 body, source = f"（{spec.title}生成失败，数据可能异常，本段暂不展开。）", "error"
         else:
             body, source = res
@@ -1617,7 +1722,31 @@ def _assemble_report(
         sections.append({"title": spec.title, "body": body})
 
     # 证据分层与数据来源（规则生成，不让模型写；如实上报每段的生成来源）
-    sections.append({"title": "证据分层与数据来源", "body": _section_evidence_traceback(findings, fv, gen)})
+    risk_metrics = _find(findings, "risk_metrics").get("risk") or {}
+    if risk_metrics:
+        unsigned_pct = (
+            lambda key: facts.pct(risk_metrics[key] * 100, 2, signed=False)
+            if risk_metrics.get(key) is not None else facts.MISSING
+        )
+        signed_pct = (
+            lambda key: facts.pct(risk_metrics[key] * 100, 2, signed=True)
+            if risk_metrics.get(key) is not None else facts.MISSING
+        )
+        dd_span = ""
+        if risk_metrics.get("drawdown_from") and risk_metrics.get("drawdown_to"):
+            dd_span = f"（{risk_metrics['drawdown_from']} 至 {risk_metrics['drawdown_to']}）"
+        sample_days = risk_metrics.get("sample_days")
+        sample_str = f"近 {sample_days} 个交易日，" if sample_days else ""
+        sections.append({"title": "客观风险指标", "body": (
+            f"年化波动率 {unsigned_pct('annualized_volatility')}，最大回撤 {signed_pct('max_drawdown')}{dd_span}，"
+            f"Beta {facts.fmt(risk_metrics.get('beta'), 2)}，Sharpe {facts.fmt(risk_metrics.get('sharpe'), 2)}。"
+            f"历史法 95% 日频 VaR {unsigned_pct('var_95')}，CVaR {unsigned_pct('cvar_95')}。"
+            f"样本区间：{sample_str}截至 {risk_metrics.get('as_of') or '—'}，基准为沪深300，日频年化按 252 个交易日。"
+        )})
+    sections.append({
+        "title": "证据分层与数据来源",
+        "body": _section_evidence_traceback(findings, fv, gen, state.get("_redacted_sections")),
+    })
 
     catalyst = _compose_catalyst(fv, template)
     risks = _compose_risks(state.get("risk_flags") or [], fv)

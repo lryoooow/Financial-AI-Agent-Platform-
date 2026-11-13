@@ -12,6 +12,7 @@ import logging
 from typing import Any, Optional
 
 from . import profile, store
+from ..core.rag import embeddings, memory_judge
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,28 @@ CURRENT_USER_TEXT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVa
     "kb_current_user_text", default=None
 )
 _REBUILD_LOCK = asyncio.Lock()
+_MEMORY_TASKS: set[asyncio.Task] = set()
+_DELETED_REPORTS: set[str] = set()
+
+
+def learn_from_user_text(text: str) -> None:
+    async def save():
+        try:
+            await memory_judge.judge(text)
+        except Exception:
+            logger.debug("长期记忆写入失败")
+
+    task = asyncio.create_task(save())
+    _MEMORY_TASKS.add(task)
+    task.add_done_callback(_MEMORY_TASKS.discard)
 
 
 async def init_and_backfill() -> int:
+    async with _REBUILD_LOCK:
+        return await _init_and_backfill()
+
+
+async def _init_and_backfill() -> int:
     """启动时建库并把存量报告补入知识库（已入库的跳过，已删除的清理）。返回新入库数。"""
     ok = await asyncio.to_thread(store.init)
     if not ok:
@@ -65,12 +85,15 @@ async def rebuild_reports() -> int:
     """设置页「重建索引」：加锁串行清空报告文档后从业务库全量重建。"""
     async with _REBUILD_LOCK:
         await asyncio.to_thread(store.clear, "report")
-        return await init_and_backfill()
+        return await _init_and_backfill()
 
 
 async def on_report_saved(report_id: str, doc: dict, *, code: str, template: str) -> None:
     """报告落库后的统一钩子：入知识库 +（开启学习画像时）记研究行为。"""
-    await asyncio.to_thread(store.index_report, report_id, doc)
+    async with _REBUILD_LOCK:
+        if report_id in _DELETED_REPORTS:
+            return
+        await asyncio.to_thread(store.index_report, report_id, doc)
     try:
         from ..app_settings import load_app_settings
 
@@ -86,12 +109,19 @@ async def on_report_saved(report_id: str, doc: dict, *, code: str, template: str
 
 
 async def on_report_deleted(report_id: str) -> None:
-    await asyncio.to_thread(store.delete_by_ref, "report", report_id)
+    async with _REBUILD_LOCK:
+        _DELETED_REPORTS.add(report_id)
+        if len(_DELETED_REPORTS) > 512:
+            _DELETED_REPORTS.pop()
+        await asyncio.to_thread(store.delete_by_ref, "report", report_id)
 
 
 async def search(query: str, *, limit: int = 6, ticker: str = "", kind: str = "") -> list[dict[str, Any]]:
     try:
-        return await asyncio.to_thread(store.search, query, limit=limit, ticker=ticker, kind=kind)
+        limit = min(20, max(1, int(limit)))
+        depth = min(20, limit * 3) if embeddings.enabled() else limit
+        hits = await asyncio.to_thread(store.search, query, limit=depth, ticker=ticker, kind=kind)
+        return (await embeddings.rerank(query, hits))[:limit]
     except Exception as e:  # noqa: BLE001
         logger.warning("知识库检索失败：%s", e)
         return []
@@ -106,7 +136,10 @@ async def stats() -> dict[str, Any]:
 
 
 async def record_stock_view(code: str, name: str = "") -> None:
-    await asyncio.to_thread(profile.record_event, "stock_view", code, name)
+    from ..app_settings import load_app_settings
+
+    if (await load_app_settings()).get("learn_profile", True):
+        await asyncio.to_thread(profile.record_event, "stock_view", code, name)
 
 
 async def record_chat_topics(text: str) -> list[str]:
@@ -124,7 +157,10 @@ async def learned_block(enabled: bool = True) -> str:
     if not enabled:
         return ""
     try:
-        return await asyncio.to_thread(profile.render_learned_block)
+        learned, memories = await asyncio.gather(
+            asyncio.to_thread(profile.render_learned_block), asyncio.to_thread(memory_judge.render_memories),
+        )
+        return "\n".join(part for part in (learned, memories) if part)
     except Exception as e:  # noqa: BLE001
         logger.warning("渲染学习画像失败：%s", e)
         return ""
@@ -132,9 +168,14 @@ async def learned_block(enabled: bool = True) -> str:
 
 async def remember_note(text: str, source: str = "model") -> Optional[dict[str, Any]]:
     """记偏好笔记。source=model 时必须通过防注入校验（出自用户本轮原话、无指令式措辞）。"""
-    if source != "user" and not profile.note_is_acceptable(text, CURRENT_USER_TEXT.get()):
-        logger.info("拒绝模型提交的偏好笔记（未出自用户原话或含指令式措辞）")
-        return None
+    if source != "user":
+        from ..core.rag.memory_judge import classify
+
+        current = CURRENT_USER_TEXT.get() or ""
+        decision = classify(current)
+        if decision is None or not profile.note_is_acceptable(text, decision.content):
+            logger.info("拒绝未由用户直接表达的偏好笔记")
+            return None
     return await asyncio.to_thread(profile.add_note, text, source)
 
 

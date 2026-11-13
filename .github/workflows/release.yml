@@ -1,0 +1,130 @@
+name: Build and release JingYuan
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Desktop ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            arch: x64
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: fronted/package.json
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.10.11"
+          python-version: "3.13"
+      - name: Backend regression and evaluation
+        shell: bash
+        run: uv run --project backend --locked --extra dev python -m pytest -q backend/tests
+      - name: Windows installer, portable EXE and ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build_windows.ps1 -OutputDir "$env:RUNNER_TEMP/release" -BuildRoot "$env:RUNNER_TEMP/jingyuan-build"
+      - name: macOS package and portable ZIP
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          JINGYUAN_ARCH: ${{ matrix.arch }}
+        run: |
+          pnpm --dir fronted install --frozen-lockfile --ignore-scripts
+          pnpm --dir fronted typecheck
+          pnpm --dir fronted build
+          uv run --project backend --locked python scripts/generate_icons.py
+          export JINGYUAN_FRONTEND_DIST="$PWD/fronted/dist"
+          uv run --project backend --locked --extra packaging pyinstaller backend/packaging/finresearch.spec --noconfirm --distpath "$RUNNER_TEMP/python-dist" --workpath "$RUNNER_TEMP/pyinstaller"
+          find "$RUNNER_TEMP/python-dist/FinResearch" -type f \( -perm +111 -o -name '*.dylib' -o -name '*.so' \) -exec codesign --force --sign - {} +
+          codesign --force --sign - "$RUNNER_TEMP/python-dist/FinResearch/FinResearch"
+          uv run --project backend --locked python scripts/smoke_sidecar.py "$RUNNER_TEMP/python-dist/FinResearch/FinResearch"
+          node scripts/package_desktop.cjs mac "$JINGYUAN_ARCH" "$RUNNER_TEMP/python-dist/FinResearch" "$RUNNER_TEMP/release"
+          touch "$RUNNER_TEMP/.portable"
+          archive="$(find "$RUNNER_TEMP/release" -maxdepth 1 -name '*.zip' -print -quit)"
+          test -f "$archive"
+          python3 -c "import sys, zipfile; z=zipfile.ZipFile(sys.argv[1], 'a'); z.write(sys.argv[2], '.portable'); z.close()" "$archive" "$RUNNER_TEMP/.portable"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jingyuan-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/release/*.exe
+            ${{ runner.temp }}/release/*.zip
+            ${{ runner.temp }}/release/*.dmg
+          if-no-files-found: error
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify the Web image
+        shell: bash
+        run: |
+          docker build -t jingyuan-web:smoke .
+          docker run --name jingyuan-web-smoke --rm -d -p 127.0.0.1:9527:9527 jingyuan-web:smoke
+          trap 'docker logs --tail 40 jingyuan-web-smoke; docker stop jingyuan-web-smoke' EXIT
+          curl --retry 30 --retry-all-errors --retry-connrefused --retry-delay 1 -fsS http://127.0.0.1:9527/api/health | python3 -c "import json,sys; assert json.load(sys.stdin)['db'] == 'ok'"
+          curl -fsS http://127.0.0.1:9527/ | grep -q 'index-'
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [desktop, web]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Check release version and generate hashes
+        shell: bash
+        run: |
+          version="$(node -p "require('./fronted/package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
+          (cd release-files && sha256sum *.exe *.dmg *.zip > SHA256SUMS.txt)
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/jingyuan-web" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-files/* --verify-tag --generate-notes
+          fi

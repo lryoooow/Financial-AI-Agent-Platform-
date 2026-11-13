@@ -85,6 +85,9 @@ def test_chat_tools_cover_the_data_surface():
         "search_news",
         "web_search",
         "search_industry",
+        "compute_risk_metrics",
+        "extract_article_text",
+        "verify_citation",
     }
 
 
@@ -275,16 +278,11 @@ def test_render_todos_normalizes_shape():
 # 这几条测试就是"能力还在"的守卫——没有它们，哪天中间件被谁摘掉也不会有人发现。
 
 
-def test_history_offload_capability_still_wired():
-    """旧 offload_history/retrieve_history_excerpt 的替代者：文件工具必须真的挂着。
-
-    SummarizationMiddleware 把被驱逐的历史写进 /conversation_history/{thread_id}.md，
-    并把路径嵌进摘要里让 agent 自己 read_file 取回。少了文件工具，历史就是真丢了。
-    """
+def test_virtual_filesystem_tools_are_hidden_from_the_model():
     mw = ca.ExcludeToolsMiddleware(excluded=ca._EXCLUDED_TOOLS)
-    kept = {t.name for t in mw._filter(_Req(_named("ls", "read_file", "write_file", "execute"))).tools}
-    assert {"ls", "read_file", "write_file"} <= kept
-    assert "execute" not in kept
+    names = ("ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute")
+    kept = {t.name for t in mw._filter(_Req(_named(*names, "resolve_entity"))).tools}
+    assert kept == {"resolve_entity"}
 
 
 def test_entity_recognition_capability_still_available():

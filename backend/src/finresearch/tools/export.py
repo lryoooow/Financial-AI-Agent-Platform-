@@ -161,7 +161,8 @@ def render_md(doc: dict) -> str:
             L.append("| " + _md_cell(r.get("name", "")) + " | " + " | ".join(_md_cell(v) for v in vals) + " |")
         L.append("")
     for s in d["sections"]:
-        L.append(f"## {s.get('title', '')}\n" + s.get("body", "") + "\n")
+        body_md = re.sub(r"(?m)^#{1,2}(?=\s)", "###", s.get("body", "") or "")
+        L.append(f"## {s.get('title', '')}\n" + body_md + "\n")
     if d["risks"]:
         L.append("## 风险提示\n" + "\n".join(f"- {r}" for r in d["risks"]) + "\n")
     if d["sources"]:
@@ -269,6 +270,12 @@ def _ensure_cjk_font() -> str:
         ("FinDeng", win_dir / "Deng.ttf", None),
         ("FinSimSun", win_dir / "simsun.ttc", 0),
         ("FinSimHei", win_dir / "simhei.ttf", None),
+        ("FinMacHeiti", Path("/System/Library/Fonts/STHeiti Light.ttc"), 0),
+        ("FinMacSongti", Path("/System/Library/Fonts/Supplemental/Songti.ttc"), 0),
+        ("FinMacArialUni", Path("/Library/Fonts/Arial Unicode.ttf"), None),
+        ("FinLinuxZenHei", Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"), 0),
+        ("FinLinuxMicroHei", Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"), 0),
+        ("FinLinuxDroidFallback", Path("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"), None),
     ]
     for name, font_path, sub_idx in candidates:
         if font_path.is_file():

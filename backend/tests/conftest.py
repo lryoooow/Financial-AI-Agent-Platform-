@@ -9,3 +9,4 @@ import tempfile
 os.environ.setdefault(
     "FINRESEARCH_KNOWLEDGE_DB", os.path.join(tempfile.mkdtemp(prefix="jy-kb-"), "knowledge.db")
 )
+os.environ.setdefault("FIN_TRUSTED_HOSTS", "testserver,localhost,127.0.0.1")

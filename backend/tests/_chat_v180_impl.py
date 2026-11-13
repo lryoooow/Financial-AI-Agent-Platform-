@@ -153,7 +153,7 @@ async def t_compaction_rollover():
         check(captured.get("thread") == f"{conv}:g1", f"新线程代际 conv:g1（实际 {captured.get('thread')}）")
         msgs = captured.get("msgs") or []
         check(bool(msgs) and msgs[0]["content"].startswith(compaction.SUMMARY_PREFIX), "新线程以前情摘要播种")
-        check("继续聊估值" in msgs[-1]["content"] and "【本轮上下文】" in msgs[-1]["content"], "本轮消息带本轮上下文")
+        check(msgs[-1]["content"] == "继续聊估值", "动态上下文不写入本轮消息")
         async with session_scope() as s:
             row = await s.get(ChatContextSummary, conv)
         check(row is not None and row.generation == 1 and "茅台" in row.summary, "压缩代际与摘要落库")
@@ -314,8 +314,22 @@ async def main():
     await init_db()
     await init_checkpointer()
     try:
-        await t_research_in_conversation()
-        await t_research_injection_once()
+        async def blocked_fixture(**_):
+            await asyncio.Event().wait()
+            if False:
+                yield ""
+
+        original_runner = routes.run_research_direct
+        routes.run_research_direct = blocked_fixture
+        try:
+            await t_research_in_conversation()
+            await t_research_injection_once()
+        finally:
+            running = [item.task for item in routes._RESEARCH_RUNS.values() if item.task and not item.task.done()]
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            routes.run_research_direct = original_runner
         await t_compaction_rollover()
         await t_single_stream_research_e2e()
     finally:

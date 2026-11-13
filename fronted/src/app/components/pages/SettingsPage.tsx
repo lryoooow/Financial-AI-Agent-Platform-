@@ -1,3 +1,5 @@
+import { useConfirm } from "../ui/confirm";
+import { isImeKeyEvent } from "../../lib/ime";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useTheme } from "next-themes";
 import {
@@ -5,12 +7,13 @@ import {
   RefreshCw, SlidersHorizontal, Trash2, UserRound, X,
 } from "lucide-react";
 import { Settings as ModelSettings } from "./Settings";
+import { McpSettings, SchedulerSettings } from "../settings/IntegrationSettings";
 import { TEMPLATES } from "../../data/report";
 import {
   api, type AppSettings, type KnowledgeStats, type LearnedProfile, type UserProfile,
 } from "../../api/client";
 
-type TabId = "general" | "models" | "context" | "research" | "personal" | "data" | "about";
+type TabId = "general" | "models" | "context" | "research" | "personal" | "data" | "scheduler" | "mcp" | "about";
 
 const TABS: { id: TabId; label: string; icon: typeof Cpu }[] = [
   { id: "general", label: "通用", icon: SlidersHorizontal },
@@ -19,6 +22,8 @@ const TABS: { id: TabId; label: string; icon: typeof Cpu }[] = [
   { id: "research", label: "研究", icon: FlaskConical },
   { id: "personal", label: "个性化", icon: UserRound },
   { id: "data", label: "数据与知识库", icon: Database },
+  { id: "scheduler", label: "定时巡检", icon: RefreshCw },
+  { id: "mcp", label: "MCP 工具服务", icon: BookOpen },
   { id: "about", label: "关于", icon: Info },
 ];
 
@@ -84,18 +89,20 @@ export function SettingsPage({ active, onActivate }: Props) {
   };
 
   return (
-    <div className="h-full min-h-0 grid grid-cols-[180px_1fr] overflow-hidden">
-      <nav className="border-r border-border bg-sidebar/40 p-3 space-y-0.5 overflow-y-auto">
+    <div className="h-full min-h-0 grid grid-cols-[160px_minmax(0,1fr)] overflow-hidden">
+      <nav aria-label="设置分类" className="border-r border-border bg-sidebar/40 p-3 space-y-0.5 overflow-y-auto">
         <p className="px-2 pt-1 pb-3 text-[10px] tracking-[0.2em] text-muted-foreground/70 uppercase">设置</p>
         {TABS.map((t) => {
           const Icon = t.icon;
           return (
             <button
               key={t.id}
+              type="button"
+              aria-current={tab === t.id ? "page" : undefined}
               onClick={() => setTab(t.id)}
-              className={`w-full flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors ${tab === t.id ? "bg-sidebar-accent text-foreground" : "text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/50"}`}
+              className={`w-full flex items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 py-2 text-left text-sm transition-colors ${tab === t.id ? "bg-sidebar-accent text-foreground" : "text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/50"}`}
             >
-              <Icon className={`size-4 ${tab === t.id ? "text-gold" : ""}`} /> {t.label}
+              <Icon className={`size-4 shrink-0 ${tab === t.id ? "text-gold" : ""}`} /> {t.label}
             </button>
           );
         })}
@@ -112,6 +119,8 @@ export function SettingsPage({ active, onActivate }: Props) {
               {tab === "research" && <ResearchTab app={app} patch={patchApp} />}
               {tab === "personal" && <PersonalTab app={app} patch={patchApp} />}
               {tab === "data" && <DataTab />}
+              {tab === "scheduler" && <SchedulerSettings />}
+              {tab === "mcp" && <McpSettings />}
               {tab === "about" && <AboutTab />}
             </div>
           </div>
@@ -183,7 +192,7 @@ function GeneralTab() {
   const desktop = typeof window !== "undefined" ? window.finresearch?.app : undefined;
   const [prefs, setPrefs] = useState<{ closeToTray: boolean; autoLaunch: boolean } | null>(null);
   const [startPage, setStartPage] = useState<string>(() => {
-    try { return localStorage.getItem(START_PAGE_KEY) || "research"; } catch { return "research"; }
+    try { return localStorage.getItem(START_PAGE_KEY) || "overview"; } catch { return "overview"; }
   });
 
   useEffect(() => {
@@ -211,6 +220,7 @@ function GeneralTab() {
           <Segmented
             value={startPage}
             options={[
+              { value: "overview", label: "市场总览" },
               { value: "research", label: "深度研究" },
               { value: "chat", label: "投研问答" },
               { value: "market", label: "实时行情" },
@@ -225,7 +235,7 @@ function GeneralTab() {
         <Row label="关闭窗口时最小化到托盘" hint="关闭后点击托盘图标即可恢复窗口；关闭此项则关闭窗口即退出">
           <Toggle checked={prefs?.closeToTray ?? true} disabled={!desktop || !prefs} onChange={(v) => updateDesktop({ closeToTray: v })} />
         </Row>
-        <Row label="开机自动启动" hint="登录 Windows 后在后台启动（托盘驻留）">
+        <Row label="开机自动启动" hint="登录系统后在后台启动（托盘驻留）">
           <Toggle checked={prefs?.autoLaunch ?? false} disabled={!desktop || !prefs} onChange={(v) => updateDesktop({ autoLaunch: v })} />
         </Row>
       </Section>
@@ -270,7 +280,7 @@ function ContextTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppSe
 // ── 研究 ─────────────────────────────────────────────────
 function ResearchTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppSettings>) => void }) {
   return (
-    <Section title="深度研究" desc="研究在「研究对话」中切换到「深度研究」模式发起，报告以卡片形式嵌入对话，完成后自动进入报告库与知识库。">
+    <Section title="深度研究" desc="研究在独立的「深度研究」工作台中发起与跟踪，完成后自动进入报告库与知识库，并可一键带上下文跳转至「投研问答」继续追问。">
       <Row label="默认研究模板">
         <Segmented
           value={app.default_template}
@@ -296,6 +306,7 @@ function ResearchTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppS
 
 // ── 个性化 ───────────────────────────────────────────────
 function PersonalTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppSettings>) => void }) {
+  const confirm = useConfirm();
   const [profile, setProfile] = useState<UserProfile>({ risk_preference: "", investment_cycle: "", focus_metrics: "", analysis_style: "" });
   const profileLoaded = useRef(false);
   const pendingProfileRef = useRef<UserProfile | null>(null);
@@ -379,7 +390,7 @@ function PersonalTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppS
             <input
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && note.trim()) api.addProfileNote(note.trim()).then(() => { setNote(""); void loadLearned(); }).catch(() => {}); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !isImeKeyEvent(e.nativeEvent) && note.trim()) api.addProfileNote(note.trim()).then(() => { setNote(""); void loadLearned(); }).catch(() => {}); }}
               placeholder="手动添加一条偏好，如：偏好高股息低估值"
               className="flex-1 rounded-lg bg-input border border-border px-3 py-1.5 text-xs outline-none focus:border-gold/40"
             />
@@ -394,7 +405,7 @@ function PersonalTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppS
         </div>
         <Row label="清除学习数据" hint="删除全部行为记录与偏好笔记（含行情搜索记录），不可恢复">
           <button
-            onClick={() => { if (window.confirm("清除全部学习数据？")) api.clearLearnedProfile().then(loadLearned).catch(() => {}); }}
+            onClick={async () => { if (await confirm("清除全部学习数据？")) void api.clearLearnedProfile().then(loadLearned).catch(() => {}); }}
             className="flex items-center gap-1 rounded-lg bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive hover:bg-destructive/20"
           >
             <Trash2 className="size-3.5" /> 清除
@@ -416,6 +427,7 @@ function LearnedLine({ icon, label, items }: { icon: ReactNode; label: string; i
 
 // ── 数据与知识库 ─────────────────────────────────────────
 function DataTab() {
+  const confirm = useConfirm();
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -426,7 +438,7 @@ function DataTab() {
       <Section title="本地知识库" desc="研究生成的每一份报告都会自动切分入库，对话中的 AI 通过检索（RAG）引用它们；较早对话的压缩摘要也会入库，形成跨会话记忆。">
         <Row label="已入库" hint={stats?.updated_at ? `最近更新 ${stats.updated_at}` : undefined}>
           <span className="text-xs text-foreground/85 tabular">
-            {stats ? `${stats.reports} 份报告 · ${stats.conversations} 段对话摘要 · ${stats.chunks} 个片段` : "读取中…"}
+            {stats ? `${stats.reports} 份报告 · ${stats.conversations} 段对话摘要${stats.external ? ` · ${stats.external} 份外部文档` : ""} · ${stats.chunks} 个片段` : "读取中…"}
           </span>
         </Row>
         <Row label="重建报告索引" hint="从报告库重新切分并建立全文索引（报告很多时需要几秒）">
@@ -450,14 +462,14 @@ function DataTab() {
       <Section title="本地数据">
         <Row label="行情搜索记录">
           <button
-            onClick={() => { if (window.confirm("清除全部行情搜索记录？")) api.clearMarketHistory().catch(() => {}); }}
+            onClick={async () => { if (await confirm("清除全部行情搜索记录？")) void api.clearMarketHistory().catch(() => {}); }}
             className="flex items-center gap-1 rounded-lg bg-secondary px-2.5 py-1.5 text-xs hover:bg-secondary/70"
           >
             <Trash2 className="size-3.5" /> 清除
           </button>
         </Row>
-        <Row label="数据位置" hint="对话、报告、知识库与密钥（加密）全部保存在本机用户目录，不上传任何服务器">
-          <span className="text-[11px] font-mono text-muted-foreground">%APPDATA%\FinResearch</span>
+        <Row label="数据位置" hint="对话、报告、知识库和加密密钥保存在运行景渊的设备上。桌面安装版使用系统用户数据目录，便携版使用应用旁的 portable-data，Docker 使用持久卷。">
+          <Database className="size-4 text-muted-foreground" />
         </Row>
       </Section>
     </>
@@ -472,7 +484,7 @@ function AboutTab() {
   }, []);
   return (
     <Section title="景渊 JingYuan · 金融研究助手">
-      <Row label="版本"><span className="text-xs tabular text-foreground/85">{version || "1.8.1"}</span></Row>
+      <Row label="版本"><span className="text-xs tabular text-foreground/85">{version || "2.0.0"}</span></Row>
       <Row label="数据原则" hint="只读研究，永不接入交易；所有数值由本地工具库计算并可溯源，AI 仅供研究参考，不构成投资建议。">
         <BookOpen className="size-4 text-gold" />
       </Row>

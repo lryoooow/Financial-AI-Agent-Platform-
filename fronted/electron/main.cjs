@@ -20,12 +20,14 @@
 // %APPDATA%/FinResearch/desktop-settings.json，由设置页经 IPC 读写；开机自启以 --hidden
 // 参数启动，直接驻留托盘不弹窗口。
 
-const { app, BrowserWindow, dialog, ipcMain, Tray, Menu, screen, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, screen, session, shell, Tray } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
+const isWin = process.platform === 'win32';
+const isMac = process.platform === 'darwin';
 
 let backend = null;
 let win = null;
@@ -45,6 +47,12 @@ let showWhenReady = false;
 const startHidden = process.argv.includes('--hidden');
 
 // [B2] 单实例锁：第二个实例只聚焦既有窗口，不再拉起第二套后端
+const explicitProfile = configuredDataDir();
+if (app.isPackaged && explicitProfile) {
+  const profile = path.join(explicitProfile, 'electron');
+  fs.mkdirSync(profile, { recursive: true });
+  app.setPath('userData', profile);
+}
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -56,15 +64,16 @@ if (!gotLock) {
 
 // 应用内窗口图标：electron/icon.ico 在 dev 与 packaged 下都随 main.cjs 同目录存在。
 function windowIcon() {
-  return path.join(__dirname, 'icon.ico');
+  return path.join(__dirname, isWin ? 'icon.ico' : 'icons/icon.png');
 }
 
 function backendExe() {
+  const executable = isWin ? 'FinResearch.exe' : 'FinResearch';
   if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'backend', 'FinResearch.exe');
+    return path.join(process.resourcesPath, 'backend', executable);
   }
   // dev：指向已打包的后端 exe（先在 backend 跑过 pyinstaller）
-  return path.join(__dirname, '..', '..', 'backend', 'dist', 'FinResearch', 'FinResearch.exe');
+  return path.join(__dirname, '..', '..', 'backend', 'dist', 'FinResearch', executable);
 }
 
 // 产品名 1.2.2 起改为「景渊 JingYuan」，但用户数据目录仍沿用 FinResearch：
@@ -72,9 +81,29 @@ function backendExe() {
 // 且必须与 backend/config.py 的 app_data_dir() 保持一致（两端靠 port.txt 握手）。
 // v1.6.3（D5）：APPDATA 环境变量优先（与后端 config.py 同算法——后端读
 // os.environ["APPDATA"]，旧实现硬拼 homedir，APPDATA 被重定向时两端目录分叉、握手必失败）。
+function configuredDataDir() {
+  const explicit = process.env.FINRESEARCH_DATA_DIR?.trim();
+  if (explicit) return path.resolve(explicit);
+  if (app.isPackaged) {
+    try {
+      const directory = process.env.PORTABLE_EXECUTABLE_DIR
+        || (isMac ? path.resolve(path.dirname(process.execPath), '../../..') : path.dirname(process.execPath));
+      const portable = path.join(directory, 'portable-data');
+      if (process.env.PORTABLE_EXECUTABLE_DIR || fs.existsSync(path.join(directory, '.portable')) || fs.existsSync(portable)) {
+        return portable;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 function appDataDir() {
-  const appData = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-  return path.join(appData, 'FinResearch');
+  const configured = configuredDataDir();
+  if (configured) return configured;
+  const home = os.homedir();
+  if (isWin) return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'FinResearch');
+  if (isMac) return path.join(home, 'Library', 'Application Support', 'FinResearch');
+  return path.join(process.env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'FinResearch');
 }
 
 function backendLogFile() {
@@ -128,7 +157,7 @@ function writeDesktopPrefs(next) {
   } catch (e) {
     appendBackendLog(`[prefs-write-failed] ${e && e.message ? e.message : e}`);
   }
-  applyAutoLaunch();
+  if (Object.hasOwn(next, 'autoLaunch')) applyAutoLaunch();
   return desktopPrefs;
 }
 
@@ -137,7 +166,14 @@ function applyAutoLaunch() {
   try {
     // 便携版运行时 execPath 指向解压临时目录，自启必须指向便携 exe 本体
     const exePath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
-    app.setLoginItemSettings({ openAtLogin: !!desktopPrefs.autoLaunch, path: exePath, args: ['--hidden'] });
+    const launch = { openAtLogin: !!desktopPrefs.autoLaunch, args: ['--hidden'] };
+    const profile = configuredDataDir();
+    if (isWin && profile) {
+      const hash = require('node:crypto').createHash('sha256').update(profile.toLowerCase()).digest('hex').slice(0, 12);
+      app.setLoginItemSettings({ ...launch, path: exePath, name: 'JingYuan-' + hash });
+    } else {
+      app.setLoginItemSettings(isWin ? { ...launch, path: exePath } : launch);
+    }
   } catch (e) {
     appendBackendLog(`[auto-launch-failed] ${e && e.message ? e.message : e}`);
   }
@@ -170,7 +206,7 @@ function showMainWindow() {
 
 function createTray() {
   if (tray) return;
-  tray = new Tray(windowIcon());
+  tray = new Tray(isMac ? path.join(__dirname, 'icons/tray.png') : windowIcon());
   tray.setToolTip('景渊 · 金融研究助手');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '打开景渊', click: () => showMainWindow() },
@@ -262,6 +298,8 @@ function waitHealth(port, retries = 240) {
 function backendEnv() {
   return {
     ...process.env,
+    FINRESEARCH_DATA_DIR: appDataDir(),
+    FIN_WEB: '0',
     FINRESEARCH_MARKET_PROXY_BYPASS: process.env.FINRESEARCH_MARKET_PROXY_BYPASS || '1',
   };
 }
@@ -317,7 +355,7 @@ function createWindow(port) {
     minWidth,
     minHeight,
     title: '景渊 · 金融研究助手',
-    frame: false,            // 无原生边框：去掉 Windows 标题栏按钮，仅保留应用内 TitleBar
+    ...(isMac ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 12, y: 10 } } : { frame: false }),
     autoHideMenuBar: true,
     icon: windowIcon(),      // 窗口/任务栏图标（统一品牌资产）
     backgroundColor: '#0b1220',
@@ -429,10 +467,20 @@ function registerWindowIpc() {
     writeDesktopPrefs(next);
     return prefsPayload();
   });
+  ipcMain.handle('finresearch:clipboard:write-image', (e, dataUrl) => {
+    if (!isMainWindow(e) || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return false;
+    try {
+      const img = nativeImage.createFromDataURL(dataUrl);
+      if (img.isEmpty()) return false;
+      clipboard.writeImage(img);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  });
 }
 
-// [B3] 优雅退出：先握手让后端自己走 lifespan 收尾（检查点 flush、日志「关闭。」），
-// 等它退出最多 5s，超时才硬杀。
+// 先通知后端取消超时的请求并刷新检查点，再等待进程退出。
 function requestBackendShutdown() {
   // 核验修复：附启动时随机生成的 X-Shutdown-Token（自定义头强制 CORS 预检，
   // 跨站 no-cors 表单无法伪造本握手关掉本地后端）。
@@ -445,7 +493,7 @@ function requestBackendShutdown() {
         host: '127.0.0.1', port: backendPort, path: '/api/shutdown', method: 'POST', timeout: 2000,
         headers: token ? { 'X-Shutdown-Token': token } : {},
       },
-      (res) => { res.resume(); resolve(true); },
+      (res) => { res.resume(); resolve(res.statusCode === 200); },
     );
     req.on('error', () => resolve(false));
     req.on('timeout', () => { req.destroy(); resolve(false); });
@@ -457,11 +505,20 @@ async function stopBackendGracefully() {
   if (!backend) return;
   const child = backend;
   await requestBackendShutdown();
-  await new Promise((resolve) => {
-    child.once('exit', () => resolve(true));
-    setTimeout(resolve, 5000); // 最多等 5s
-  });
-  try { child.kill(); } catch (_) {} // 仍在就硬杀（TerminateProcess）
+  if (child.exitCode === null && child.signalCode === null) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.removeListener('exit', onExit);
+        try { child.kill(); } catch (_) {}
+        resolve();
+      }, 10000);
+      function onExit() {
+        clearTimeout(timer);
+        resolve();
+      }
+      child.once('exit', onExit);
+    });
+  }
   if (backend === child) backend = null;
 }
 
@@ -471,7 +528,6 @@ async function start() {
   if (!startHidden) createSplash();          // [B2] 立即出反馈窗口（开机自启隐藏启动时不出）
   registerWindowIpc();
   createTray();
-  applyAutoLaunch();
   try {
     const port = await launchBackend();
     // v1.8.0：界面由本地后端伺服，HTTP 缓存毫无收益却会在升级后继续显示旧版界面
@@ -486,7 +542,7 @@ async function start() {
     dialog.showErrorBox(
       '景渊启动失败',
       `本地研究引擎启动失败：${e && e.message ? e.message : e}\n\n` +
-      '日志位置：%APPDATA%\\FinResearch\\backend.log 与 backend-sidecar.log',
+      `日志位置：${backendLogFile()} 与 backend-sidecar.log`,
     );
     app.quit();
   }
@@ -566,7 +622,7 @@ async function restartBackend() {
       dialog.showErrorBox(
         '景渊 · 后端反复重启失败',
         '本地研究引擎连续 3 次启动失败，应用将退出。\n' +
-        '请查看 %APPDATA%\\FinResearch\\backend.log 排查（端口占用/杀软拦截/文件缺失是常见原因）。',
+        `请查看 ${backendLogFile()} 排查（端口占用/杀软拦截/文件缺失是常见原因）。`,
       );
       app.quit();
     }
@@ -601,6 +657,7 @@ async function quitAll() {
 }
 
 // 托盘驻留时窗口只是隐藏，不会触发本事件；关闭了托盘驻留（或窗口真被销毁）时才退出
+app.on('activate', () => { showMainWindow(); });
 app.on('window-all-closed', () => { quitAll(); });
 app.on('before-quit', (e) => {
   if (quitting) return;

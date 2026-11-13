@@ -29,13 +29,23 @@ hiddenimports = []
 
 # 重型 / 动态导入的库：全量收集（数据 + 二进制 + 子模块）
 # v1.6.0：+psutil（run_server 父进程看门狗的懒导入，显式收集防静态分析漏网）
-for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar", "psutil"]:
+# v2.0.0：+tiktoken + trafilatura 传递数据依赖（justext/htmldate/courlan）
+for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar", "psutil", "trafilatura", "tiktoken"]:
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
 
-# langchain 系列 / sqlite 检查点：按子模块收集
+for optional_pkg in ["justext", "htmldate", "courlan", "tiktoken_ext"]:
+    try:
+        d, b, h = collect_all(optional_pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception:
+        pass
+
+# langchain 系列 / sqlite 检查点 / 隔离进程懒加载解析库：按子模块收集
 for pkg in [
     "langchain",
     "langchain_core",
@@ -43,9 +53,11 @@ for pkg in [
     "langgraph.checkpoint",
     "aiosqlite",
     "docx",
+    "openpyxl",
+    "pypdf",
+    "PIL",
+    "charset_normalizer",
     "reportlab",
-    # v1.6.3（E）：PIL 移出显式收集 —— 唯一消费者是 make_brand_assets.py（dev 工具，
-    # 运行期 App 永不导入），13MB 纯死体积。若 reportlab 内部需要会通过自身 hook 收集。
     # deepagents 对话链路（agents/deep/*）。中间件/后端有动态导入（graph.py 用 import_module
     # 解析 profile 与 model），静态分析追不全，按子模块收。
     "deepagents",
@@ -57,6 +69,8 @@ for pkg in [
 ]:
     hiddenimports += collect_submodules(pkg)
 
+hiddenimports += ["lxml._elementpath", "tiktoken_ext.openai_public"]
+
 # 本包全部子模块：desktop.py 用字符串 "finresearch.main:app" 启动 uvicorn，
 # 静态分析追不到 main/agents/api/db/tools，必须显式收集，否则运行时 import 失败。
 hiddenimports += collect_submodules("finresearch")
@@ -65,7 +79,7 @@ hiddenimports += collect_submodules("finresearch")
 hiddenimports = [h for h in hiddenimports if not h.startswith("langgraph.checkpoint.postgres")]
 
 # 本包数据（报告模板、本地数据、tzdata 时区库、前端构建产物）。即便没 pip install -e . 也兜底显式收集
-datas += collect_data_files("finresearch")
+datas += collect_data_files("finresearch", excludes=["static/**"])
 datas += collect_data_files("reportlab")
 try:
     datas += collect_data_files("docx")
@@ -79,7 +93,7 @@ _tmpl_dir = os.path.join(_SRC_DIR, "finresearch", "report_templates")
 datas += [(f, "finresearch/report_templates") for f in glob.glob(os.path.join(_tmpl_dir, "*.html"))]
 _data_dir = os.path.join(_SRC_DIR, "finresearch", "data")
 datas += [(f, "finresearch/data") for f in glob.glob(os.path.join(_data_dir, "*.json"))]
-_static_dir = os.path.join(_SRC_DIR, "finresearch", "static")
+_static_dir = os.environ.get("JINGYUAN_FRONTEND_DIST") or os.path.join(_SRC_DIR, "finresearch", "static")
 if os.path.isdir(_static_dir):
     for _root, _dirs, _files in os.walk(_static_dir):
         _rel = os.path.relpath(_root, _static_dir)
@@ -166,7 +180,7 @@ exe = EXE(
     exclude_binaries=True,
     name="FinResearch",
     console=False,   # 真软件：无控制台黑框（调试时临时改 True 看日志）
-    icon=os.path.join(_SPEC_DIR, "app.ico"),  # 统一品牌图标（make_brand_assets.py 生成）
+    icon=os.path.join(_SPEC_DIR, "app.ico") if sys.platform == "win32" else None,
 )
 coll = COLLECT(
     exe,

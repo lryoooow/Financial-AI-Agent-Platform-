@@ -184,6 +184,34 @@ def yoy_pct(vals: list) -> Optional[float]:
     return (cur - prev) / abs(prev) * 100.0
 
 
+def profit_turnaround_tag(cur_val: Any, prev_val: Any) -> str:
+    """识别跨零轴/亏损期的盈利状态定性，避免负基数百分比增速单独出现引起误读。"""
+    cur, prev = to_float(cur_val), to_float(prev_val)
+    if cur is None or prev is None:
+        return ""
+    if prev < 0 < cur:
+        return "扭亏为盈"
+    if prev > 0 > cur:
+        return "由盈转亏"
+    if prev < 0 and cur < 0:
+        if cur > prev:
+            return "同比减亏"
+        if cur < prev:
+            return "亏损扩大"
+    return ""
+
+
+def latest_profit_turnaround(fins: dict) -> str:
+    """结合同口径基准（年报相邻列或中期 yoy_base）返回最新一期净利润扭亏/减亏定性。"""
+    vals = row_vals(fins, ["净利润", "扣非净利润"])
+    if not vals:
+        return ""
+    if latest_pair_comparable(fins) and len(vals) >= 2:
+        return profit_turnaround_tag(vals[-1], vals[-2])
+    base = (fins or {}).get("yoy_base") or {}
+    return profit_turnaround_tag(vals[-1], base.get("净利润"))
+
+
 def delta_pp(vals: list) -> Optional[float]:
     """最新一年相对上一年的差值（百分点），用于比率类指标。"""
     if len(vals) < 2:
@@ -245,6 +273,12 @@ def yoy_pct_latest(fins: dict, name) -> Optional[float]:
     if not latest_pair_comparable(fins):
         return None
     return yoy_pct(row_vals(fins, name))
+
+
+def financial_yoy(fins: dict, direct: str, base: str) -> Optional[float]:
+    reported = row_vals(fins, direct)
+    value = to_float(reported[-1]) if reported else None
+    return value if value is not None else yoy_pct_latest(fins, base)
 
 
 def pp_str_latest(fins: dict, name) -> str:
@@ -337,9 +371,11 @@ def render_financial_facts(fins: dict) -> str:
     rev_yoy = row_vals(f, ["营收同比", "营业收入同比"])
     net_yoy = row_vals(f, ["净利润同比", "归母净利润同比"])
     latest_year = years[-1] if years else "—"
+    turn_tag = latest_profit_turnaround(f)
+    net_yoy_display = f"{val_str(net_yoy)}，{turn_tag}" if turn_tag and val_str(net_yoy) != MISSING else (turn_tag or val_str(net_yoy))
     lines = [
         f"【财务指标】最新一期（{latest_year}）",
-        f"营业收入 {val_str(rev)}（同比 {val_str(rev_yoy)}）；净利润 {val_str(net)}（同比 {val_str(net_yoy)}）。",
+        f"营业收入 {val_str(rev)}（同比 {val_str(rev_yoy)}）；净利润 {val_str(net)}（同比 {net_yoy_display}）。",
         f"ROE {val_str(roe)}（同比变动 {pp_str_latest(f, 'ROE')}）；毛利率 {val_str(gm)}（同比变动 {pp_str_latest(f, '毛利率')}）；"
         f"资产负债率 {val_str(debt)}（同比变动 {pp_str_latest(f, '资产负债率')}）。",
         "注：营收/净利润括注为上游增速行的同比（%）；ROE/毛利率/资产负债率括注为同比变动（pct=百分点）。",
@@ -355,26 +391,29 @@ def render_financial_facts(fins: dict) -> str:
 
 def render_news_facts(news: list, web: list = None) -> str:
     """新闻/网页证据：引文用「」包裹并标注来源，不经 sanitize。"""
+    from ..core.guardrails.untrusted import fence_external, looks_like_instruction
+
     lines = ["【资讯与公开信息证据】"]
     has_any = False
     for n in (news or [])[:3]:
         if not isinstance(n, dict):
             continue
         title = (n.get("title") or "").strip()
-        if not title:
+        if not title or looks_like_instruction(title):
             continue
         src = str(n.get("source") or "").strip()
         tm = str(n.get("time") or "").strip()
         meta = f"{src} · {tm}" if (src and tm) else (src or tm or "公开来源")
-        lines.append(f"· 「{title}」（来源：{meta}）")
+        lines.append(f"· {fence_external(f'「{title}」', src or 'news', limit=240)}（来源：{meta}）")
         has_any = True
     for w in (web or [])[:3]:
-        if not isinstance(w, dict) or not (w.get("title") or "").strip():
+        if not isinstance(w, dict) or not (w.get("title") or "").strip() or looks_like_instruction(w["title"]):
             continue
         w_src = str(w.get("source") or "").strip()
         w_tm = str(w.get("time") or "").strip()
         w_meta = f"{w_src} · {w_tm}" if (w_src and w_tm) else (w_src or w_tm or "网页")
-        lines.append(f"· 「{w['title'].strip()}」（来源：{w_meta}）")
+        headline = f"「{w['title'].strip()}」"
+        lines.append(f"· {fence_external(headline, w_src or 'web', limit=240)}（来源：{w_meta}）")
         has_any = True
     if not has_any:
         lines.append(MISSING + "（未检索到可引用的公开资讯）")

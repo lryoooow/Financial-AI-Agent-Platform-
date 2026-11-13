@@ -22,16 +22,23 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import aclosing
 from typing import Any, AsyncIterator, Optional
 
 from ...api import sse
 from ...llm import ThinkTagSplitter
+from ...engine.turn_context import TurnToolState, bind_turn_state, current_turn_state
+from ...engine.event_bridge import EventBridge
 
 logger = logging.getLogger(__name__)
 
 # 工具名 → 前端展示标签。缺失时回落工具名本身，不硬编码兜底文案。
 # 新增工具务必在此登记：漏登记不会报错，只会把 prefetch_basics 这种函数名直接甩给用户看。
 TOOL_LABELS = {
+    "compute_risk_metrics": "计算波动与回撤",
+    "extract_article_text": "读取公开文章",
+    "verify_citation": "核对原文引文",
+    "mcp_call": "查询授权数据源",
     # 研究链路
     "prefetch_basics": "取数（行情/财务/新闻/K线）",
     "prefetch_industry": "取行业估值与资讯",
@@ -124,15 +131,15 @@ def custom_event_to_sse(data: Any) -> Optional[str]:
     if kind == "report_progress":
         text = data.get("text", "")
         return sse.sse({"type": "tool", "text": text, "report_stage": True}) if text else None
-    if kind in ("section_queued", "section_start"):
-        # section_queued：段落已排上（等并发闸）；section_start：真正开始撰写
+    if kind in ("section_queued", "section_start", "section_reset"):
+        # section_queued：段落已排上；section_start：开始撰写；section_reset：裸 </think> 清空本节已流草稿
         return sse.sse({"type": kind, "title": data.get("title", "")})
     if kind == "section_thinking":
         # 思维链快照（替换语义，尾部预览 + 累计字数），重连回放不会重复累加
         return sse.sse({
             "type": "section_thinking",
             "title": data.get("title", ""),
-            "text": data.get("text", ""),
+            "text": "正在核对本节证据。",
             "chars": data.get("chars", 0),
         })
     if kind == "section_token":
@@ -154,7 +161,7 @@ def custom_event_to_sse(data: Any) -> Optional[str]:
         return sse.sse({"type": "summary_token", "text": data.get("text", "")})
     if kind == "report_thinking":
         # 单次流式的思维链快照（替换语义：尾部预览 + 累计字数）
-        return sse.sse({"type": "report_thinking", "text": data.get("text", ""), "chars": data.get("chars", 0)})
+        return sse.sse({"type": "report_thinking", "text": "正在核对研报证据。", "chars": data.get("chars", 0)})
     if kind == "sections_reset":
         return sse.sse({"type": "sections_reset"})
     if kind == "research_summary_text":
@@ -182,6 +189,24 @@ async def stream_agent_sse(
     *,
     emit_tokens: bool = True,
 ) -> AsyncIterator[tuple[str, str]]:
+    settings = config.get("configurable") or {}
+    state = current_turn_state() or TurnToolState(
+        conv_id=str(settings.get("thread_id") or ""),
+        active_symbol=str(settings.get("active_symbol") or ""),
+    )
+    with bind_turn_state(state):
+        async with aclosing(_stream_agent_sse(agent, inputs, config, emit_tokens=emit_tokens)) as stream:
+            async for event in stream:
+                yield event
+
+
+async def _stream_agent_sse(
+    agent: Any,
+    inputs: dict,
+    config: dict,
+    *,
+    emit_tokens: bool = True,
+) -> AsyncIterator[tuple[str, str]]:
     """把 agent 的流转成 SSE 行。
 
     产出 (sse_line, text_piece)：text_piece 非空时是正文片段，调用方据此累计最终回复
@@ -199,9 +224,11 @@ async def stream_agent_sse(
     turn_idx = 0
     saw_tool_output = False
     emitted_calls: set[tuple[int, str]] = set()
+    open_calls_by_name: dict[str, list[str]] = {}
     emitted_any_text = False
     last_text_ended_nl = True
     turn_started_text: set[int] = set()
+    bridge = EventBridge()
 
     async for mode, data in agent.astream(
         inputs, config=config, stream_mode=["updates", "messages", "custom"]
@@ -225,7 +252,17 @@ async def stream_agent_sse(
                 name = getattr(msg, "name", "") or ""
                 if name:
                     status = "error" if _tool_failed(getattr(msg, "content", None), msg) else "ok"
-                    yield sse.ev_tool_call(name, tool_label(name), status), ""
+                    call_id = str(getattr(msg, "tool_call_id", "") or "")
+                    queue = open_calls_by_name.get(name) or []
+                    if not call_id and queue:
+                        call_id = queue.pop(0)
+                    elif call_id and call_id in queue:
+                        queue.remove(call_id)
+                    if call_id:
+                        for event in bridge.finish_tool("main", call_id, name, tool_label(name), status, getattr(msg, "artifact", None)):
+                            yield sse.sse(event), ""
+                    else:
+                        yield sse.ev_tool_call(name, tool_label(name), status), ""
                 continue
 
             if node != "model":
@@ -243,7 +280,9 @@ async def stream_agent_sse(
                     call_key = (turn_idx, str(call.get("id") or f"{idx}:{name}"))
                     if call_key not in emitted_calls:
                         emitted_calls.add(call_key)
-                        yield sse.ev_tool_call(name, tool_label(name), "start"), ""
+                        open_calls_by_name.setdefault(name, []).append(call_key[1])
+                        event = bridge.start_tool("main", call_key[1], name, tool_label(name), call.get("args") or {})
+                        yield sse.sse(event), ""
                         yield sse.ev_chat_stage("tool", tool_label(name)), ""
 
             # v1.7.0+：思维链增量透出（delta.reasoning_content 或结构化 thinking block）。

@@ -31,9 +31,14 @@ configure_market_network()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .agents.graph import init_checkpointer
+from .engine.checkpoints import init_checkpointer
 from .api.knowledge_routes import router as knowledge_router
+from .api.mcp_routes import router as mcp_router
+from .api.scheduler_routes import router as scheduler_router
+from .api.watchlist_routes import ensure_default_watchlist, router as watchlist_router
+from .api.web_auth import WebAccessTokenMiddleware, router as auth_router
 from .api.routes import router
 from .config import settings
 from .db.session import init_db
@@ -62,14 +67,16 @@ def _warmup_indexes() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from .agents.graph import close_checkpointer  # 延迟导入避免循环
-    from .api.routes import sweep_stale_research_tasks
+    from .engine.checkpoints import close_checkpointer  # 延迟导入避免循环
+    from .api.routes import close_research_runtimes, sweep_stale_research_tasks
+    from .core.scheduler.post_close import scheduler_loop
 
     logger.info("启动：init_db + checkpointer")
     await init_db()
     # v1.6.0（审计 B4）：启动清扫上一进程遗留的 pending/running 研究任务（僵尸终结）
     try:
         await sweep_stale_research_tasks()
+        await ensure_default_watchlist()
     except Exception as e:  # noqa: BLE001
         logger.warning("启动清扫失败（不影响启动）：%s", e)
     await init_checkpointer()
@@ -79,11 +86,19 @@ async def lifespan(app: FastAPI):
     from .knowledge.service import init_and_backfill
 
     _kb_task = asyncio.create_task(init_and_backfill())
-    yield
-    if not _kb_task.done():
+    scheduler = asyncio.create_task(scheduler_loop())
+    try:
+        yield
+    finally:
         _kb_task.cancel()
-    await close_checkpointer()
-    logger.info("关闭。")
+        scheduler.cancel()
+        await asyncio.gather(_kb_task, scheduler, return_exceptions=True)
+        await close_research_runtimes()
+        from .mcp.service import close_all_clients
+
+        await close_all_clients()
+        await close_checkpointer()
+        logger.info("关闭。")
 
 
 # v1.6.0（审计 D6）：生产关闭 /docs /redoc /openapi.json（API 自描述不随包分发）；
@@ -102,14 +117,23 @@ app = FastAPI(
 # v1.6.0（审计 B1）：CORS 收紧。此前 allow_origin_regex 放行任意 localhost:* 源 ——
 # 本机任何端口上的网页都能跨域读走 /api/local-settings/model-configs 里的明文密钥。
 # v1.6.3（E）：打包生产不放行任何来源（同源伺服无需 CORS）；FIN_DEV=1 才开 vite dev 5173。
+app.state.dev_cors = bool(os.environ.get("FIN_DEV"))
+origins = [item.strip().rstrip("/") for item in settings.fin_cors_origins.split(",") if item.strip()]
+if app.state.dev_cors:
+    origins += ["http://localhost:5173", "http://127.0.0.1:5173"]
+app.add_middleware(WebAccessTokenMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=(["http://localhost:5173", "http://127.0.0.1:5173"]
-                   if os.environ.get("FIN_DEV") else []),
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+trusted_hosts = [item.strip() for item in settings.fin_trusted_hosts.split(",") if item.strip()]
+if (not settings.fin_web or not settings.fin_access_token) and not trusted_hosts:
+    trusted_hosts = ["localhost", "127.0.0.1", "[::1]"]
+if trusted_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts, www_redirect=False)
 
 
 @app.middleware("http")
@@ -122,6 +146,10 @@ async def _api_no_store_headers(request, call_next):
 
 app.include_router(router)
 app.include_router(knowledge_router)
+app.include_router(mcp_router)
+app.include_router(watchlist_router)
+app.include_router(scheduler_router)
+app.include_router(auth_router)
 
 
 # ── 前端静态托管（打包后由后端一并提供 UI；dev 无 dist 时跳过）──

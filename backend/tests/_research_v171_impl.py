@@ -208,7 +208,9 @@ async def t_a05_and_replay():
         return None
 
     orig = routes._active_llm_cfg
+    original_llm = report.build_llm
     routes._active_llm_cfg = none_cfg
+    report.build_llm = lambda **_kwargs: None
     try:
         task = await routes.create_research(routes.ResearchRequest(code="000001.SZ"))
         events = await _drain(await routes.research_stream(_Req(), task["task_id"]))
@@ -216,13 +218,12 @@ async def t_a05_and_replay():
         stored = await routes.get_research_task(task["task_id"])
     finally:
         routes._active_llm_cfg = orig
+        report.build_llm = original_llm
     check(events[0]["type"] == "replay", "A06：SSE 连接首帧为 replay")
-    check(events[-1]["type"] == "error" and "模型未配置" in events[-1]["message"], "无模型 → error 帧")
-    check(stored["status"] == "error" and "模型未配置" in (stored["error"] or ""),
-          f"A05：任务行落 error 且保留原因（实际 {stored['status']} / {stored['error']}）")
-    # 终态任务再次订阅：replay + 终态帧
+    check(events[-1]["type"] == "done", "无模型 → 完成事实模板报告")
+    check(stored["status"] == "done" and stored.get("report_id"), "无模型报告与终态成功落库")
     again = await _drain(await routes.research_stream(_Req(), task["task_id"]))
-    check([e["type"] for e in again] == ["replay", "error"], f"终态回放：replay + error（实际 {[e['type'] for e in again]}）")
+    check(again[0]["type"] == "replay" and again[-1]["type"] == "done", "已归档报告回放终态")
 
 
 async def t_full_pipeline_via_route():

@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { ArrowUpRight, ArrowDownRight, TrendingUp, Search, Loader2, AlertTriangle, Database, Globe2, ShieldCheck, RefreshCw, History, Star, Trash2 } from "lucide-react";
-import { WATCHLIST, type Stock } from "../../data/market";
-import { api, type Book, type Indicator, type IntradayPoint, type MarketDiagnostics, type Quote, type ResolveHit, type StockHistoryItem } from "../../api/client";
+import type { Stock, Candle } from "../../data/market";
+import { api, type Book, type Indicator, type IntradayPoint, type MarketDiagnostics, type MarketOverview, type Quote, type ResolveHit, type StockHistoryItem } from "../../api/client";
 import { AnimatedNumber } from "../AnimatedNumber";
 import { OrderBook } from "../OrderBook";
 import { IntradayChart } from "../charts/IntradayChart";
 import { KLineChart } from "../charts/KLineChart";
 import { fmt, signed, trendClass } from "../../lib/format";
+import { useConfirm } from "../ui/confirm";
+import { Skeleton } from "../ui/skeleton";
+import { WatchlistPanel } from "../watchlist/WatchlistPanel";
 
 const EMPTY_BOOK: Book = { asks: [], bids: [] };
 const LEFT_WIDTH_KEY = "finresearch_market_left_width";
@@ -41,12 +44,11 @@ function isCstTradingHours(): boolean {
 }
 
 function fallbackMeta(code: string): Pick<Stock, "code" | "name" | "exchange" | "industry"> {
-  const s = WATCHLIST.find((x) => x.code === code);
   return {
     code,
-    name: s?.name || code,
-    exchange: s?.exchange || "A股",
-    industry: s?.industry || "",
+    name: code,
+    exchange: code.split(".")[1] || "A股",
+    industry: "",
   };
 }
 
@@ -148,13 +150,16 @@ export function MarketView({
   onSelect,
   onResearch,
   visible = true,
+  indices,
 }: {
   code: string;
   onSelect: (c: string) => void;
   onResearch: (c: string, name: string) => void;
   /** 页面常驻挂载（hidden 切页）：回到前台时刷新搜索记录（其间研究也会计入） */
   visible?: boolean;
+  indices?: MarketOverview["indices"];
 }) {
+  const confirm = useConfirm();
   // v1.8.0：搜索记录（最近查看 + 最常查看），成功加载行情即记一次查看
   const [history, setHistory] = useState<{ recent: StockHistoryItem[]; frequent: StockHistoryItem[] }>({ recent: [], frequent: [] });
   const [historyTab, setHistoryTab] = useState<"recent" | "frequent">("recent");
@@ -165,10 +170,17 @@ export function MarketView({
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState("");
   const [tab, setTab] = useState<"intraday" | "kline">("intraday");
+  const [days, setDays] = useState(1);
+  const [period, setPeriod] = useState<"daily" | "weekly" | "monthly">("daily");
+  const [adjust, setAdjust] = useState("qfq");
+  const [actualAdjust, setActualAdjust] = useState<string>();
+  const [tradingDays, setTradingDays] = useState<number>();
+  const chartKey = [code, days, period, adjust].join("|");
+  const lastChartRef = useRef("");
   const [q, setQ] = useState("");
 
   const [intraday, setIntraday] = useState<IntradayPoint[]>([]);
-  const [kline, setKline] = useState<any[]>([]);
+  const [kline, setKline] = useState<Candle[]>([]);
   const [book, setBook] = useState<Book>(EMPTY_BOOK);
   const [indicators, setIndicators] = useState<Indicator[]>([]);
   const [dataAsOf, setDataAsOf] = useState("");
@@ -186,7 +198,6 @@ export function MarketView({
   const [refreshTick, setRefreshTick] = useState(0);
   const [silentRefreshing, setSilentRefreshing] = useState(false);
   const lastCodeRef = useRef("");
-  const [favPrices, setFavPrices] = useState<Record<string, { price: number; changePct: number }>>({});
   const loadSeq = useRef(0);
   const [leftWidth, setLeftWidth] = useState(() => {
     try {
@@ -240,10 +251,21 @@ export function MarketView({
   }, [visible]);
 
   useEffect(() => {
+    if (!visible) return;
     const seq = ++loadSeq.current;
     const ac = new AbortController();
     let cancelled = false;
     const isCodeSwitch = lastCodeRef.current !== code;
+    const changedChart = lastChartRef.current !== chartKey;
+    if (changedChart) {
+      setChartError("");
+      setIntraday([]);
+      setKline([]);
+      setIntradayMeta(null);
+      setKlineMeta(null);
+      setActualAdjust(undefined);
+      setTradingDays(undefined);
+    }
     if (isCodeSwitch) {
       setQuoteLoading(true);
       setQuoteError("");
@@ -262,6 +284,7 @@ export function MarketView({
 
     const timer = window.setTimeout(() => {
       lastCodeRef.current = code;
+      lastChartRef.current = chartKey;
       (async () => {
       try {
         const qq = await api.quote(code, ac.signal);
@@ -278,8 +301,8 @@ export function MarketView({
         if (isCodeSwitch) api.recordStockView(code, qq.name).then(loadHistory).catch(() => {});
 
         const [intraRes, klineRes, bookRes, indRes] = await Promise.allSettled([
-          api.intraday(code, ac.signal),
-          api.kline(code, 60, "qfq", ac.signal),
+          api.intraday(code, ac.signal, days),
+          api.kline(code, 90, adjust, ac.signal, period),
           api.book(code, ac.signal),
           api.indicators(code, ac.signal),
         ]);
@@ -287,12 +310,14 @@ export function MarketView({
 
         if (intraRes.status === "fulfilled") {
           const v = intraRes.value;
-          if ((v.data || []).length || isCodeSwitch) setIntraday(v.data || []);
+          if ((v.data || []).length || changedChart) setIntraday(v.data || []);
+          setTradingDays(v.trading_days);
           setIntradayMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
         }
         if (klineRes.status === "fulfilled") {
           const v = klineRes.value;
-          if ((v.data || []).length || isCodeSwitch) setKline(v.data || []);
+          if ((v.data || []).length || changedChart) setKline(v.data || []);
+          setActualAdjust(v.adjust);
           setKlineMeta({ source: v.provenance?.source, attempts: v.provenance?.attempts, trading_date: v.trading_date, elapsed_ms: v.elapsed_ms });
         }
         if (bookRes.status === "fulfilled") setBook(bookRes.value);
@@ -301,7 +326,7 @@ export function MarketView({
         if (isCodeSwitch) {
           const missing: string[] = [];
           if (intraRes.status !== "fulfilled" || !(intraRes.value.data || []).length) missing.push("分时");
-          if (klineRes.status !== "fulfilled" || !(klineRes.value.data || []).length) missing.push("日K");
+          if (klineRes.status !== "fulfilled" || !(klineRes.value.data || []).length) missing.push("K线");
           if (missing.length) setChartError(`${missing.join("、")}未返回真实数据，请检查数据源或稍后重试。`);
         }
       } catch (e) {
@@ -322,7 +347,7 @@ export function MarketView({
       ac.abort();
       window.clearTimeout(timer);
     };
-  }, [code, refreshTick]);
+  }, [code, refreshTick, chartKey, days, period, adjust, visible]);
 
   // 诊断：仅挂载时读一次 fast（零网络）；不再随 code/quoteError 重探（避免重试风暴）。手动刷新才探测。
   useEffect(() => {
@@ -385,30 +410,6 @@ export function MarketView({
     };
   }, [q]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const entries = await Promise.all(
-        WATCHLIST.map(async (s) => {
-          try {
-            const qq = await api.quote(s.code);
-            if (!isUsableQuote(qq)) return null;
-            return [s.code, { price: qq.price, changePct: qq.changePct }] as const;
-          } catch {
-            return null;
-          }
-        })
-      );
-      if (cancelled) return;
-      const m: Record<string, { price: number; changePct: number }> = {};
-      for (const e of entries) if (e) m[e[0]] = e[1];
-      setFavPrices(m);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const display = stock ?? ({
     ...meta,
     price: 0,
@@ -434,33 +435,48 @@ export function MarketView({
 
   const up = display.change >= 0;
   const Arrow = up ? ArrowUpRight : ArrowDownRight;
-  const filteredFav = WATCHLIST.filter((s) => s.name.includes(q) || s.code.includes(q.toUpperCase()));
-  const list: { code: string; name: string; exchange?: string; price?: number; changePct?: number }[] =
-    results ?? filteredFav.map((s) => ({ code: s.code, name: s.name, exchange: s.exchange, ...favPrices[s.code] }));
+  const list = results ?? [];
 
   const chartData = tab === "intraday" ? intraday : kline;
   const currentChartError = chartData.length ? "" : chartError || `${tab === "intraday" ? "分时" : "日K"}未返回真实数据。`;
 
   return (
-    <div className="h-full min-h-0 flex flex-col lg:flex-row gap-4 p-5 overflow-hidden">
+    <div className="h-full min-h-0 flex flex-col lg:flex-row gap-2.5 p-2.5 overflow-hidden">
       <div className="hidden lg:flex flex-col gap-4 min-h-0 overflow-y-auto pr-1 shrink-0" style={{ width: leftWidth }}>
-        <DiagnosticsCard diagnostics={diagnostics} error={diagnosticsError} onRefresh={refreshDiagnostics} refreshing={diagRefreshing} />
+        <WatchlistPanel visible={visible} compact currentSymbol={code} onSelect={onSelect} />
 
         <div className="rounded-xl border border-border bg-card p-3">
           <p className="text-[10px] tracking-[0.18em] text-muted-foreground uppercase mb-2 px-1">主要指数</p>
-          <div className="rounded-lg bg-secondary/40 px-3 py-4 text-xs text-muted-foreground leading-relaxed">
-            指数实时行情暂未接入真实数据源，本页不展示模拟指数。
-          </div>
+          {indices && indices.length > 0 ? (
+            <div className="space-y-1">
+              {indices.map((idx) => {
+                const chg = idx.changePct;
+                return (
+                  <div key={idx.code} className="flex items-center justify-between px-1.5 py-1 text-xs rounded hover:bg-secondary/40">
+                    <span className="truncate text-foreground/90">{idx.name}</span>
+                    <span className={"font-mono tabular " + trendClass(chg ?? 0)}>
+                      {idx.price != null ? fmt(idx.price, 2) : "—"}
+                      {chg != null ? ` ${signed(chg)}%` : ""}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="rounded-lg bg-secondary/40 px-3 py-3 text-xs text-muted-foreground leading-relaxed">
+              正在同步宽基指数实时快照…
+            </div>
+          )}
         </div>
 
-        <div className="rounded-xl border border-border bg-card min-h-[260px] flex flex-col overflow-hidden">
+        <div className="rounded-xl border border-border bg-card flex flex-col overflow-hidden">
           <div className="p-2.5 border-b border-border">
             <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
               <Search className="size-3.5 text-muted-foreground" />
               <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码/首字母）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
               {searching && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
             </div>
-            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{searchError ? "搜索服务异常" : results ? `全市场结果 ${list.length} 条` : "常用标的"}</p>
+            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{searchError ? "搜索服务异常" : results ? `全市场结果 ${list.length} 条` : "输入代码或简称"}</p>
           </div>
           <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
             {list.length === 0 && searchError && <div className="text-center text-[11px] text-destructive/80 py-8">搜索服务暂时不可用，请稍后重试</div>}
@@ -546,7 +562,7 @@ export function MarketView({
               ))}
             </div>
             <button
-              onClick={() => { if (window.confirm("清除全部行情搜索记录？")) api.clearMarketHistory().then(loadHistory).catch(() => {}); }}
+              onClick={async () => { if (await confirm("清除全部行情搜索记录？")) void api.clearMarketHistory().then(loadHistory).catch(() => {}); }}
               className="grid place-items-center size-6 rounded text-muted-foreground hover:text-destructive shrink-0"
               title="清除搜索记录"
             >
@@ -589,7 +605,7 @@ export function MarketView({
               >
                 <RefreshCw className={`size-3.5 ${silentRefreshing ? "animate-spin" : ""}`} /> 刷新
               </button>
-              <button onClick={() => onResearch(display.code, display.name || meta.name)} disabled={quoteLoading} className="flex items-center gap-1.5 rounded-lg bg-gold px-3.5 py-2 text-sm text-[#17140a] hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
+              <button onClick={() => onResearch(display.code, display.name || meta.name)} disabled={quoteLoading} className="flex items-center gap-1.5 rounded-lg bg-gold px-3.5 py-2 text-sm text-gold-foreground hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
                 <TrendingUp className="size-4" strokeWidth={2.4} /> 深度研究
               </button>
             </div>
@@ -609,13 +625,20 @@ export function MarketView({
         </motion.div>
 
         <div className="rounded-xl border border-border bg-card flex-1 min-h-0 flex flex-col overflow-hidden">
-          <div className="flex items-center gap-1 p-2 border-b border-border">
-            {([["intraday", "分时"], ["kline", "日K线"]] as const).map(([id, label]) => (
-              <button key={id} onClick={() => setTab(id)} className="relative px-3.5 py-1.5 text-sm rounded-lg">
-                {tab === id && <motion.div layoutId="chart-tab" className="absolute inset-0 rounded-lg bg-secondary" transition={{ type: "spring", stiffness: 400, damping: 30 }} />}
-                <span className={`relative ${tab === id ? "text-foreground" : "text-muted-foreground"}`}>{label}</span>
-              </button>
+          <div className="flex flex-wrap items-center gap-1 p-2 border-b border-border">
+            {([[1, "分时"], [5, "5日"]] as const).map(([value, label]) => (
+              <button key={value} aria-pressed={tab === "intraday" && days === value}
+                className="rounded px-2 py-1 aria-pressed:bg-secondary" onClick={() => { setDays(value); setTab("intraday"); }}>{label}</button>
             ))}
+            {([["daily", "日K"], ["weekly", "周K"], ["monthly", "月K"]] as const).map(([value, label]) => (
+              <button key={value} aria-pressed={tab === "kline" && period === value}
+                className="rounded px-2 py-1 aria-pressed:bg-secondary" onClick={() => { setPeriod(value); setTab("kline"); }}>{label}</button>
+            ))}
+            {tab === "kline" && <select aria-label="复权方式" className="rounded border bg-input px-1 py-1" value={adjust} onChange={(event) => setAdjust(event.target.value)}>
+              <option value="qfq">前复权</option><option value="hfq">后复权</option><option value="">不复权</option>
+            </select>}
+            {tab === "kline" && actualAdjust !== undefined && actualAdjust !== adjust && <span className="text-xs text-muted-foreground">数据源返回不复权</span>}
+            {tab === "intraday" && days === 5 && !!tradingDays && tradingDays < 5 && <span className="text-xs text-muted-foreground">已返回 {tradingDays} 个交易日</span>}
             <span className="ml-auto text-[10px] text-muted-foreground tabular px-2 text-right leading-relaxed">
               {dataAsOf || activeMeta?.trading_date || chartSourceLabel ? (
                 <>
@@ -631,11 +654,11 @@ export function MarketView({
           </div>
           <div className="flex-1 min-h-0 p-2">
             <AnimatePresence mode="wait">
-              <motion.div key={tab + display.code} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.3 }} className="h-full w-full">
-                {quoteLoading ? (
-                  <div className="h-full grid place-items-center text-sm text-muted-foreground"><Loader2 className="size-5 animate-spin" /></div>
+              <motion.div key={tab + chartKey} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }} className="h-full w-full">
+                {quoteLoading || (silentRefreshing && !chartData.length) ? (
+                  <div className="flex h-full flex-col gap-2 p-3"><Skeleton className="flex-1" /><Skeleton className="h-[28%]" /></div>
                 ) : chartData.length ? (
-                  tab === "intraday" ? <IntradayChart data={intraday} prevClose={display.prevClose} code={display.code} /> : <KLineChart data={kline} code={display.code} />
+                  tab === "intraday" ? <IntradayChart data={intraday} prevClose={days === 1 ? display.prevClose : 0} code={display.code} /> : <KLineChart data={kline} code={display.code} />
                 ) : (
                   <DataUnavailable text={quoteError || failedAttempt?.error || currentChartError} />
                 )}
@@ -645,7 +668,10 @@ export function MarketView({
         </div>
       </div>
 
-      <div className="flex flex-col gap-4 min-h-0 overflow-y-auto lg:w-[288px] lg:shrink-0">
+      <div className="flex flex-col gap-4 min-h-0 overflow-y-auto lg:w-[220px] lg:shrink-0">
+        <details className="text-xs"><summary className="cursor-pointer text-muted-foreground">行情源诊断</summary>
+          <DiagnosticsCard diagnostics={diagnostics} error={diagnosticsError} onRefresh={refreshDiagnostics} refreshing={diagRefreshing} />
+        </details>
         {book.asks.length || book.bids.length ? (
           <OrderBook asks={book.asks} bids={book.bids} prevClose={display.prevClose} />
         ) : (

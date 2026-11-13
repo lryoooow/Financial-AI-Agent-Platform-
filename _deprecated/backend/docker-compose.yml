@@ -5,9 +5,9 @@ services:
     image: pgvector/pgvector:pg16
     container_name: finresearch-pg
     environment:
-      POSTGRES_USER: fin
-      POSTGRES_PASSWORD: fin
-      POSTGRES_DB: finresearch
+      POSTGRES_USER: ${POSTGRES_USER:-finresearch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-finresearch}
     ports:
       - "5432:5432"
     volumes:

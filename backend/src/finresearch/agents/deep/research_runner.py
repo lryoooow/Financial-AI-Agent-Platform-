@@ -29,8 +29,10 @@ import json
 import logging
 import re
 from typing import Any, AsyncIterator, Optional
+from uuid import uuid4
 
 from ...api import sse
+from ...engine.event_bridge import EventBridge
 from .._utils import sanitize_err_text
 from ..workers.report import PUSH_SINK
 from .research_tools import _put, build_research_tools
@@ -123,10 +125,12 @@ async def run_research_direct(
     else:
         steps = [("prefetch_basics", {"code": code.strip().upper()})]
     steps.append(("compose_report", {}))
+    bridge = EventBridge(parent_run_id=task_id)
 
     for name, args in steps:
         label = tool_label(name)
-        yield sse.ev_tool_call(name, label, "start")
+        call_id = uuid4().hex
+        yield sse.sse(bridge.start_tool(tpl, call_id, name, label, args))
         yield sse.ev_chat_stage("tool", label)
         result: Any = None
         try:
@@ -138,12 +142,15 @@ async def run_research_direct(
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  工具异常 = 该步失败，如实上报
-            logger.exception("研究工具 %s 失败：%s", name, exc)
-            _put(task_id, "failure", f"{label}失败：{sanitize_err_text(exc)}")
-            yield sse.ev_tool_call(name, label, "error")
+            safe_error = sanitize_err_text(exc)
+            logger.warning("研究工具 %s 失败：%s", name, safe_error)
+            _put(task_id, "failure", f"{label}失败：{safe_error}")
+            for event in bridge.finish_tool(tpl, call_id, name, label, "error", None):
+                yield sse.sse(event)
             return
         failed = _tool_failed(result)
-        yield sse.ev_tool_call(name, label, "error" if failed else "ok")
+        for event in bridge.finish_tool(tpl, call_id, name, label, "error" if failed else "ok", None):
+            yield sse.sse(event)
         if failed:
             _put(task_id, "failure", _error_text(result))
             return

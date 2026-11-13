@@ -4,6 +4,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('finresearch', {
+  platform: process.platform,
   window: {
     minimize: () => ipcRenderer.send('finresearch:window:minimize'),
     maximizeToggle: () => ipcRenderer.send('finresearch:window:maximize-toggle'),
@@ -21,5 +22,9 @@ contextBridge.exposeInMainWorld('finresearch', {
   app: {
     getPreferences: () => ipcRenderer.invoke('finresearch:app:get-prefs'),
     setPreferences: (patch) => ipcRenderer.invoke('finresearch:app:set-prefs', patch),
+  },
+  // v2.0.0：原生剪贴板写图（分享海报一键复制，不受 Web Clipboard API 权限限制）
+  clipboard: {
+    writeImageDataUrl: (dataUrl) => ipcRenderer.invoke('finresearch:clipboard:write-image', dataUrl),
   },
 });

@@ -30,6 +30,19 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/(?:\/|\\)(?:recharts|d3-[a-z]+|victory-vendor)(?:\/|\\)/.test(id)) return 'charts'
+          if (/(?:\/|\\)(?:react|react-dom|scheduler)(?:\/|\\)/.test(id)) return 'react'
+          if (/(?:\/|\\)(?:motion|framer-motion|motion-dom|motion-utils)(?:\/|\\)/.test(id)) return 'motion'
+          if (/(?:\/|\\)(?:react-markdown|remark-[a-z-]+|unified|micromark[^/\\]*)(?:\/|\\)/.test(id)) return 'markdown'
+        },
+      },
+    },
+  },
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],

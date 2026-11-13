@@ -12,8 +12,8 @@
     在 backend\\.env 里写（该文件已在 .gitignore 里，不会被提交）：
         LLM_API_KEY=sk-你的key
 
-    然后在任意目录、任意终端里：
-        python D:\\Lry\\langchain\\backend\\verify_deepagent.py
+    然后在仓库根目录任意终端里：
+        python backend/verify_deepagent.py
 
     换厂商就连 base_url 和 model 一起写进 .env（三者必须同厂商，不能混搭）：
         LLM_API_KEY=你的key

@@ -12,6 +12,8 @@ from typing import Optional
 from sqlalchemy import (
     JSON,
     DateTime,
+    Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -66,9 +68,49 @@ class Report(Base):
     payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # 完整 ReportDoc
     html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     as_of: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    snapshot_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class WatchlistGroup(Base):
+    __tablename__ = "watchlist_groups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(64))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist_items"
+    __table_args__ = (UniqueConstraint("group_id", "symbol", name="uq_watchlist_group_symbol"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    group_id: Mapped[str] = mapped_column(ForeignKey("watchlist_groups.id", ondelete="CASCADE"), index=True)
+    symbol: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(64))
+    market: Mapped[str] = mapped_column(String(8))
+    added_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    note: Mapped[str] = mapped_column(String(200), default="")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ScheduledRun(Base):
+    __tablename__ = "scheduled_runs"
+    __table_args__ = (UniqueConstraint("run_date", "trigger_type", name="uq_scheduled_run_day"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    run_date: Mapped[str] = mapped_column(String(16))
+    trigger_type: Mapped[str] = mapped_column(String(16))
+    summary_report_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    radar_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    push_channels_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="running")
+    error_msg: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ChatConversation(Base):
@@ -101,6 +143,13 @@ class ChatDelta(Base):
     kind: Mapped[str] = mapped_column(String(16), default="delta")  # delta/snapshot
     role: Mapped[str] = mapped_column(String(16), default="user")
     payload: Mapped[dict] = mapped_column(JSON)
+    clean_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reasoning_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    thinking_elapsed_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    agent_trace_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    tool_invocations_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    artifacts_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    turn_status: Mapped[Optional[str]] = mapped_column(String(24), nullable=True, server_default="completed")
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -124,6 +173,16 @@ class ChatContextSummary(Base):
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class HumanApproval(Base):
+    __tablename__ = "human_approval"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class LocalSetting(Base):

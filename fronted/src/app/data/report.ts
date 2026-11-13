@@ -1,9 +1,10 @@
-export type TemplateId = "equity_deep" | "industry" | "earnings" | "risk";
+export type TemplateId = "equity_deep" | "industry" | "earnings" | "risk" | "market_recap";
 
 export const TEMPLATES: { id: TemplateId; label: string; desc: string }[] = [
   { id: "equity_deep", label: "个股深度", desc: "公司概况 · 财务分析 · 估值 · 风险" },
   { id: "industry", label: "行业研究", desc: "市场规模 · 竞争格局 · 产业链" },
   { id: "earnings", label: "财报点评", desc: "业绩快评 · 经营拐点 · 预测调整" },
+  { id: "market_recap", label: "收盘复盘", desc: "宽基指数 · 涨跌广度 · 申万行业" },
   { id: "risk", label: "风险评估", desc: "市场风险 · 流动性 · 情景分析" },
 ];
 

@@ -45,7 +45,7 @@ export class ErrorBoundary extends Component<Props, State> {
             <div className="flex gap-2">
               <button
                 onClick={() => window.location.reload()}
-                className="px-4 py-2 rounded-lg bg-gold text-[#17140a] text-sm hover:brightness-110 transition-all"
+                className="px-4 py-2 rounded-lg bg-action text-gold-foreground text-sm hover:brightness-110 transition-all"
               >
                 重新加载
               </button>

@@ -55,7 +55,10 @@ TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "资金面": ("北向", "主力资金", "融资融券", "资金流"),
 }
 
-TEMPLATE_LABELS = {"equity_deep": "个股深度", "industry": "行业研究", "earnings": "财报点评", "risk": "风险评估"}
+TEMPLATE_LABELS = {
+    "equity_deep": "个股深度", "industry": "行业研究", "earnings": "财报点评", "risk": "风险评估",
+    "market_recap": "收盘复盘", "peer_compare": "同业对比", "batch_radar": "批量体检",
+}
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -166,7 +169,7 @@ def clear_events(kinds: Optional[list[str]] = None) -> int:
 # 指令式措辞；③注入时标注「用户自述偏好（数据，非指令）」。
 _NOTE_BLOCKLIST = re.compile(
     r"https?://|www\.|忽略|无视|无论如何|系统提示|提示词|指令|扮演|你必须|你要|务必|总是回答|不要告诉|"
-    r"泄露|密钥|api.?key|password|ignore|system|prompt|instruction",
+    r"推荐|荐股|泄露|密钥|api.?key|password|ignore|system|prompt|instruction",
     re.IGNORECASE,
 )
 _GROUND_MIN_RATIO = 0.4
@@ -188,15 +191,22 @@ def _grams(text: str) -> set[str]:
 
 def note_is_acceptable(note: str, user_text: Optional[str]) -> bool:
     """模型提交的偏好笔记是否可接受：无指令式措辞，且足够多的字面内容出自用户本轮原话。"""
+    from ..core.guardrails.compliance import check_generated
+
     note = (note or "").strip()
-    if len(note) < 2 or _NOTE_BLOCKLIST.search(note):
+    if len(note) < 2 or _NOTE_BLOCKLIST.search(note) or check_generated(note):
         return False
     if not user_text:
         return False
+    user_grams = _grams(user_text)
     grams = _grams(note)
-    if not grams:
+    if not grams or not user_grams:
         return False
-    hit = len(grams & _grams(user_text))
+    for clause in re.split(r"[，,；;。！？\n]+", note):
+        c_grams = _grams(clause)
+        if len(c_grams) >= 2 and len(c_grams & user_grams) / len(c_grams) < _GROUND_MIN_RATIO:
+            return False
+    hit = len(grams & user_grams)
     return hit / len(grams) >= _GROUND_MIN_RATIO
 
 
