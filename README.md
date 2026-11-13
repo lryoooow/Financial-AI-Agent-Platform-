@@ -129,16 +129,7 @@ docker compose ps
 docker compose logs -f jingyuan
 ```
 
-启动完成后浏览器访问 `http://127.0.0.1:9527`，所有持久化数据保存在命名卷 `jingyuan-data` 中。  
-也可直接拉取 GitHub Container Registry 预构建镜像运行：
-
-```bash
-docker run -d --name jingyuan \
-  -p 127.0.0.1:9527:9527 \
-  -v jingyuan-data:/data \
-  -e FIN_ACCESS_TOKEN="replace-with-strong-secret" \
-  ghcr.io/lryoooow/jingyuan-web:v2.0.0
-```
+启动完成后浏览器访问 `http://127.0.0.1:9527`，所有持久化数据保存在命名卷 `jingyuan-data` 中。对外网开放时请配合 Nginx / Caddy 等 HTTPS 反向代理使用。
 
 ### 2. 原生命令行一键启动同源 Web 版（无需 Docker）
 

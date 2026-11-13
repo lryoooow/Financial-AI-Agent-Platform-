@@ -86,7 +86,7 @@ cp .env.example .env
 # Edit .env and set FIN_ACCESS_TOKEN when exposed beyond localhost
 docker compose up -d --build
 ```
-Open `http://127.0.0.1:9527` (or pull `ghcr.io/lryoooow/jingyuan-web:v2.0.0`).
+Open `http://127.0.0.1:9527` (application data persists in the `jingyuan-data` Docker volume).
 
 #### Option B — Native Web Startup Script (Windows / macOS / Linux)
 Requires **Node.js 22+**, **pnpm 10+**, and **uv** (Python 3.13):
