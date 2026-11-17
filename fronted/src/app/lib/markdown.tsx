@@ -58,7 +58,7 @@ export function StructuredText({ content, className = "", streaming = false, cit
         li: ({ children }) => <li>{cite(children, citations)}</li>,
         img: () => null,
         a: ({ href, children }) => <a href={href} target="_blank" rel="noreferrer" className="text-gold underline">{children}</a>,
-        table: ({ children }) => <div className="overflow-x-auto rounded border"><table className="financial-table text-sm">{children}</table></div>,
+        table: ({ children }) => <div role="region" aria-label="数据表格" tabIndex={0} className="table-scroll-region rounded-lg border border-border"><table className="financial-table text-sm">{children}</table></div>,
         pre: ({ children }) => <pre className="overflow-x-auto rounded bg-secondary p-2">{children}</pre>,
         code: ({ children }) => <code className="font-mono">{children}</code>,
       }}>{visible}</Markdown>

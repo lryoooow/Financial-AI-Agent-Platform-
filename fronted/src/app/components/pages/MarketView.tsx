@@ -88,14 +88,13 @@ function DiagnosticsCard({
   const dot = (st?: string) => st === "ok" ? "var(--down)" : st === "fail" ? "var(--up)" : "var(--muted-foreground)";
 
   return (
-    <div className="rounded-xl border border-border bg-card p-3">
-      <div className="flex items-center justify-between gap-2 mb-2">
-        <div className="flex items-center gap-2">
-          <Database className={`size-4 ${marketOk ? "text-down" : "text-muted-foreground"}`} />
-          <span className="text-sm text-foreground">数据源状态</span>
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs font-medium text-foreground">探测明细</span>
           {diagnostics && <span className={`text-[10px] px-1.5 py-0.5 rounded ${marketOk ? "bg-down/10 text-down" : "bg-up/10 text-up"}`}>{marketOk ? "可用" : "待检查"}</span>}
         </div>
-        <button onClick={onRefresh} disabled={refreshing} className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-secondary hover:bg-secondary/70 disabled:opacity-50 transition-colors">
+        <button type="button" onClick={onRefresh} disabled={refreshing} className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-secondary hover:bg-secondary/70 disabled:opacity-50 transition-colors">
           {refreshing ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
           刷新
         </button>
@@ -202,9 +201,9 @@ export function MarketView({
   const [leftWidth, setLeftWidth] = useState(() => {
     try {
       const saved = Number(window.localStorage.getItem(LEFT_WIDTH_KEY));
-      return Number.isFinite(saved) && saved > 0 ? Math.min(380, Math.max(180, saved)) : 220;
+      return Number.isFinite(saved) && saved > 0 ? Math.min(380, Math.max(196, saved)) : 236;
     } catch {
-      return 220;
+      return 236;
     }
   });
 
@@ -442,7 +441,7 @@ export function MarketView({
 
   return (
     <div className="h-full min-h-0 flex flex-col lg:flex-row gap-2.5 p-2.5 overflow-hidden">
-      <div className="hidden lg:flex flex-col gap-4 min-h-0 overflow-y-auto pr-1 shrink-0" style={{ width: leftWidth }}>
+      <div className="hidden lg:flex flex-col gap-3 min-h-0 overflow-y-auto overscroll-contain pr-1 shrink-0" style={{ width: leftWidth }}>
         <WatchlistPanel visible={visible} compact currentSymbol={code} onSelect={onSelect} />
 
         <div className="rounded-xl border border-border bg-card p-3">
@@ -473,12 +472,12 @@ export function MarketView({
           <div className="p-2.5 border-b border-border">
             <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
               <Search className="size-3.5 text-muted-foreground" />
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码/首字母）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
+              <input aria-label="搜索全 A 股" value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索全 A 股（名称/代码/首字母）" className="bg-transparent outline-none text-xs w-full placeholder:text-muted-foreground" />
               {searching && <Loader2 className="size-3.5 animate-spin text-muted-foreground" />}
             </div>
-            <p className="text-[9px] text-muted-foreground/70 mt-1.5 px-0.5">{searchError ? "搜索服务异常" : results ? `全市场结果 ${list.length} 条` : "输入代码或简称"}</p>
+            <p className="text-[10px] text-muted-foreground/70 mt-1.5 px-0.5">{searchError ? "搜索服务异常" : results ? `全市场结果 ${list.length} 条` : "输入代码或简称"}</p>
           </div>
-          <div className="flex-1 overflow-y-auto p-1.5 space-y-0.5">
+          <div className="flex-1 overflow-y-auto overscroll-contain p-1.5 space-y-0.5">
             {list.length === 0 && searchError && <div className="text-center text-[11px] text-destructive/80 py-8">搜索服务暂时不可用，请稍后重试</div>}
             {list.length === 0 && !searchError && Array.isArray(results) && <div className="text-center text-[11px] text-muted-foreground py-8">未找到匹配股票</div>}
             {list.map((s) => (
@@ -505,12 +504,13 @@ export function MarketView({
         <div className="my-2 w-1 rounded-full bg-border transition-colors group-hover:bg-gold/60" />
       </div>
 
-      <div className="flex flex-col gap-4 min-h-0 flex-1 min-w-0 overflow-y-auto">
+      <div className="flex flex-col gap-3 min-h-0 flex-1 min-w-0 overflow-y-auto overscroll-contain">
         {/* 窄窗口搜索入口（lg 以下左侧栏隐藏时仍可搜股切换） */}
         <div className="lg:hidden rounded-xl border border-border bg-card p-2.5 relative">
           <div className="flex items-center gap-2 rounded-lg bg-input px-2.5 py-1.5">
             <Search className="size-3.5 text-muted-foreground" />
             <input
+              aria-label="搜索全 A 股"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="搜索全 A 股（名称/代码/拼音首字母）"
@@ -668,14 +668,28 @@ export function MarketView({
         </div>
       </div>
 
-      <div className="flex flex-col gap-4 min-h-0 overflow-y-auto lg:w-[220px] lg:shrink-0">
-        <details className="text-xs"><summary className="cursor-pointer text-muted-foreground">行情源诊断</summary>
-          <DiagnosticsCard diagnostics={diagnostics} error={diagnosticsError} onRefresh={refreshDiagnostics} refreshing={diagRefreshing} />
+      <div className="flex flex-col gap-3 min-h-0 overflow-y-auto overscroll-contain lg:w-[228px] lg:shrink-0">
+        <details className="group rounded-xl border border-border bg-card text-xs">
+          <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2.5 text-muted-foreground hover:text-foreground">
+            <span className="flex items-center gap-1.5">
+              <Database className={`size-3.5 ${diagnostics?.market.available ? "text-down" : "text-muted-foreground"}`} />
+              <span>行情源诊断</span>
+            </span>
+            <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {diagnostics ? (diagnostics.market.available ? "正常" : "待查") : "状态"}
+            </span>
+          </summary>
+          <div className="border-t border-border p-3">
+            <DiagnosticsCard diagnostics={diagnostics} error={diagnosticsError} onRefresh={refreshDiagnostics} refreshing={diagRefreshing} />
+          </div>
         </details>
         {book.asks.length || book.bids.length ? (
           <OrderBook asks={book.asks} bids={book.bids} prevClose={display.prevClose} />
         ) : (
-          <div className="rounded-xl border border-border bg-card p-4 text-xs text-muted-foreground">五档盘口未返回真实数据。</div>
+          <div className="rounded-xl border border-border bg-card px-3 py-2.5 flex items-center justify-between gap-2 text-xs">
+            <span className="text-foreground/90">五档盘口</span>
+            <span className="text-[11px] text-muted-foreground">暂无盘口数据</span>
+          </div>
         )}
 
         <div className="rounded-xl border border-border bg-card overflow-hidden">

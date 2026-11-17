@@ -686,7 +686,7 @@ export function ChatDesk({
             </button>
           </div>
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 space-y-1">
           {conversations.length === 0 && (
             <div className="px-3 py-8 text-center text-xs text-muted-foreground">
               {showArchived ? "暂无归档对话" : "暂无本地对话"}
@@ -747,7 +747,9 @@ export function ChatDesk({
                 <FlaskConical className="size-3.5" /> 深度研究台
               </button>
             )}
-            <ModelPicker active={activeModel} onChange={setLlm} onGoSettings={onGoSettings} />
+              <div className="sm:hidden">
+                <ModelPicker active={activeModel} onChange={setLlm} onGoSettings={onGoSettings} />
+              </div>
           </div>
         </div>
 
@@ -757,7 +759,7 @@ export function ChatDesk({
             const el = e.currentTarget;
             stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
           }}
-          className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4"
+          className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-5 space-y-4"
         >
           {!messages.length && !loading && !showArchived && (
             <div className="h-full grid place-items-center">
@@ -827,8 +829,10 @@ export function ChatDesk({
                     <Bot className="size-4" />
                   </div>
                 )}
-                <div className={`max-w-[78%] rounded-xl px-4 py-3 text-sm leading-relaxed ${
-                  m.role === "user" ? "bg-action text-gold-foreground" : "bg-secondary/50 text-foreground/90"
+                <div className={`max-w-[78%] rounded-xl px-4 py-3 text-sm leading-relaxed shadow-[var(--shadow-card)] ${
+                  m.role === "user"
+                    ? "border border-gold/30 bg-[var(--gold-muted)] text-foreground"
+                    : "border border-border/70 bg-card text-foreground/95"
                 }`}>
                   {m.role === "assistant" ? (
                     <>
@@ -883,7 +887,7 @@ export function ChatDesk({
                   ) : (
                     <>
                       {m.kind === "research_request" && (
-                        <span className="mr-1.5 inline-flex items-center gap-1 rounded bg-black/10 px-1.5 py-0.5 text-[10px] align-middle">
+                        <span className="mr-1.5 inline-flex items-center gap-1 rounded border border-gold/30 bg-gold/15 px-1.5 py-0.5 text-[10px] text-gold align-middle">
                           <FlaskConical className="size-3" /> 深度研究
                         </span>
                       )}
@@ -899,7 +903,7 @@ export function ChatDesk({
                               onError={(e) => {
                                 e.currentTarget.style.display = "none";
                               }}
-                              className="w-full max-h-32 object-cover rounded-lg border border-black/10 cursor-pointer hover:opacity-90 transition-opacity"
+                              className="w-full max-h-32 object-cover rounded-lg border border-border cursor-pointer hover:opacity-90 transition-opacity"
                               onClick={() => setLightbox(img)}
                             />
                           ))}
@@ -909,7 +913,7 @@ export function ChatDesk({
                   )}
                 </div>
                 {m.role === "user" && (
-                  <div className="grid place-items-center size-8 rounded-lg bg-secondary text-muted-foreground shrink-0">
+                  <div className="grid place-items-center size-8 rounded-lg border border-gold/25 bg-[var(--gold-muted)] text-gold shrink-0">
                     <UserRound className="size-4" />
                   </div>
                 )}
@@ -969,6 +973,8 @@ export function ChatDesk({
                 }}
               />
               <button
+                type="button"
+                aria-label="上传图片"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={readOnly}
                 className="grid place-items-center size-10 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors shrink-0"
@@ -978,6 +984,7 @@ export function ChatDesk({
               </button>
               <textarea
                 ref={inputRef}
+                aria-label="输入投研问题"
                 value={input}
                 disabled={readOnly}
                 onChange={(e) => setInput(e.target.value)}
@@ -1007,10 +1014,12 @@ export function ChatDesk({
                   ? "归档对话仅供查看，恢复后可继续提问"
                   : "输入投研问题，可上传 K 线/财报截图分析（支持粘贴/拖拽），也可追问已生成的深度研报…"}
                 rows={2}
-                className="min-h-[44px] flex-1 resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60"
+                className="auto-grow-textarea min-h-[44px] max-h-40 flex-1 resize-none overflow-y-auto bg-transparent px-2 py-1 text-sm outline-none placeholder:text-muted-foreground disabled:opacity-60"
               />
               {loading && (
                 <button
+                  type="button"
+                  aria-label="停止生成"
                   onClick={() => stopRef.current?.abort()}
                   className="grid place-items-center size-10 rounded-lg bg-destructive/15 text-destructive hover:bg-destructive/25 transition-colors shrink-0"
                   title="停止生成"
@@ -1019,6 +1028,8 @@ export function ChatDesk({
                 </button>
               )}
               <button
+                type="button"
+                aria-label="发送"
                 onClick={send}
                 disabled={!canSend}
                 className="grid place-items-center size-10 rounded-lg bg-action text-gold-foreground hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
@@ -1039,19 +1050,69 @@ export function ChatDesk({
       </>}
       </PanelGroup>
 
-      {/* 图片全屏预览 */}
-      {lightbox && (
-        <div
-          className="fixed inset-0 z-50 grid place-items-center bg-black/80 backdrop-blur-sm cursor-zoom-out"
-          onClick={() => setLightbox(null)}
-        >
+      {/* 图片全屏预览（原生 modal dialog + light-dismiss） */}
+      <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} />
+    </div>
+  );
+}
+
+function ImageLightbox({ src, onClose }: { src: string | null; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (src) {
+      if (!dialog.open) dialog.showModal();
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [src]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog || typeof HTMLDialogElement === "undefined" || "closedBy" in HTMLDialogElement.prototype) return;
+    const outside = (e: PointerEvent) => {
+      const r = dialog.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    let pressedOutside = false;
+    const onDown = (e: PointerEvent) => { pressedOutside = outside(e); };
+    const onUp = (e: PointerEvent) => { if (pressedOutside && outside(e)) dialog.close(); };
+    dialog.addEventListener("pointerdown", onDown);
+    dialog.addEventListener("pointerup", onUp);
+    return () => {
+      dialog.removeEventListener("pointerdown", onDown);
+      dialog.removeEventListener("pointerup", onUp);
+    };
+  }, []);
+
+  return (
+    <dialog
+      ref={dialogRef}
+      aria-label="附图大图预览"
+      {...({ closedby: "any" } as Record<string, string>)}
+      onClose={onClose}
+      className="m-auto max-h-[90dvh] max-w-[90dvw] border-0 bg-transparent p-0 outline-none overflow-visible"
+    >
+      {src && (
+        <div className="relative">
           <img
-            src={lightbox}
-            className="max-h-[90vh] max-w-[90vw] object-contain rounded-lg shadow-2xl"
-            alt="预览"
+            src={src}
+            className="block max-h-[88dvh] max-w-[88dvw] rounded-xl object-contain shadow-2xl"
+            alt="附图预览"
           />
+          <button
+            type="button"
+            autoFocus
+            aria-label="关闭大图预览"
+            onClick={() => dialogRef.current?.close()}
+            className="absolute -right-3 -top-3 grid size-8 place-items-center rounded-full border border-border bg-popover text-foreground shadow-md hover:bg-secondary"
+          >
+            <X className="size-4" />
+          </button>
         </div>
       )}
-    </div>
+    </dialog>
   );
 }

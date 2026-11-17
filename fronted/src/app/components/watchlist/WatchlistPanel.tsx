@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, GripVertical, Pencil, Plus, ScanLine, Trash2 } from "lucide-react";
 import { api, type HumanApproval, type Quote, type RadarRow, type WatchlistGroup, type WatchlistItem } from "../../api/client";
 import { fmt, signed, trendClass } from "../../lib/format";
+import { isImeKeyEvent } from "../../lib/ime";
 import { loadActiveLlm } from "../ModelPicker";
 import { useConfirm } from "../ui/confirm";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "../ui/dialog";
@@ -164,10 +165,10 @@ export function WatchlistPanel({ visible, compact = false, currentSymbol, onSele
     await mutate(async () => { await api.removeWatchlist(item?.id ?? group.id, item ? "item" : "group"); saved(); });
   }
 
-  return <section aria-label="自选股" className="min-w-0 space-y-2 rounded-lg border bg-card p-2.5">
-    <div className="flex flex-wrap items-center gap-1.5">
-      <h2 className="mr-1 font-medium">自选股</h2>
-      {group && <select aria-label="自选分组" className="min-w-0 max-w-36 rounded border bg-input px-1.5 py-1" value={group.id}
+  return <section aria-label="自选股" className="min-w-0 space-y-2 rounded-xl border border-border bg-card p-2.5">
+    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+      <h2 className="mr-0.5 text-sm font-medium">自选股</h2>
+      {group && <select aria-label="自选分组" className="min-w-0 max-w-32 rounded border bg-input px-1.5 py-1 text-xs" value={group.id}
         onChange={(event) => setGroupId(event.target.value)}>
         {groups?.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
       </select>}
@@ -177,7 +178,7 @@ export function WatchlistPanel({ visible, compact = false, currentSymbol, onSele
         <button type="button" title="删除分组" aria-label="删除分组" disabled={busy || (groups?.length ?? 0) <= 1} className={toolbarButton} onClick={() => void remove()}><Trash2 className="size-3.5" /></button>
         <button type="button" className={toolbarButton} onClick={() => setImportOpen(true)}>导入</button>
         {currentSymbol && !group.items.some((item) => item.symbol === currentSymbol) && <button type="button" className={toolbarButton} disabled={busy}
-          onClick={() => void mutate(async () => { await api.addWatchlist({ group_id: group.id, symbol: currentSymbol }); saved(); })}>加入当前标的</button>}
+          onClick={() => void mutate(async () => { await api.addWatchlist({ group_id: group.id, symbol: currentSymbol }); saved(); })}>加入当前</button>}
         {!compact && <button type="button" className={toolbarButton + " ml-auto flex items-center gap-1"} disabled={scanning || !group.items.length} onClick={() => void runRadar()}>
           <ScanLine className="size-3.5" /> {scanning ? "体检中…" : "五维体检"}
         </button>}
@@ -186,36 +187,59 @@ export function WatchlistPanel({ visible, compact = false, currentSymbol, onSele
     {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
     {message && <p role="status" className="text-xs text-gold">{message}</p>}
     {!groups && !error && <Skeleton className="h-24" />}
-    {group && !group.items.length && <p className="p-3 text-muted-foreground">分组为空。导入或从看盘页加入标的。</p>}
-    {!!group?.items.length && <div className="overflow-auto">
-      <table className="financial-table text-xs">
-        <thead><tr><th>标的</th><th>现价</th><th>涨跌</th>{!compact && <><th>PE</th><th>PB</th><th>加入价</th><th>较加入价</th></>}<th>编辑</th></tr></thead>
+    {group && !group.items.length && <p className="p-3 text-xs text-muted-foreground">分组为空。导入或从看盘页加入标的。</p>}
+    {!!group?.items.length && <div role="region" aria-label="自选股行情表" tabIndex={0} className="table-scroll-region rounded-md">
+      <table className={"financial-table text-xs" + (compact ? " financial-table-compact" : "")}>
+        <thead>
+          <tr>
+            <th>标的</th>
+            <th>现价</th>
+            <th>涨跌</th>
+            {!compact && <><th>PE</th><th>PB</th><th>加入价</th><th>较加入价</th><th>编辑</th></>}
+          </tr>
+        </thead>
         <tbody>{group.items.map((item, index) => {
           const quote = quotes[item.symbol];
           const price = quote?.price && quote.price > 0 ? quote.price : null;
           const change = price != null ? quote?.changePct : null;
           const delta = price != null && item.added_price ? (price / item.added_price - 1) * 100 : null;
-          return <tr key={item.id} onDragOver={(event) => { if (dragging.current) event.preventDefault(); }}
+          return <tr key={item.id}
+            draggable={compact && !busy}
+            onDragStart={compact ? (event) => { dragging.current = item.id; event.dataTransfer.setData("text/plain", item.id); } : undefined}
+            onDragEnd={compact ? () => { dragging.current = ""; } : undefined}
+            onDragOver={(event) => { if (dragging.current) event.preventDefault(); }}
             onDrop={(event) => { event.preventDefault(); void reorder(dragging.current, item.id); dragging.current = ""; }}>
             <td><div className="flex items-center gap-1">
-              <span draggable={!busy} onDragStart={(event) => { dragging.current = item.id; event.dataTransfer.setData("text/plain", item.id); }}
-                onDragEnd={() => { dragging.current = ""; }} title="拖动调整顺序" className="cursor-grab text-muted-foreground"><GripVertical className="size-3" /></span>
-              <button type="button" onClick={() => onSelect(item.symbol)} className="whitespace-nowrap text-left hover:text-gold" title={item.note || item.symbol}>
+              {!compact && <span draggable={!busy} onDragStart={(event) => { dragging.current = item.id; event.dataTransfer.setData("text/plain", item.id); }}
+                onDragEnd={() => { dragging.current = ""; }} title="拖动调整顺序" className="cursor-grab text-muted-foreground"><GripVertical className="size-3" /></span>}
+              <button type="button" onClick={() => onSelect(item.symbol)}
+                className={"whitespace-nowrap text-left hover:text-gold " + (currentSymbol === item.symbol ? "font-medium text-gold" : "")}
+                title={item.note ? `${item.symbol} · ${item.note}` : item.symbol}>
                 {item.name}{!compact && <span className="ml-2 font-mono text-muted-foreground">{item.symbol}</span>}
               </button>
             </div></td>
-            <td title={quote?.as_of}>{price == null ? "—" : fmt(price)}</td>
-            <td className={trendClass(change ?? 0)}>{change == null ? "—" : signed(change) + "%"}</td>
-            {!compact && <><td>{price && quote?.pe ? fmt(quote.pe) : "—"}</td><td>{price && quote?.pb ? fmt(quote.pb) : "—"}</td>
-              <td>{item.added_price == null ? "—" : fmt(item.added_price)}</td><td className={trendClass(delta ?? 0)}>{delta == null ? "—" : signed(delta) + "%"}</td></>}
-            <td><div className="flex justify-end gap-1">
-              {!compact && <>
+            <td title={quote?.as_of} className="whitespace-nowrap">{price == null ? "—" : fmt(price)}</td>
+            <td className={"relative whitespace-nowrap " + trendClass(change ?? 0)}>
+              <span>{change == null ? "—" : signed(change) + "%"}</span>
+              {compact && (
+                <span className="row-hover-actions absolute right-1 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 rounded border border-border bg-popover px-1 py-0.5 text-muted-foreground shadow-sm">
+                  <button type="button" aria-label={"编辑 " + item.name + " 备注"} className="hover:text-foreground" onClick={() => edit("item", item.note, item.id)}><Pencil className="size-3" /></button>
+                  <button type="button" aria-label={"移除 " + item.name} disabled={busy} className="hover:text-destructive disabled:opacity-40" onClick={() => void remove(item)}><Trash2 className="size-3" /></button>
+                </span>
+              )}
+            </td>
+            {!compact && <>
+              <td>{price && quote?.pe ? fmt(quote.pe) : "—"}</td>
+              <td>{price && quote?.pb ? fmt(quote.pb) : "—"}</td>
+              <td>{item.added_price == null ? "—" : fmt(item.added_price)}</td>
+              <td className={trendClass(delta ?? 0)}>{delta == null ? "—" : signed(delta) + "%"}</td>
+              <td><div className="flex justify-end gap-1">
                 <button type="button" aria-label={"上移 " + item.name} disabled={!index || busy} onClick={() => void reorder(item.id, group.items[index - 1].id)} className="disabled:opacity-30"><ArrowUp className="size-3" /></button>
                 <button type="button" aria-label={"下移 " + item.name} disabled={index === group.items.length - 1 || busy} onClick={() => void reorder(item.id, group.items[index + 1].id)} className="disabled:opacity-30"><ArrowDown className="size-3" /></button>
-              </>}
-              <button type="button" aria-label={"编辑 " + item.name + " 备注"} onClick={() => edit("item", item.note, item.id)}><Pencil className="size-3" /></button>
-              <button type="button" aria-label={"移除 " + item.name} disabled={busy} onClick={() => void remove(item)}><Trash2 className="size-3" /></button>
-            </div></td>
+                <button type="button" aria-label={"编辑 " + item.name + " 备注"} onClick={() => edit("item", item.note, item.id)}><Pencil className="size-3" /></button>
+                <button type="button" aria-label={"移除 " + item.name} disabled={busy} onClick={() => void remove(item)}><Trash2 className="size-3" /></button>
+              </div></td>
+            </>}
           </tr>;
         })}</tbody>
       </table>
@@ -231,7 +255,14 @@ export function WatchlistPanel({ visible, compact = false, currentSymbol, onSele
       <DialogContent>
         <DialogHeader><DialogTitle>{editor?.kind === "group" ? "自选分组" : "自选备注"}</DialogTitle><DialogDescription>修改会保存到本机自选列表。</DialogDescription></DialogHeader>
         <input aria-label={editor?.kind === "group" ? "分组名称" : "备注"} className="rounded border bg-input p-2"
-          maxLength={editor?.kind === "group" ? 64 : 200} value={draft} onChange={(event) => setDraft(event.target.value)} />
+          maxLength={editor?.kind === "group" ? 64 : 200} value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !isImeKeyEvent(event.nativeEvent) && !(busy || (editor?.kind === "group" && !draft.trim()))) {
+              event.preventDefault();
+              void saveEditor();
+            }
+          }} />
         {error && <p role="alert" className="text-destructive">{error}</p>}
         <button type="button" className="justify-self-end rounded bg-action px-3 py-1 text-gold-foreground disabled:opacity-50"
           disabled={busy || (editor?.kind === "group" && !draft.trim())} onClick={() => void saveEditor()}>保存</button>

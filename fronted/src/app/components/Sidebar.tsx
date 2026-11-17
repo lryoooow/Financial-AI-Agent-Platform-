@@ -22,7 +22,7 @@ export function Sidebar({ page, onNavigate, runningResearchCount = 0, collapsed,
     if (page !== "settings") api.schedulerConfig().then((result) => setScheduled(result.enabled)).catch(() => {});
   }, [page]);
   return (
-    <aside aria-label="工作台导航" className={"flex shrink-0 flex-col border-r bg-sidebar transition-[width] duration-150 " + (collapsed ? "w-[52px]" : "w-[180px]")}>
+    <aside aria-label="工作台导航" className={"flex shrink-0 flex-col border-r bg-sidebar motion-safe:transition-[width] duration-150 " + (collapsed ? "w-[52px]" : "w-[180px]")}>
       <nav className="flex flex-1 flex-col gap-1 p-2">
         {NAV.map(({ id, label, icon: Icon }) => (
           <button type="button" key={id} title={label} aria-label={label} aria-current={page === id ? "page" : undefined}

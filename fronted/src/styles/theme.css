@@ -3,6 +3,11 @@
 
 :root {
   color-scheme: light;
+  accent-color: var(--gold);
+  --scrollbar-thumb: #68707c;
+  --scrollbar-track: #eceef2;
+  scrollbar-width: auto;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   --bg-body: #f2f3f6;
   --bg-surface: #ffffff;
   --bg-card: #ffffff;
@@ -70,6 +75,11 @@
 
 .dark {
   color-scheme: dark;
+  accent-color: var(--gold);
+  --scrollbar-thumb: #737b8c;
+  --scrollbar-track: #181a1e;
+  scrollbar-width: auto;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   --bg-body: #121316;
   --bg-surface: #181a1e;
   --bg-card: #1f2228;
@@ -148,9 +158,9 @@
 
 /* ---- 字体（Windows 风格）：真实 CSS 变量，font-display / font-mono / var(--font-mono) 均可用 ---- */
 @theme {
-  --text-xs: 12px;
-  --text-sm: 13px;
-  --text-base: 14px;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
   --font-sans: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, "PingFang SC", sans-serif;
   --font-display: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -164,21 +174,147 @@
 
 @layer base {
   * { @apply border-border outline-ring/60; }
+  ::selection {
+    background-color: rgba(216, 178, 74, 0.26);
+    color: var(--text-primary);
+  }
   body {
     @apply bg-background text-foreground;
     font-family: var(--font-sans);
-    font-size: 13px;
-    line-height: 20px;
+    font-size: 0.8125rem;
+    line-height: 1.55;
+    overflow-wrap: break-word;
   }
-  h1, h2, h3, h4 { font-family: var(--font-display); font-weight: 600; }
-  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    text-wrap: balance;
+  }
+  p, li, blockquote {
+    text-wrap: pretty;
+  }
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    :where(button:not(:disabled)) {
+      transition: background-color 150ms ease-out, border-color 150ms ease-out, color 150ms ease-out, opacity 150ms ease-out, scale 120ms ease-out;
+    }
+    :where(button:not(:disabled)):active {
+      scale: 0.98;
+    }
+  }
 }
-.workbench-copy { font-size: 14px; line-height: 22px; max-width: 700px; }
-.financial-table { border-collapse: separate; border-spacing: 0; min-width: max(100%, 420px); }
-.financial-table :is(td, th) { padding: 5px 10px; border-bottom: 1px solid var(--border-subtle); text-align: right; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
-.financial-table :is(td, th):first-child { position: sticky; left: 0; z-index: 1; text-align: left; font-family: var(--font-sans); background: var(--bg-surface); }
-.financial-table th { background: var(--bg-subtle); }
-.financial-table tr:nth-child(even) td { background: var(--bg-subtle); }
+
+/* Native modal dialog scroll containment & backdrop */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background-color: rgb(0 0 0 / 0.78);
+  backdrop-filter: blur(3px);
+}
+
+/* Legacy fallback for browsers without standard scrollbar-color */
+@supports not (scrollbar-color: auto) {
+  ::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+}
+
+.workbench-copy {
+  font-size: 0.875rem;
+  line-height: 1.65;
+  max-inline-size: 68ch;
+  overflow-wrap: break-word;
+  text-wrap: pretty;
+}
+.auto-grow-textarea {
+  field-sizing: content;
+  max-block-size: 10rem;
+}
+.table-scroll-region {
+  overflow: auto;
+  max-inline-size: 100%;
+  overscroll-behavior: contain;
+}
+.financial-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  min-inline-size: max(100%, 26rem);
+}
+.financial-table-compact {
+  min-inline-size: 100%;
+}
+.financial-table :is(td, th) {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+.financial-table-compact :is(td, th) {
+  padding: 5px 6px;
+}
+.financial-table thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.financial-table tbody tr {
+  --row-bg: var(--bg-card);
+}
+.financial-table tbody tr:nth-child(even) {
+  --row-bg: var(--bg-subtle);
+}
+.financial-table tbody tr:hover {
+  --row-bg: var(--bg-muted);
+}
+.financial-table tbody :is(td, th) {
+  background: var(--row-bg);
+}
+.financial-table :is(td, th):first-child {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: 1;
+  text-align: left;
+  font-family: var(--font-sans);
+}
+.financial-table thead th:first-child {
+  z-index: 3;
+  background: var(--bg-subtle);
+}
+.row-hover-actions {
+  opacity: 0;
+  pointer-events: none;
+}
+tr:hover .row-hover-actions,
+tr:focus-within .row-hover-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: none) {
+  .row-hover-actions {
+    position: static;
+    translate: none;
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
 .stream-tail { transition: opacity 125ms ease; }
 @starting-style { .stream-tail { opacity: .65; } }
 @media (prefers-reduced-motion: reduce) {

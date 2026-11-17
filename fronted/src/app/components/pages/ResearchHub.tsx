@@ -618,7 +618,7 @@ export function ResearchHub({
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+        <div className="flex-1 overflow-y-auto overscroll-contain p-2 space-y-1">
           {pollWarning && (
             <div className="mx-1 mb-1 rounded-md border border-gold/25 bg-gold/10 px-2 py-1 text-[10.5px] text-gold">
               {pollWarning}
@@ -678,9 +678,10 @@ export function ResearchHub({
                     {isRunning && (
                       <button
                         type="button"
+                        aria-label={"取消 " + displayName + " 研究任务"}
                         onClick={(e) => void handleCancelTask(t, e)}
                         title="取消该任务"
-                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-all"
+                        className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100 p-0.5 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-all"
                       >
                         <Square className="size-3 fill-current" />
                       </button>
@@ -688,9 +689,10 @@ export function ResearchHub({
                     {!isRunning && !t.report_id && (
                       <button
                         type="button"
+                        aria-label={"清理 " + displayName + " 未完成记录"}
                         onClick={(e) => void handleDeleteTask(t, e)}
                         title="清理该条未完成记录"
-                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-all"
+                        className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100 p-0.5 rounded hover:bg-destructive/15 text-muted-foreground hover:text-destructive transition-all"
                       >
                         <Trash2 className="size-3" />
                       </button>
@@ -730,13 +732,13 @@ export function ResearchHub({
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 sm:hidden">
             <ModelPicker active={activeModel} onGoSettings={onGoSettings} onChange={setLlm} />
           </div>
         </header>
 
         {/* 主体内容区 */}
-        <div className="flex-1 overflow-y-auto px-3 py-2.5">
+        <div className="flex-1 overflow-y-auto overscroll-contain px-3 py-2.5">
           {activeTask ? (
             /* ── 视图 B：单任务实时流式/成品阅读视图 ── */
             <div className="mx-auto max-w-4xl space-y-3.5">
@@ -891,7 +893,7 @@ export function ResearchHub({
               {/* 第二步：研究标的输入 + 智能联想 */}
               <div className="rounded-lg border border-border bg-card p-3 space-y-2.5">
                 <div className="space-y-2" ref={searchBoxRef} hidden={template === "market_recap"}>
-                  <label className="text-xs font-medium text-foreground/90 flex items-center gap-2">
+                  <label htmlFor="research-target-input" className="text-xs font-medium text-foreground/90 flex items-center gap-2">
                     {template === "industry" ? "输入目标行业或赛道" : "输入目标股票 / ETF（支持代码、简称、拼音首字母）"}
                   </label>
 
@@ -899,6 +901,7 @@ export function ResearchHub({
                     <div className="flex items-center gap-2 rounded-lg bg-input border border-border focus-within:border-gold/60 px-3 py-2.5 transition-colors">
                       <Search className="size-4 text-gold shrink-0" />
                       <input
+                        id="research-target-input"
                         ref={targetInputRef}
                         value={targetInput}
                         onChange={(e) => {
@@ -1020,13 +1023,14 @@ export function ResearchHub({
 
                 {/* 第三步：可选研究关注点（打通后端 query） */}
                 <div className="space-y-2 pt-2 border-t border-border/60">
-                  <label className="text-xs font-medium text-foreground/90 flex items-center gap-2">
+                  <label htmlFor="research-focus-input" className="text-xs font-medium text-foreground/90 flex items-center gap-2">
                     <span className="inline-grid place-items-center size-4.5 rounded-full bg-secondary text-muted-foreground text-[10px] font-mono">3</span>
                     特别关注的研究问题
                     <span className="text-[10.5px] font-normal text-muted-foreground">（可选 · AI 会在撰写各章节时重点回应）</span>
                   </label>
 
                   <input
+                    id="research-focus-input"
                     value={focusQuery}
                     onChange={(e) => setFocusQuery(e.target.value)}
                     onKeyDown={(e) => {

@@ -42,10 +42,10 @@ function ReportPreview({ report }: { report: ReportDoc }) {
       {finRows.length > 0 && finYears.length > 0 && (
         <section>
           <h2 className="mb-3 border-l-[3px] border-gold pl-2.5 text-sm font-semibold">财务分析</h2>
-          <div className="overflow-x-auto rounded-lg border border-border">
+          <div role="region" aria-label="财务分析表格" tabIndex={0} className="table-scroll-region rounded-lg border border-border">
             <table className="financial-table text-xs">
               <thead>
-                <tr className="bg-secondary/50">
+                <tr>
                   <th className="px-3 py-2 text-left font-normal text-muted-foreground">指标</th>
                   {finYears.map((year) => (
                     <th key={year} className="px-3 py-2 font-normal text-muted-foreground">{year}</th>
@@ -53,9 +53,9 @@ function ReportPreview({ report }: { report: ReportDoc }) {
                 </tr>
               </thead>
               <tbody>
-                {finRows.map((row, index) => (
-                  <tr key={row.name} className={index % 2 ? "bg-secondary/20" : ""}>
-                    <td className="px-3 py-2 text-foreground/80">{row.name}</td>
+                {finRows.map((row) => (
+                  <tr key={row.name}>
+                    <td className="px-3 py-2 text-foreground/85">{row.name}</td>
                     {(row.values || []).map((value, valueIndex) => (
                       <td key={valueIndex} className="px-3 py-2 text-right font-mono tabular-nums text-foreground/90">{value}</td>
                     ))}

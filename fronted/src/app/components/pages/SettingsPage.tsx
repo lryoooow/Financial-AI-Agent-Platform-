@@ -89,8 +89,8 @@ export function SettingsPage({ active, onActivate }: Props) {
   };
 
   return (
-    <div className="h-full min-h-0 grid grid-cols-[160px_minmax(0,1fr)] overflow-hidden">
-      <nav aria-label="设置分类" className="border-r border-border bg-sidebar/40 p-3 space-y-0.5 overflow-y-auto">
+    <div className="h-full min-h-0 grid grid-cols-[168px_minmax(0,1fr)] overflow-hidden">
+      <nav aria-label="设置分类" className="border-r border-border bg-sidebar/40 p-3 space-y-0.5 overflow-y-auto overscroll-contain">
         <p className="px-2 pt-1 pb-3 text-[10px] tracking-[0.2em] text-muted-foreground/70 uppercase">设置</p>
         {TABS.map((t) => {
           const Icon = t.icon;
@@ -112,8 +112,8 @@ export function SettingsPage({ active, onActivate }: Props) {
         {tab === "models" ? (
           <ModelSettings active={active} onActivate={onActivate} />
         ) : (
-          <div className="h-full overflow-y-auto">
-            <div className="max-w-2xl p-6 space-y-6">
+          <div className="h-full overflow-y-auto overscroll-contain">
+            <div className="mx-auto w-full max-w-3xl px-6 py-6 space-y-6">
               {tab === "general" && <GeneralTab />}
               {tab === "context" && <ContextTab app={app} patch={patchApp} />}
               {tab === "research" && <ResearchTab app={app} patch={patchApp} />}
@@ -261,6 +261,7 @@ function ContextTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppSe
         </Row>
         <Row label={`自动压缩阈值：${app.compact_threshold_pct}%`} hint="上下文用量达到窗口的该比例时压缩；越低越省 token，越高保留原文越多">
           <input
+            aria-label="自动压缩阈值"
             type="range" min={50} max={90} step={5}
             value={app.compact_threshold_pct}
             onChange={(e) => patch({ compact_threshold_pct: Number(e.target.value) })}
@@ -388,6 +389,7 @@ function PersonalTab({ app, patch }: { app: AppSettings; patch: (p: Partial<AppS
           </div>
           <div className="mt-2 flex items-center gap-2">
             <input
+              aria-label="手动添加偏好笔记"
               value={note}
               onChange={(e) => setNote(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !isImeKeyEvent(e.nativeEvent) && note.trim()) api.addProfileNote(note.trim()).then(() => { setNote(""); void loadLearned(); }).catch(() => {}); }}

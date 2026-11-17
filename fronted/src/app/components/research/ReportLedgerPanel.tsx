@@ -36,7 +36,7 @@ export function ReportLedgerPanel({ id }: { id: string }) {
     {!ledger && !error && <Skeleton className="h-48" />}
     {ledger && <>
       {(ledger.legacy || ledger.message) && <p className="text-muted-foreground">{ledger.message || "历史研报从原始记录读取当时可核验的数据。"}</p>}
-      <div className="overflow-auto rounded border">
+      <div role="region" aria-label="跨期事实对账单表格" tabIndex={0} className="table-scroll-region rounded-lg border border-border">
         <table className="financial-table text-xs">
           <thead><tr><th>事实字段</th><th>研报时点</th><th>当前数据</th></tr></thead>
           <tbody>{FIELDS.map(([key, label, unit]) => <tr key={key}>

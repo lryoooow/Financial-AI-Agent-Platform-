@@ -19,7 +19,7 @@ export function RadarTable({ rows, selected, onToggle, onSelect }: {
       {["", ...groups].map((group) => <button key={group} type="button" aria-pressed={group === category} onClick={() => setCategory(group)}
         className="rounded border px-2 py-1 aria-pressed:bg-accent">{group || "全部"} {group ? rows.filter((row) => row.groups.includes(group)).length : rows.length}</button>)}
     </div>
-    <div className="overflow-auto rounded border">
+    <div role="region" aria-label="自选五维体检表格" tabIndex={0} className="table-scroll-region rounded-lg border border-border">
       <table className="financial-table min-w-[540px] text-xs">
         <thead><tr><th>标的</th><th>PE TTM 分位</th><th>营收同比</th><th>量比</th><th>60日回撤</th><th>72h 快讯</th></tr></thead>
         <tbody>{visible.map((row) => <Fragment key={row.symbol}>

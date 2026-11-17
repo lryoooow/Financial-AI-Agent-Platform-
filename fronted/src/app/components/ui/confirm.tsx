@@ -32,7 +32,7 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
             <Alert.Title className="text-base">{dialog?.title}</Alert.Title>
             <Alert.Description className="mt-2 text-sm text-muted-foreground">{dialog?.description}</Alert.Description>
             <div className="mt-5 flex justify-end gap-2">
-              <Alert.Cancel className="rounded-md border px-4 py-1.5" onClick={() => finish(false)}>取消</Alert.Cancel>
+              <Alert.Cancel autoFocus className="rounded-md border px-4 py-1.5" onClick={() => finish(false)}>取消</Alert.Cancel>
               <Alert.Action className="rounded-md bg-destructive px-4 py-1.5 text-destructive-foreground" onClick={() => finish(true)}>确认</Alert.Action>
             </div>
           </Alert.Content>
