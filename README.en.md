@@ -6,7 +6,7 @@
 
 **A local-first & self-hostable A-share AI research workbench for individual investors.**
 
-[![Official Release](https://img.shields.io/badge/release-v2.0.0%20Official-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+[![Release](https://img.shields.io/badge/release-v0.1.1%20Preview-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Web%20%2F%20Docker-0B1220)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![Tests](https://img.shields.io/badge/tests-365%20passed-10B981)](backend/tests)
 [![License](https://img.shields.io/badge/license-Personal%20use%20only-8B5CF6)](LICENSE)
@@ -17,9 +17,14 @@
 
 ---
 
-## v2.0.0 Official Release (GA)
+## v0.1.1 Release Notes (Version Reset & What's New)
 
-**`v2.0.0` is the first architecture-level General Availability release of JingYuan.** It delivers an Astryx-inspired 6-workspace financial research terminal, a 10-module decoupled agent engine (`engine/` ACL boundary + pure Python `core/`), and three ready-to-use open distributions (**Self-Hosted Web / Docker**, **Windows & macOS Desktop Installers**, and **Ready-to-Run Portable Archives**), verified by **365 automated backend regression tests**.
+> **Why `v0.1.1`?** JingYuan is still under active early-stage iteration. Earlier inflated version numbers and tags have been retired, and versioning now starts cleanly and pragmatically from **`v0.1.1`**.
+
+**Highlights in `v0.1.1`:**
+- **Modern Web UI & Aesthetics Overhaul**: Eliminated narrow-rail watchlist price clipping with `.financial-table-compact` and hover/focus-within action pills; added `<meta name="color-scheme">` zero-FOUC dark canvas, warm-gold `accent-color` native controls, and ≥3:1 dark `scrollbar-color`; deduplicated stacked `ModelPicker` bars; refined chat user prompts into muted-gold dark cards; fixed sticky table first-column zebra seams; upgraded to `field-sizing: content` auto-growing inputs and native `<dialog closedby="any">` lightboxes.
+- **6-Workspace Financial Terminal & 10-Module Decoupled Engine**: Covers Market Overview, Market & 5D Watchlist Radar, Deep Research Hub, Multi-Turn Agentic Chat with Artifact Drawer, Report Ledger & Hybrid RAG, and Post-Close Scheduler — backed by an ACL-isolated `engine/` + pure Python `core/` architecture verified by **365 automated backend tests**.
+- **Three Open Distributions**: Self-Hosted Web / Docker, Windows & macOS Desktop Installers, and Ready-to-Run Portable Archives.
 
 ## Three Iron Product Laws
 
@@ -47,7 +52,7 @@ Dedicated workspace supporting 5 templates (*Equity Deep Dive*, *Industry Resear
 ![Deep Research Hub](assets/screenshots/03-deep-research.png)
 
 ### 4. Agentic Research Chat & Artifact Drawer
-Multi-turn research Q&A with parallel tool bursts, canonical symbol deduplication, HITL ambiguity confirmation, screenshot paste analysis, collapsible reasoning chain, and interactive right-hand **Artifact Drawer** for K-lines, risk tables, and financial statements.
+Multi-turn research Q&A with parallel tool bursts, canonical symbol deduplication, HITL ambiguity confirmation, screenshot paste analysis, auto-growing multiline input, collapsible reasoning chain, and interactive right-hand **Artifact Drawer** for K-lines, risk tables, and financial statements.
 
 ![Research Chat & Artifact Drawer](assets/screenshots/04-chat-artifacts.png)
 
@@ -63,18 +68,18 @@ OpenAI-compatible provider gateway (DeepSeek, Qwen, OpenAI, Gemini, GLM, custom 
 
 ---
 
-## Three Ways to Run JingYuan v2.0.0
+## Three Ways to Run JingYuan v0.1.1
 
 Download prebuilt packages from [GitHub Releases](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest):
 
 ### 1. Ready-to-Run Portable Archives (No Installation Required)
-- **Windows Portable ZIP**: `JingYuan-2.0.0-win-x64-portable.zip` — extract anywhere and launch `JingYuan.exe` (stores data in `./portable-data`).
-- **Windows Single-File Portable**: `JingYuan-Portable-2.0.0.exe` — double-click to run directly.
-- **macOS Portable ZIP**: `JingYuan-2.0.0-mac-arm64-portable.zip` (Apple Silicon) / `JingYuan-2.0.0-mac-x64-portable.zip` (Intel).
+- **Windows Portable ZIP**: `JingYuan-0.1.1-win-x64-portable.zip` — extract anywhere and launch `JingYuan.exe` (stores data in `./portable-data`).
+- **Windows Single-File Portable**: `JingYuan-Portable-0.1.1.exe` — double-click to run directly.
+- **macOS Portable ZIP**: `JingYuan-0.1.1-mac-arm64-portable.zip` (Apple Silicon) / `JingYuan-0.1.1-mac-x64-portable.zip` (Intel).
 
 ### 2. Desktop Installers (Windows & macOS)
-- **Windows x64 Installer**: `JingYuan-Setup-2.0.0.exe` (retains existing `%APPDATA%\FinResearch` data across upgrades).
-- **macOS Disk Images**: `JingYuan-2.0.0-mac-arm64.dmg` / `JingYuan-2.0.0-mac-x64.dmg` (`~/Library/Application Support/FinResearch`).
+- **Windows x64 Installer**: `JingYuan-Setup-0.1.1.exe` (retains existing `%APPDATA%\FinResearch` data across upgrades).
+- **macOS Disk Images**: `JingYuan-0.1.1-mac-arm64.dmg` / `JingYuan-0.1.1-mac-x64.dmg` (`~/Library/Application Support/FinResearch`).
 
 ### 3. CLI Startup & Self-Hosted Web Edition
 
@@ -131,5 +136,5 @@ pnpm --dir fronted typecheck
 ---
 
 <div align="center">
-<sub>景渊 JingYuan v2.0.0 · Built for research, not for trading.</sub>
+<sub>景渊 JingYuan v0.1.1 · Built for research, not for trading.</sub>
 </div>

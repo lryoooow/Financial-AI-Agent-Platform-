@@ -1,4 +1,4 @@
-"""Comprehensive v2.0.0 full-stack audit regression suite.
+"""Comprehensive full-stack audit regression suite.
 
 Locks in fixes for:
 1. 泽璟制药 (688266.SH) 8-parallel-tool burst, zero current-turn archiving, market_io=36,

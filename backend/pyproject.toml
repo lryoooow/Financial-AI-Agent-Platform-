@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finresearch"
-version = "2.0.0"
-description = "景渊 JingYuan · 家用本地金融研究助手后端（akshare + LangGraph 固定管线）"
+version = "0.1.1"
+description = "景渊 JingYuan · 本地优先与可自部署 A 股 AI 投研工作台后端"
 readme = "README.md"
 requires-python = ">=3.12"
 # 注：PyInstaller 6.21+ 在 Python 3.14 已实测可用；3.12 仍是安全下限。
-authors = [{ name = "JingYuan Contributors" }]
+authors = [{ name = "lryoooow" }]
 dependencies = [
   # Web
   "fastapi>=0.110",

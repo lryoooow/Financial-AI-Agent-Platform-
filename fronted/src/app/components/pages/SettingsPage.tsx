@@ -486,7 +486,7 @@ function AboutTab() {
   }, []);
   return (
     <Section title="景渊 JingYuan · 金融研究助手">
-      <Row label="版本"><span className="text-xs tabular text-foreground/85">{version || "2.0.0"}</span></Row>
+      <Row label="版本"><span className="text-xs tabular text-foreground/85">{version || "0.1.1"}</span></Row>
       <Row label="数据原则" hint="只读研究，永不接入交易；所有数值由本地工具库计算并可溯源，AI 仅供研究参考，不构成投资建议。">
         <BookOpen className="size-4 text-gold" />
       </Row>

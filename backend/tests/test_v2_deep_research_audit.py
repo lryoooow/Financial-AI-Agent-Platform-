@@ -1,4 +1,4 @@
-"""v2.0.0 Deep Research & Multi-Turn Numeric Evidence Audit Regressions."""
+"""Deep Research & Multi-Turn Numeric Evidence Audit Regressions."""
 
 from __future__ import annotations
 

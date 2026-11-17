@@ -44,7 +44,7 @@ def smoke(executable: Path) -> None:
             if process.poll() is not None:
                 log = profile / "backend-sidecar.log"
                 raise RuntimeError(log.read_text(encoding="utf-8", errors="replace")[-4000:] if log.exists() else "Packaged sidecar exited.")
-            assert health["version"] == "2.0.0"
+            assert health["version"] == "0.1.1"
             assert b"/assets/" in request("/")
             assert json.loads(request("/api/watchlist"))["groups"][0]["name"] == "核心自选"
             boundary = "JingYuanSmokeMultipart"

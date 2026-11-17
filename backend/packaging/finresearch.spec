@@ -29,7 +29,7 @@ hiddenimports = []
 
 # 重型 / 动态导入的库：全量收集（数据 + 二进制 + 子模块）
 # v1.6.0：+psutil（run_server 父进程看门狗的懒导入，显式收集防静态分析漏网）
-# v2.0.0：+tiktoken + trafilatura 传递数据依赖（justext/htmldate/courlan）
+# 显式收集 tiktoken 与 trafilatura 传递数据依赖（justext/htmldate/courlan）
 for pkg in ["akshare", "langgraph", "pandas_ta_classic", "chinese_calendar", "psutil", "trafilatura", "tiktoken"]:
     d, b, h = collect_all(pkg)
     datas += d

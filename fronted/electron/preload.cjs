@@ -23,7 +23,7 @@ contextBridge.exposeInMainWorld('finresearch', {
     getPreferences: () => ipcRenderer.invoke('finresearch:app:get-prefs'),
     setPreferences: (patch) => ipcRenderer.invoke('finresearch:app:set-prefs', patch),
   },
-  // v2.0.0：原生剪贴板写图（分享海报一键复制，不受 Web Clipboard API 权限限制）
+  // 原生剪贴板写图（分享海报一键复制，不受 Web Clipboard API 权限限制）
   clipboard: {
     writeImageDataUrl: (dataUrl) => ipcRenderer.invoke('finresearch:clipboard:write-image', dataUrl),
   },

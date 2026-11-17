@@ -6,27 +6,31 @@
 
 **面向个人投资者的本地优先 · 可自部署 A 股 AI 投研工作台**
 
-[![Official Release](https://img.shields.io/badge/release-v2.0.0%20%E6%AD%A3%E5%BC%8F%E7%89%88-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
+[![Release](https://img.shields.io/badge/release-v0.1.1%20Preview-D8B24A)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Web%20%2F%20Docker-0B1220)](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest)
 [![Tests](https://img.shields.io/badge/tests-365%20passed-10B981)](backend/tests)
 [![License](https://img.shields.io/badge/license-%E4%BB%85%E9%99%90%E4%B8%AA%E4%BA%BA%E9%9D%9E%E5%95%86%E4%B8%9A%E4%BD%BF%E7%94%A8-8B5CF6)](LICENSE)
 
 **简体中文** · [English](README.en.md)
 
-[v2.0.0 正式版说明](#-v200-正式发布版说明) · [界面与功能导览](#️-界面与功能全景导览) · [下载与发行包](#-三种开箱运行形态) · [命令行启动指南](#️-命令行启动与自部署全指南) · [系统架构与安全](#️-系统架构与数据安全)
+[v0.1.1 版本与更新说明](#-v011-版本与本轮更新说明) · [界面与功能导览](#️-界面与功能全景导览) · [下载与发行包](#-三种开箱运行形态) · [命令行启动指南](#️-命令行启动与自部署全指南) · [系统架构与安全](#️-系统架构与数据安全)
 
 </div>
 
 ---
 
-## 📢 v2.0.0 正式发布版说明
+## 📢 v0.1.1 版本与本轮更新说明
 
-**`v2.0.0` 是景渊（JingYuan）首个架构级焕新的正式发布版本（General Availability）。**
+> **版本号归零重算说明**：景渊（JingYuan）目前仍处于积极开发与持续打磨阶段，许多规划能力尚在演进。为避免虚高版本号造成误导，现已清理早期历史版本号与旧标签，统一从 **`v0.1.1`** 务实重新计版。
 
-相较早期迭代版本，`v2.0.0` 完成了从桌面单机工具向**全形态专业投研工作台**的跨越：
-- **三种开源运行形态一次齐备**：同时提供 **可自部署同源 Web / Docker 版**、**桌面安装版（Windows `.exe` + macOS `.dmg`）** 与 **免安装解压即用版（绿色 `.zip` + 单文件便携版 `.exe`）**。
-- **Astryx 风格六大投研模块重构**：覆盖市场总览、看盘与自选（含五维事实体检）、独立深度研究任务台、多轮投研问答（含右侧交互式产物抽屉）、报告与混合知识库（含跨期事实对账单与高清长图分享）、设置与交易日盘后自动巡检推送。
-- **十模块解耦智能体引擎**：将底层框架依赖严格收敛于 `engine/` 防腐层，彻底根治多工具并发取数归档断流、代码写法不一致重复报错、孤立 `</think>` 思维链泄漏与重连闪烁问题，全仓通过 **365 项自动化回归测试**。
+本次 `v0.1.1` 迭代重点完成了**前端视觉审美与现代 Web 标准的全面打磨**，并交付完整的全形态投研基线：
+
+- **现代 Web 界面与交互体验精修**：
+  - 修复看盘窄栏紧凑自选表价格截断与横向滚动条问题，行内操作升级为悬停 / 键盘聚焦自适应胶囊浮层；
+  - 统一暗色沉浸感：接入 `<meta name="color-scheme">` 首屏零闪烁画布、暖金品牌 `accent-color` 原生复选框/滑块，以及高对比低干扰暗色滚动条；
+  - 消除子页面重复叠放的模型选择器，将问答页刺眼的大面积亮黄用户气泡重塑为微金描边深色浮层，修复粘性表格首列斑马纹底色色差，并升级 `field-sizing: content` 自适应输入框与原生 `<dialog closedby="any">` 灯箱。
+- **六大核心投研工作台**：覆盖市场总览、看盘与自选（含五维事实体检）、独立深度研究任务台、多轮投研问答（含右侧交互式产物抽屉）、报告与混合知识库（含跨期事实对账单与高清长图分享）、设置与交易日盘后自动巡检推送。
+- **十模块解耦智能体引擎与三种运行形态**：底层框架依赖严格收敛于 `engine/` 防腐层，全仓通过 **365 项自动化回归测试**；同步提供 **自部署同源 Web / Docker 版**、**Windows / macOS 桌面安装版** 与 **免安装解压即用便携版**。
 
 ---
 
@@ -60,7 +64,7 @@
 ![深度研究工作台](assets/screenshots/03-deep-research.png)
 
 ### 4. 投研问答与右侧交互式产物抽屉（Research Chat & Artifact Drawer）
-- **多轮智能体并发取数**：支持单轮多工具并行调用、多写法证券代码（`688266.SH` / `SH:688266` / `688266`）自动归一复用、同名简称歧义确认（HITL）、粘贴 K 线截图看图解盘与长对话自动压缩（Auto-Compact）。
+- **多轮智能体并发取数**：支持单轮多工具并行调用、多写法证券代码（`688266.SH` / `SH:688266` / `688266`）自动归一复用、同名简称歧义确认（HITL）、粘贴 K 线截图看图解盘、随内容自动长高的多行输入框与长对话自动压缩（Auto-Compact）。
 - **工具胶囊与产物抽屉**：气泡内实时展示工具调用进度胶囊与可折叠思维链；点击消息下方的产物卡片即可在右侧抽屉交互查看完整 K 线、技术指标、250 日风险统计与多期财务报表。
 
 ![投研问答与产物抽屉](assets/screenshots/04-chat-artifacts.png)
@@ -82,22 +86,22 @@
 
 ## 📦 三种开箱运行形态
 
-直接前往 [**GitHub Releases (v2.0.0)**](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest) 下载预构建好的发行包，所有桌面包均已内置独立 Python 3.13 投研引擎与前端界面，**无需在本机安装 Python 或 Node.js**：
+直接前往 [**GitHub Releases (v0.1.1)**](https://github.com/lryoooow/Financial-AI-Agent-Platform-/releases/latest) 下载预构建好的发行包，所有桌面包均已内置独立 Python 3.13 投研引擎与前端界面，**无需在本机安装 Python 或 Node.js**：
 
 ### 形态一：免安装解压即用版（绿色压缩包 / 单文件便携版）
 
 | 平台与形态 | 发行文件名 | 运行与数据存储说明 |
 | :--- | :--- | :--- |
-| **Windows 绿色压缩包** | `JingYuan-2.0.0-win-x64-portable.zip` | 解压到任意目录，双击 `JingYuan.exe` 直接运行；内置 `.portable` 标记，数据独立保存在同级 `portable-data/` 目录 |
-| **Windows 单文件便携版** | `JingYuan-Portable-2.0.0.exe` | 无需解压，双击直接启动，适合随身携带 |
-| **macOS 免安装压缩包** | `JingYuan-2.0.0-mac-arm64-portable.zip`<br>`JingYuan-2.0.0-mac-x64-portable.zip` | 分别适配 Apple Silicon（M 系列芯片）与 Intel 芯片，解压后直接运行 |
+| **Windows 绿色压缩包** | `JingYuan-0.1.1-win-x64-portable.zip` | 解压到任意目录，双击 `JingYuan.exe` 直接运行；内置 `.portable` 标记，数据独立保存在同级 `portable-data/` 目录 |
+| **Windows 单文件便携版** | `JingYuan-Portable-0.1.1.exe` | 无需解压，双击直接启动，适合随身携带 |
+| **macOS 免安装压缩包** | `JingYuan-0.1.1-mac-arm64-portable.zip`<br>`JingYuan-0.1.1-mac-x64-portable.zip` | 分别适配 Apple Silicon（M 系列芯片）与 Intel 芯片，解压后直接运行 |
 
 ### 形态二：桌面标准安装版（Windows + macOS）
 
 | 平台与形态 | 发行文件名 | 默认数据目录 |
 | :--- | :--- | :--- |
-| **Windows 安装包** | `JingYuan-Setup-2.0.0.exe` | `%APPDATA%\FinResearch`（覆盖升级自动保留历史对话、自选与研报） |
-| **macOS 安装镜像** | `JingYuan-2.0.0-mac-arm64.dmg`<br>`JingYuan-2.0.0-mac-x64.dmg` | `~/Library/Application Support/FinResearch` |
+| **Windows 安装包** | `JingYuan-Setup-0.1.1.exe` | `%APPDATA%\FinResearch`（覆盖升级自动保留历史对话、自选与研报） |
+| **macOS 安装镜像** | `JingYuan-0.1.1-mac-arm64.dmg`<br>`JingYuan-0.1.1-mac-x64.dmg` | `~/Library/Application Support/FinResearch` |
 
 > **系统首次运行提示**：由于个人开源项目暂未购买商业代码签名证书，Windows 首次打开若出现 SmartScreen 提示，点击 **「更多信息」→「仍要运行」** 即可；macOS 若提示无法验证开发者，可在终端执行 `xattr -cr /Applications/JingYuan.app` 后正常打开。
 
@@ -194,7 +198,7 @@ VITE_API_BASE=http://127.0.0.1:8000 pnpm --dir fronted dev
 ### 4. 命令行运行测试、静态检查与桌面重打包
 
 ```bash
-# 运行后端全量自动化回归测试（365+ 项，含架构防腐边界与数值核验红队测试）
+# 运行后端全量自动化回归测试（365 项，含架构防腐边界与数值核验红队测试）
 uv run --project backend --locked --extra dev python -m pytest -q backend/tests
 
 # 运行前端 TypeScript 严格类型检查与生产构建
@@ -207,7 +211,7 @@ pnpm --dir fronted build
 # 双击或命令行执行根目录脚本（产物输出至 fronted/release/）
 .\build_release.bat
 # 或指定自定义输出目录：
-powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1 -OutputDir fronted/release/v2.0.0
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1 -OutputDir fronted/release/v0.1.1
 ```
 
 ### 5. 常用环境变量速查表
@@ -257,10 +261,10 @@ Financial-AI-Agent-Platform-/
 ## ⚠️ 免责声明与开源许可
 
 - **免责声明**：景渊（JingYuan）是金融数据整理与投研辅助工具，**不提供任何投资建议，不接入任何券商，也无法执行交易下单**。模型输出可能存在误差或遗漏；公开行情与财务数据可能存在延迟、修正或暂不可用。**每一个投资决策及其全部后果，均由使用者自行承担。** 市场有风险，投资需谨慎。
-- **使用许可**：本项目免费开放供**个人非商业学习与投研使用**。未经授权禁止用于商业运营、付费分发或逆向工程。完整条款见 [LICENSE](LICENSE)，历次迭代记录见 [CHANGELOG.md](CHANGELOG.md)，后端接口说明见 [backend/README.md](backend/README.md)。
+- **使用许可**：本项目免费开放供**个人非商业学习与投研使用**。未经授权禁止用于商业运营、付费分发或逆向工程。完整条款见 [LICENSE](LICENSE)，迭代记录见 [CHANGELOG.md](CHANGELOG.md)，后端接口说明见 [backend/README.md](backend/README.md)。
 
 ---
 
 <div align="center">
-<sub>景渊 JingYuan v2.0.0 · 为研究而生，不为交易。</sub>
+<sub>景渊 JingYuan v0.1.1 · 为研究而生，不为交易。</sub>
 </div>

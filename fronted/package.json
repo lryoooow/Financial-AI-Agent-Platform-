@@ -1,7 +1,9 @@
 {
   "name": "jingyuan-desktop",
   "private": true,
-  "version": "2.0.0",
+  "version": "0.1.1",
+  "description": "景渊 JingYuan · 本地优先与可自部署 A 股 AI 投研工作台",
+  "author": "lryoooow",
   "packageManager": "pnpm@10.33.0",
   "type": "module",
   "main": "electron/main.cjs",

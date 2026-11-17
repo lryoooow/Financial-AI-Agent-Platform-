@@ -1,7 +1,7 @@
 services:
   jingyuan:
     build: .
-    image: jingyuan:2.0.0
+    image: jingyuan:0.1.1
     restart: unless-stopped
     ports:
       - "${FIN_BIND_ADDRESS:-127.0.0.1}:${FIN_PORT:-9527}:9527"
