@@ -7,7 +7,7 @@ $OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
 $BuildRoot = [System.IO.Path]::GetFullPath($BuildRoot)
 Push-Location $Root
 try {
-    $Version = (Get-Content -Raw -LiteralPath 'fronted/package.json' | ConvertFrom-Json).version
+    $Version = (Get-Content -Raw -Encoding UTF8 -LiteralPath 'fronted/package.json' | ConvertFrom-Json).version
     $ZipName = "JingYuan-$Version-win-x64-portable.zip"
     $Zip = Join-Path $OutputDir $ZipName
     foreach ($Target in @($Zip, (Join-Path $OutputDir "JingYuan-Setup-$Version.exe"), (Join-Path $OutputDir "JingYuan-Portable-$Version.exe"))) {

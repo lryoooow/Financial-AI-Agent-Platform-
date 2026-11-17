@@ -2,7 +2,7 @@
   "name": "jingyuan-desktop",
   "private": true,
   "version": "0.1.1",
-  "description": "景渊 JingYuan · 本地优先与可自部署 A 股 AI 投研工作台",
+  "description": "JingYuan - Local-first and self-hostable A-share AI research workbench",
   "author": "lryoooow",
   "packageManager": "pnpm@10.33.0",
   "type": "module",
